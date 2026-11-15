@@ -1,0 +1,37 @@
+{
+  "name": "dsh-companion",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "独立运行的 Agent Pet，连接 DSH、WorkBuddy、Antigravity、Codex 与刘海收纳",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./package.json": "./package.json",
+    "./client": "./src/client.js"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "check": "node --check src/index.js && node --check src/session-view.js && node --check runtime/main.cjs && node --check runtime/placement.cjs && node --check runtime/preload.cjs && node --check runtime/ui.js && node --check runtime/activity-notices.js && node --check src/client.js && node --check runtime/audio.js && node --check runtime/providers.cjs && node --check runtime/hook-state.cjs && node --check runtime/workbuddy-state.cjs && node --check runtime/codex-sessions.cjs && node --check runtime/notch.cjs && node --check scripts/start.cjs",
+    "start": "node scripts/start.cjs",
+    "install:local": "python3 scripts/install.py",
+    "build:notch": "mkdir -p bin && xcrun swiftc runtime/NotchPanel.swift -o bin/notch-panel && xcrun swiftc scripts/screen-info.swift -o bin/screen-info"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-workspace"
+      ],
+      "platform": "web"
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT"
+}
