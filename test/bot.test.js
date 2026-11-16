@@ -10,6 +10,7 @@ import {
   rm,
   stat,
   symlink,
+  utimes,
   writeFile,
 } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
@@ -2420,4 +2421,441 @@ test('MobileBridgeServer GET /api/mobile/state?extra=1 按 targetAgent 返回工
   assert.equal(svcWithCustomDispatcher.localChat.providers, customProviders);
   const dshWs = svcWithCustomDispatcher.localChat.discoverWorkspaces({ engine: 'dsh' });
   assert.ok(dshWs.some(w => w.path === dshWorkDir));
+});
+
+test('LocalChatBridge Antigravity 子 Agent 去重防淹没、config/projects + app_storage.json 与主对话优先召回', async t => {
+  const rawDir = await mkdtemp(join(tmpdir(), 'agent-pet-agy-'));
+  const dir = await realpath(rawDir);
+  t.after(() => rm(rawDir, { recursive: true, force: true }));
+
+  const defaultDir = join(dir, 'default-cwd');
+  const appSupportDir = join(dir, 'AppSupport');
+  const agyAppSupportDir = join(appSupportDir, 'Antigravity');
+  const agyConfigDir = join(dir, 'gemini-config');
+  const agyProjectsDir = join(agyConfigDir, 'projects');
+  const agyDbPath = join(dir, 'conversation_summaries.db');
+
+  const projMainA = join(dir, 'agy-proj-a');
+  const projMainB = join(dir, 'agy-proj-b');
+  const projConfigLast = join(dir, 'agy-config-last');
+  const projConfigOrd1 = join(dir, 'agy-config-ord1');
+  const projConfigSidecar = join(dir, 'agy-config-sidecar');
+
+  for (const d of [
+    defaultDir, agyAppSupportDir, agyProjectsDir,
+    projMainA, projMainB, projConfigLast, projConfigOrd1, projConfigSidecar,
+  ]) {
+    await mkdir(d, { recursive: true });
+  }
+
+  // >30 sub-agents on projMainA with parent_conversation_id & CASCADE_RUN_STATUS_RUNNING must not drown out projMainB
+  const inserts = [];
+  const uriA = sqlStr(JSON.stringify([pathToFileURL(projMainA).href]));
+  const uriB = sqlStr(JSON.stringify([pathToFileURL(projMainB).href]));
+  inserts.push(`INSERT INTO conversation_summaries VALUES ('main-b', 'Main Conversation B', ${uriB}, 2000, '', 'CASCADE_RUN_STATUS_IDLE', 0);`);
+  inserts.push(`INSERT INTO conversation_summaries VALUES ('main-a', 'Main Conversation A', ${uriA}, 2500, '', 'CASCADE_RUN_STATUS_IDLE', 0);`);
+  for (let i = 1; i <= 35; i++) {
+    const status = i === 35 ? 'CASCADE_RUN_STATUS_RUNNING' : 'CASCADE_RUN_STATUS_IDLE';
+    inserts.push(
+      `INSERT INTO conversation_summaries VALUES ('sub-a-${i}', 'SubAgent ${i}', ${uriA}, ${3000 + i}, 'main-a', '${status}', 0);`,
+    );
+  }
+  execSqlite(
+    agyDbPath,
+    `CREATE TABLE conversation_summaries (
+      conversation_id TEXT PRIMARY KEY,
+      title TEXT,
+      workspace_uris TEXT,
+      last_modified_time INTEGER,
+      parent_conversation_id TEXT,
+      status TEXT,
+      not_fully_idle INTEGER
+    );
+    ${inserts.join('\n')}`,
+  );
+
+  // app_storage.json + ~/.gemini/config/projects/*.json
+  await writeFile(join(agyAppSupportDir, 'app_storage.json'), JSON.stringify({
+    lastCreatedProjectId: 'proj-last',
+    projectsOrder: ['proj-ord-1', 'proj-last'],
+  }), 'utf8');
+  await writeFile(join(agyProjectsDir, 'outside-of-project.json'), JSON.stringify({
+    id: 'outside-of-project',
+    projectResources: { resources: [{ folderUri: pathToFileURL(projConfigSidecar).href }] },
+  }), 'utf8');
+  await writeFile(join(agyProjectsDir, 'sidecar.json'), JSON.stringify({
+    id: 'sidecar-proj',
+    sidecar: true,
+    projectResources: { resources: [{ folderUri: pathToFileURL(projConfigSidecar).href }] },
+  }), 'utf8');
+  await writeFile(join(agyProjectsDir, 'proj-ord-1.json'), JSON.stringify({
+    id: 'proj-ord-1',
+    projectResources: { resources: [{ gitFolder: { folderUri: pathToFileURL(projConfigOrd1).href } }] },
+  }), 'utf8');
+  await writeFile(join(agyProjectsDir, 'proj-last.json'), JSON.stringify({
+    id: 'proj-last',
+    projectResources: { resources: [{ folderUri: pathToFileURL(projConfigLast).href }] },
+  }), 'utf8');
+
+  const bridge = new LocalChatBridge({
+    dispatcher: {
+      defaultCwd: defaultDir,
+      allowedWorkspaces: [dir],
+      validateWorkspace: target => sanitizeWorkspace(target, [dir]),
+    },
+    getConfig: () => ({ defaultEngine: 'claude', defaultCwd: defaultDir }),
+    appSupportDir,
+    antigravityDbPath: agyDbPath,
+    antigravityConfigDir: agyConfigDir,
+  });
+
+  const agyWs = bridge.discoverWorkspaces({ engine: 'antigravity' });
+  assert.deepEqual(
+    agyWs.map(w => [w.path, w.isOpen]),
+    [
+      [projMainA, true],
+      [projMainB, false],
+      [projConfigLast, false],
+      [projConfigOrd1, false],
+    ],
+  );
+  assert.equal(agyWs.some(w => w.path === projConfigSidecar), false);
+
+  // discoverSessions filters out parent_conversation_id sub-agents and ranks matched cwd main conversation first
+  const agySessions = bridge.discoverSessions({ engine: 'antigravity', cwd: projMainB });
+  assert.deepEqual(agySessions.map(s => s.sessionId), ['main-b', 'main-a']);
+  assert.equal(agySessions[0].matchesCwd, true);
+  assert.equal(agySessions[1].matchesCwd, false);
+});
+
+test('LocalChatBridge WorkBuddy spaces 表、playground 过滤及 workbuddy-ai 从 sessions 召回项目', async t => {
+  const rawDir = await mkdtemp(join(tmpdir(), 'agent-pet-wb-'));
+  const dir = await realpath(rawDir);
+  t.after(() => rm(rawDir, { recursive: true, force: true }));
+
+  const defaultDir = join(dir, 'default-cwd');
+  const workbuddyDbPath = join(dir, 'workbuddy.db');
+  const workbuddyAiDbPath = join(dir, 'workbuddy-ai.db');
+
+  const wbSpaceProj = join(dir, 'wb-space-proj');
+  const wbSessionProj = join(dir, 'wb-session-proj');
+  const wbWorkspaceProj = join(dir, 'wb-workspace-proj');
+  const wbPgDir = join(dir, 'WorkBuddy', '2026-11-17-00-53-57');
+  const wbFlaggedPgDir = join(dir, 'wb-flagged-playground');
+
+  const waiRealProj = join(dir, 'wai-real-proj');
+  const waiPgDir = join(dir, 'WorkBuddy AI', '2026-10-09-15-20-16');
+  const waiFlaggedPgDir = join(dir, 'wai-flagged-playground');
+
+  for (const d of [
+    defaultDir, wbSpaceProj, wbSessionProj, wbWorkspaceProj, wbPgDir, wbFlaggedPgDir,
+    waiRealProj, waiPgDir, waiFlaggedPgDir,
+  ]) {
+    await mkdir(d, { recursive: true });
+  }
+
+  execSqlite(
+    workbuddyDbPath,
+    `CREATE TABLE spaces (
+      id TEXT PRIMARY KEY,
+      primary_folder_path TEXT,
+      create_folder_path TEXT,
+      status TEXT,
+      deleted_at INTEGER,
+      updated_at INTEGER
+    );
+    INSERT INTO spaces VALUES ('sp-1', NULL, ${sqlStr(wbSpaceProj)}, 'active', -1, 5000);
+    INSERT INTO spaces VALUES ('sp-del', NULL, ${sqlStr(wbFlaggedPgDir)}, 'active', 99999, 9000);
+    CREATE TABLE workspaces (id TEXT PRIMARY KEY, path TEXT, last_opened_at INTEGER);
+    INSERT INTO workspaces VALUES ('ws-real', ${sqlStr(wbWorkspaceProj)}, 2000);
+    INSERT INTO workspaces VALUES ('ws-pg-re', ${sqlStr(wbPgDir)}, 8000);
+    INSERT INTO workspaces VALUES ('ws-pg-flag', ${sqlStr(wbFlaggedPgDir)}, 9000);
+    CREATE TABLE sessions (
+      id TEXT PRIMARY KEY,
+      cwd TEXT,
+      title TEXT,
+      is_playground INTEGER,
+      updated_at INTEGER,
+      last_activity_at INTEGER,
+      deleted_at INTEGER
+    );
+    INSERT INTO sessions VALUES ('wb-ses-pg', ${sqlStr(wbPgDir)}, 'Tarot Playground', 1, 9000, 9000, NULL);
+    INSERT INTO sessions VALUES ('wb-ses-flag', ${sqlStr(wbFlaggedPgDir)}, 'Flagged Playground', 1, 8500, 8500, NULL);
+    INSERT INTO sessions VALUES ('wb-ses-real', ${sqlStr(wbSessionProj)}, 'Real WB Session', 0, 3000, 4000, NULL);
+    INSERT INTO sessions VALUES ('wb-ses-space', ${sqlStr(wbSpaceProj)}, 'Space Match Session', 0, 2000, 2500, NULL);`,
+  );
+
+  // workbuddy-ai: empty spaces & workspaces, real project recalled via sessions (is_playground=0)
+  execSqlite(
+    workbuddyAiDbPath,
+    `CREATE TABLE spaces (id TEXT PRIMARY KEY, path TEXT, status TEXT, deleted_at INTEGER, updated_at INTEGER);
+    CREATE TABLE workspaces (id TEXT PRIMARY KEY, path TEXT, last_opened_at INTEGER);
+    CREATE TABLE sessions (
+      id TEXT PRIMARY KEY,
+      cwd TEXT,
+      title TEXT,
+      is_playground INTEGER,
+      updated_at INTEGER,
+      last_activity_at INTEGER,
+      deleted_at INTEGER
+    );
+    INSERT INTO sessions VALUES ('wai-pg-1', ${sqlStr(waiPgDir)}, 'WAI Temp Playground', 1, 9500, 9500, NULL);
+    INSERT INTO sessions VALUES ('wai-pg-2', ${sqlStr(waiFlaggedPgDir)}, 'WAI Flagged Playground', 1, 9200, 9200, NULL);
+    INSERT INTO sessions VALUES ('wai-real-1', ${sqlStr(waiRealProj)}, 'WAI Real Session', 0, 4000, 4500, NULL);`,
+  );
+
+  const bridge = new LocalChatBridge({
+    dispatcher: {
+      defaultCwd: defaultDir,
+      allowedWorkspaces: [dir],
+      validateWorkspace: target => sanitizeWorkspace(target, [dir]),
+    },
+    getConfig: () => ({ defaultEngine: 'claude', defaultCwd: defaultDir }),
+    workbuddyDbPath,
+    workbuddyAiDbPath,
+  });
+
+  const wbWs = bridge.discoverWorkspaces({ engine: 'workbuddy' });
+  assert.deepEqual(wbWs.map(w => w.path), [wbSpaceProj, wbSessionProj, wbWorkspaceProj]);
+  assert.equal(wbWs.some(w => w.path === wbPgDir || w.path === wbFlaggedPgDir), false);
+
+  const wbSessions = bridge.discoverSessions({ engine: 'workbuddy', cwd: wbSpaceProj });
+  assert.equal(wbSessions[0].sessionId, 'wb-ses-space');
+  assert.equal(wbSessions[0].matchesCwd, true);
+  assert.equal(wbSessions[1].sessionId, 'wb-ses-real');
+  assert.ok(wbSessions.findIndex(s => s.sessionId === 'wb-ses-real') < wbSessions.findIndex(s => s.sessionId === 'wb-ses-pg'));
+
+  const waiWs = bridge.discoverWorkspaces({ engine: 'workbuddy-ai' });
+  assert.deepEqual(waiWs.map(w => w.path), [waiRealProj]);
+  assert.equal(waiWs[0].sourceEngine, 'workbuddy-ai');
+
+  const waiSessions = bridge.discoverSessions({ engine: 'workbuddy-ai', cwd: waiRealProj });
+  assert.equal(waiSessions[0].sessionId, 'wai-real-1');
+  assert.equal(waiSessions[0].matchesCwd, true);
+});
+
+test('LocalChatBridge Codex global-state、Claude ~/.claude.json、Qoder CN、Kiro 与 workspaceStorage 发现及去杂', async t => {
+  const rawDir = await mkdtemp(join(tmpdir(), 'agent-pet-multi-agent-'));
+  const dir = await realpath(rawDir);
+  t.after(() => rm(rawDir, { recursive: true, force: true }));
+
+  const defaultDir = join(dir, 'default-cwd');
+  const appSupportDir = join(dir, 'AppSupport');
+  const codexSessionsDir = join(dir, 'codex-sessions');
+  const codexGlobalStatePath = join(dir, '.codex-global-state.json');
+  const claudeProjectsDir = join(dir, 'claude-projects');
+  const claudeJsonPath = join(dir, '.claude.json');
+  const qoderCnProjectsDir = join(dir, 'qoder-cn-projects');
+  const kiroDir = join(dir, 'kiro-home');
+
+  const codexActive = join(dir, 'codex-active');
+  const codexLocalProj = join(dir, 'codex-local-proj');
+  const codexSavedRoot = join(dir, 'codex-saved-root');
+
+  const claudeProjNew = join(dir, 'claude-proj-new');
+  const claudeProjOld = join(dir, 'claude-proj-old');
+  const claudeProbeFake = join(dir, 'CodexBar', 'ClaudeProbe');
+
+  const qoderJsonlProj = join(dir, 'qoder-jsonl-proj');
+  const qoderWsStorageNew = join(dir, 'qoder-ws-new');
+  const qoderWsStorageOld = join(dir, 'qoder-ws-old');
+
+  const kiroRootProj = join(dir, 'kiro-root-proj');
+  const kiroWsStorageProj = join(dir, 'kiro-ws-storage');
+
+  const traeCnProj = join(dir, 'trae-cn-real-proj');
+  const traeSoloLiteRuntimeDir = join(appSupportDir, 'Trae CN', 'ProjectWorkspaces');
+  const traeSoloLiteDefaultDir = join(appSupportDir, 'Trae CN', 'solo-lite-default-workspace');
+
+  for (const d of [
+    defaultDir, codexSessionsDir, claudeProjectsDir, qoderCnProjectsDir,
+    join(kiroDir, 'workspace-roots'),
+    codexActive, codexLocalProj, codexSavedRoot,
+    claudeProjNew, claudeProjOld, claudeProbeFake,
+    qoderJsonlProj, qoderWsStorageNew, qoderWsStorageOld,
+    kiroRootProj, kiroWsStorageProj,
+    traeCnProj, traeSoloLiteRuntimeDir, traeSoloLiteDefaultDir,
+  ]) {
+    await mkdir(d, { recursive: true });
+  }
+
+  // 1. Codex .codex-global-state.json
+  await writeFile(codexGlobalStatePath, JSON.stringify({
+    'active-workspace-roots': [codexActive],
+    'local-projects': {
+      p1: { path: codexLocalProj, updatedAt: 5000 },
+    },
+    'electron-saved-workspace-roots': [codexSavedRoot],
+  }), 'utf8');
+
+  // 2. Claude ~/.claude.json (with homeDir and CodexBar/ClaudeProbe that must be excluded)
+  await writeFile(claudeJsonPath, JSON.stringify({
+    projects: {
+      [os.homedir()]: { lastSessionModified: 9999999 },
+      [claudeProbeFake]: { lastSessionModified: 9999998 },
+      '/Users/someone/Library/Application Support/CodexBar/ClaudeProbe': { lastSessionModified: 9999997 },
+      [claudeProjOld]: { lastSessionModified: 1000 },
+      [claudeProjNew]: { lastSessionModified: 5000 },
+    },
+  }), 'utf8');
+
+  // 3. Qoder CN: ~/.qoder-cn/projects/*/*.jsonl + workspaceStorage/*/workspace.json
+  const qoderProjSub = join(qoderCnProjectsDir, '-tmp-proj');
+  await mkdir(qoderProjSub, { recursive: true });
+  await writeFile(join(qoderProjSub, 'ses-1.jsonl'), [
+    JSON.stringify({ type: 'workspace-directories', directories: [qoderJsonlProj] }),
+    JSON.stringify({ type: 'user', text: 'hello' }),
+  ].join('\n'), 'utf8');
+
+  const qoderWsOldFile = join(appSupportDir, 'Qoder CN', 'User', 'workspaceStorage', 'ws-old', 'workspace.json');
+  const qoderWsNewFile = join(appSupportDir, 'Qoder CN', 'User', 'workspaceStorage', 'ws-new', 'workspace.json');
+  await mkdir(dirname(qoderWsOldFile), { recursive: true });
+  await mkdir(dirname(qoderWsNewFile), { recursive: true });
+  await writeFile(qoderWsOldFile, JSON.stringify({ folder: pathToFileURL(qoderWsStorageOld).href }), 'utf8');
+  await writeFile(qoderWsNewFile, JSON.stringify({ folder: pathToFileURL(qoderWsStorageNew).href }), 'utf8');
+  await utimes(qoderWsOldFile, new Date(1000), new Date(1000));
+  await utimes(qoderWsNewFile, new Date(5000), new Date(5000));
+
+  // 4. Kiro: ~/.kiro/workspace-roots + Kiro/User/workspaceStorage/*/workspace.json
+  await writeFile(join(kiroDir, 'workspace-roots', 'roots.json'), JSON.stringify({ roots: [kiroRootProj] }), 'utf8');
+  const kiroWsFile = join(appSupportDir, 'Kiro', 'User', 'workspaceStorage', 'k1', 'workspace.json');
+  await mkdir(dirname(kiroWsFile), { recursive: true });
+  await writeFile(kiroWsFile, JSON.stringify({ folder: pathToFileURL(kiroWsStorageProj).href }), 'utf8');
+
+  // 5. Trae CN workspaceStorage: excludes solo-lite synthetic paths
+  await writeFile(join(traeSoloLiteRuntimeDir, 'solo-lite-runtime.code-workspace'), '{}', 'utf8');
+  await writeFile(join(traeSoloLiteDefaultDir, 'workspace.json'), '{}', 'utf8');
+  const traeWsSolo1 = join(appSupportDir, 'Trae CN', 'User', 'workspaceStorage', 'solo1', 'workspace.json');
+  const traeWsSolo2 = join(appSupportDir, 'Trae CN', 'User', 'workspaceStorage', 'solo2', 'workspace.json');
+  const traeWsReal = join(appSupportDir, 'Trae CN', 'User', 'workspaceStorage', 'real1', 'workspace.json');
+  await mkdir(dirname(traeWsSolo1), { recursive: true });
+  await mkdir(dirname(traeWsSolo2), { recursive: true });
+  await mkdir(dirname(traeWsReal), { recursive: true });
+  await writeFile(traeWsSolo1, JSON.stringify({ workspace: pathToFileURL(join(traeSoloLiteRuntimeDir, 'solo-lite-runtime.code-workspace')).href }), 'utf8');
+  await writeFile(traeWsSolo2, JSON.stringify({ folder: pathToFileURL(traeSoloLiteDefaultDir).href }), 'utf8');
+  await writeFile(traeWsReal, JSON.stringify({ folder: pathToFileURL(traeCnProj).href }), 'utf8');
+
+  const homeReal = await realpath(os.homedir());
+  const bridge = new LocalChatBridge({
+    dispatcher: {
+      defaultCwd: defaultDir,
+      allowedWorkspaces: [dir, homeReal],
+      validateWorkspace: target => sanitizeWorkspace(target, [dir, homeReal]),
+    },
+    getConfig: () => ({ defaultEngine: 'claude', defaultCwd: defaultDir }),
+    appSupportDir,
+    codexSessionsDir,
+    codexGlobalStatePath,
+    claudeProjectsDir,
+    claudeJsonPath,
+    qoderCnProjectsDir,
+    kiroDir,
+  });
+
+  const codexWs = bridge.discoverWorkspaces({ engine: 'codex' });
+  assert.deepEqual(
+    codexWs.map(w => [w.path, w.isOpen]),
+    [
+      [codexActive, true],
+      [codexLocalProj, false],
+      [codexSavedRoot, false],
+    ],
+  );
+
+  const claudeWs = bridge.discoverWorkspaces({ engine: 'claude' });
+  assert.deepEqual(claudeWs.map(w => w.path), [claudeProjNew, claudeProjOld]);
+  assert.equal(claudeWs.some(w => w.path === homeReal || w.path.includes('ClaudeProbe')), false);
+
+  const qoderCnWs = bridge.discoverWorkspaces({ engine: 'qoder-cn' });
+  assert.deepEqual(qoderCnWs.map(w => w.path), [qoderWsStorageNew, qoderWsStorageOld, qoderJsonlProj]);
+
+  const kiroWs = bridge.discoverWorkspaces({ engine: 'kiro' });
+  assert.deepEqual(kiroWs.map(w => w.path), [kiroWsStorageProj, kiroRootProj]);
+
+  const traeCnWs = bridge.discoverWorkspaces({ engine: 'trae-cn' });
+  assert.deepEqual(traeCnWs.map(w => w.path), [traeCnProj]);
+});
+
+test('LocalChatBridge 跨 Agent 工作区隔离、workspaces 返回 homeDir/suggestedCwd 与 files 指定 cwd', async t => {
+  const rawDir = await mkdtemp(join(tmpdir(), 'agent-pet-isolation-'));
+  const dir = await realpath(rawDir);
+  t.after(() => rm(rawDir, { recursive: true, force: true }));
+
+  const defaultDir = join(dir, 'default-cwd');
+  const appSupportDir = join(dir, 'AppSupport');
+  const claudeJsonPath = join(dir, '.claude.json');
+  const codexGlobalStatePath = join(dir, '.codex-global-state.json');
+
+  const claudeOnlyProj = join(dir, 'claude-only-proj');
+  const codexOnlyProj = join(dir, 'codex-only-proj');
+  const cursorOnlyProj = join(dir, 'cursor-only-proj');
+
+  for (const d of [
+    defaultDir,
+    join(appSupportDir, 'Cursor', 'User', 'globalStorage'),
+    claudeOnlyProj,
+    codexOnlyProj,
+    cursorOnlyProj,
+  ]) {
+    await mkdir(d, { recursive: true });
+  }
+  await writeFile(join(claudeOnlyProj, 'claude-marker.ts'), 'export const a = 1;\n', 'utf8');
+  await writeFile(join(codexOnlyProj, 'codex-marker.py'), 'print(1)\n', 'utf8');
+  await writeFile(join(cursorOnlyProj, 'cursor-marker.rs'), 'fn main() {}\n', 'utf8');
+
+  await writeFile(claudeJsonPath, JSON.stringify({
+    projects: { [claudeOnlyProj]: { lastSessionModified: 5000 } },
+  }), 'utf8');
+  await writeFile(codexGlobalStatePath, JSON.stringify({
+    'active-workspace-roots': [codexOnlyProj],
+  }), 'utf8');
+  await writeFile(join(appSupportDir, 'Cursor', 'User', 'globalStorage', 'storage.json'), JSON.stringify({
+    windowsState: { openedWindows: [{ folder: pathToFileURL(cursorOnlyProj).href }] },
+  }), 'utf8');
+
+  const bridge = new LocalChatBridge({
+    dispatcher: {
+      defaultCwd: defaultDir,
+      allowedWorkspaces: [dir],
+      validateWorkspace: target => sanitizeWorkspace(target, [dir]),
+    },
+    getConfig: () => ({ defaultEngine: 'claude', defaultCwd: defaultDir }),
+    appSupportDir,
+    claudeJsonPath,
+    codexGlobalStatePath,
+  });
+
+  // Select claudeOnlyProj via selectWorkspace; must NOT pollute codex or cursor workspaces
+  const selRes = await bridge.handleAction({
+    action: 'selectWorkspace',
+    cwd: claudeOnlyProj,
+    targetAgent: 'claude',
+  }, 'auto');
+  assert.equal(selRes.currentCwd, claudeOnlyProj);
+  assert.deepEqual(selRes.workspaces.map(w => w.path), [claudeOnlyProj]);
+
+  const codexActionWs = await bridge.handleAction({ action: 'workspaces', targetAgent: 'codex' }, 'auto');
+  const homeReal = await realpath(os.homedir()).catch(() => os.homedir());
+  assert.equal(codexActionWs.homeDir, homeReal);
+  assert.equal(codexActionWs.suggestedCwd, codexOnlyProj);
+  assert.equal(codexActionWs.currentCwd, claudeOnlyProj);
+  assert.equal(codexActionWs.targetAgent, 'codex');
+  assert.deepEqual(codexActionWs.workspaces.map(w => w.path), [codexOnlyProj]);
+  assert.equal(codexActionWs.workspaces.some(w => w.path === claudeOnlyProj), false);
+
+  const cursorActionWs = await bridge.handleAction({ action: 'workspaces', targetAgent: 'cursor' }, 'auto');
+  assert.equal(cursorActionWs.homeDir, homeReal);
+  assert.equal(cursorActionWs.suggestedCwd, cursorOnlyProj);
+  assert.deepEqual(cursorActionWs.workspaces.map(w => w.path), [cursorOnlyProj]);
+  assert.equal(cursorActionWs.workspaces.some(w => w.path === claudeOnlyProj), false);
+
+  // handleAction('files', { cwd }) scans the explicitly passed cwd, not this.currentCwd()
+  const filesCodex = await bridge.handleAction({ action: 'files', cwd: codexOnlyProj, query: 'marker' }, 'auto');
+  assert.deepEqual(filesCodex.candidates.map(f => f.path), ['codex-marker.py']);
+
+  const filesCursor = await bridge.handleAction({ action: 'files', cwd: cursorOnlyProj, query: 'marker' }, 'auto');
+  assert.deepEqual(filesCursor.candidates.map(f => f.path), ['cursor-marker.rs']);
+
+  const filesDefault = await bridge.handleAction({ action: 'files', query: 'marker' }, 'auto');
+  assert.deepEqual(filesDefault.candidates.map(f => f.path), ['claude-marker.ts']);
 });

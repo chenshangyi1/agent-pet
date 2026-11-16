@@ -107,12 +107,22 @@ let items = [], current, animationKey, polling = false, noticeTimer, drag, suppr
 /* authoritative: dismissal/mute are display-only and never touch DSH data.   */
 /* -------------------------------------------------------------------------- */
 const PREFS_KEY = 'dsh-companion:prefs:v1';
-const defaultPrefs = { firstAwakeSeen: false, muted: [], dismissed: [], activeSessionId: null, activeSessionTitle: '', cwd: '', model: null, targetAgent: null, stackCollapsed: true, dockCollapsed: true };
+const defaultPrefs = { firstAwakeSeen: false, muted: [], dismissed: [], activeSessionId: null, activeSessionTitle: '', cwd: '', cwdByAgent: {}, model: null, targetAgent: null, stackCollapsed: true, dockCollapsed: true };
 let prefs;
 try { prefs = { ...defaultPrefs, ...JSON.parse(localStorage.getItem(PREFS_KEY) || '{}') }; }
 catch { prefs = { ...defaultPrefs }; }
+if (!prefs.cwdByAgent || typeof prefs.cwdByAgent !== 'object' || Array.isArray(prefs.cwdByAgent)) {
+  prefs.cwdByAgent = {};
+}
 let targetAgent = prefs.targetAgent || 'claude';
-let currentCwd = prefs.cwd || '';
+let hostHomeDir = '';
+let targetSwitchEpoch = 0;
+let currentCwd = (typeof prefs.cwdByAgent[targetAgent] === 'string' && prefs.cwdByAgent[targetAgent])
+  || prefs.cwd
+  || '';
+if (currentCwd && !prefs.cwdByAgent[targetAgent] && !isBareHomeDir(currentCwd)) {
+  prefs.cwdByAgent[targetAgent] = currentCwd;
+}
 let activeSessionTitle = prefs.activeSessionTitle || '';
 let workspaceOptions = [];
 let extraWorkspaceOptions = [];
@@ -120,7 +130,32 @@ let sessionOptions = [];
 let contextMode = 'agent';
 let contextExtraOpen = false;
 let scanningExtra = false;
+function normalizeDirPath(dirPath) {
+  if (!dirPath || typeof dirPath !== 'string') return '';
+  const trimmed = dirPath.trim();
+  if (!trimmed) return '';
+  if (trimmed === '/') return '/';
+  return trimmed.replace(/[/\\]+$/, '') || '/';
+}
+function isBareHomeDir(dirPath) {
+  const norm = normalizeDirPath(dirPath);
+  if (!norm) return false;
+  if (norm === '/') return true;
+  if (hostHomeDir && norm === normalizeDirPath(hostHomeDir)) return true;
+  if (/^\/Users\/[^/]+$/i.test(norm)) return true;
+  if (/^\/home\/[^/]+$/i.test(norm)) return true;
+  if (/^[A-Za-z]:[\\/]Users[\\/][^\\/]+$/i.test(norm)) return true;
+  return false;
+}
 function savePrefs() { try { localStorage.setItem(PREFS_KEY, JSON.stringify(prefs)); } catch { /* private mode */ } }
+function setActiveCwd(nextCwd, agent = targetAgent, { persistAgent = true } = {}) {
+  currentCwd = nextCwd || '';
+  prefs.cwd = currentCwd;
+  if (persistAgent && agent && currentCwd) {
+    prefs.cwdByAgent[agent] = currentCwd;
+  }
+  savePrefs();
+}
 // Persist the quiet collapsed dock as the boot state. An Electron restart must
 // come back to the pill, never to a panel that happened to be open on exit.
 savePrefs();
@@ -630,17 +665,60 @@ function cwdBasename(dir = currentCwd) {
 function syncTargetFromInfo(info) {
   if (!info) return;
   if (Array.isArray(info.targets)) chatTargets = info.targets;
-  if (info.currentCwd && !currentCwd) {
-    currentCwd = info.currentCwd;
-    prefs.cwd = currentCwd;
-    savePrefs();
-  }
+  if (info.homeDir) hostHomeDir = info.homeDir;
   if (info.targetAgent && (!prefs.targetAgent || (chatTargets.length && !chatTargets.some(t => t.id === targetAgent)))) {
     targetAgent = info.targetAgent;
     prefs.targetAgent = info.targetAgent;
+    const saved = prefs.cwdByAgent?.[targetAgent];
+    if (saved && !isBareHomeDir(saved)) {
+      currentCwd = saved;
+      prefs.cwd = currentCwd;
+    }
     savePrefs();
   }
+  if (info.currentCwd && (!currentCwd || (isBareHomeDir(currentCwd) && !isBareHomeDir(info.currentCwd)))) {
+    setActiveCwd(info.currentCwd, targetAgent, { persistAgent: !isBareHomeDir(info.currentCwd) });
+  }
   renderModel();
+}
+async function ensureDefaultWorkspaceForTarget(agent = targetAgent) {
+  if (!agent) return;
+  const saved = prefs.cwdByAgent?.[agent];
+  const candidateCwd = (currentCwd && !isBareHomeDir(currentCwd))
+    ? currentCwd
+    : ((saved && !isBareHomeDir(saved)) ? saved : '');
+  if (candidateCwd) {
+    const sel = await action('selectWorkspace', { cwd: candidateCwd, targetAgent: agent }).catch(() => null);
+    if (agent !== targetAgent) return;
+    if (sel?.currentCwd) {
+      if (Array.isArray(sel.workspaces)) workspaceOptions = sel.workspaces;
+      setActiveCwd(sel.currentCwd, agent, { persistAgent: !isBareHomeDir(sel.currentCwd) });
+      renderModel();
+      return;
+    }
+    delete prefs.cwdByAgent[agent];
+    if (normalizeDirPath(currentCwd) === normalizeDirPath(candidateCwd)) {
+      currentCwd = '';
+      prefs.cwd = '';
+    }
+    savePrefs();
+  }
+  const res = await action('workspaces', { targetAgent: agent }).catch(() => null);
+  if (!res || agent !== targetAgent) return;
+  if (res.homeDir) hostHomeDir = res.homeDir;
+  const rows = Array.isArray(res.workspaces) ? res.workspaces : [];
+  workspaceOptions = rows;
+  const firstReal = rows.find(w => w?.path && !isBareHomeDir(w.path))
+    || (res.suggestedCwd && !isBareHomeDir(res.suggestedCwd) ? { path: res.suggestedCwd } : null);
+  if (firstReal) {
+    setActiveCwd(firstReal.path, agent);
+    await action('selectWorkspace', { cwd: firstReal.path, targetAgent: agent }).catch(() => null);
+    if (agent !== targetAgent) return;
+    renderModel();
+  } else if (!currentCwd && res.currentCwd) {
+    setActiveCwd(res.currentCwd, agent, { persistAgent: !isBareHomeDir(res.currentCwd) });
+    renderModel();
+  }
 }
 function renderModel() {
   const chip = $('quick-model');
@@ -730,38 +808,96 @@ function renderTargetOptions(targets) {
     button.append(el('span', 'context-target-label', label));
     button.append(el('span', 'context-target-tag', mode === 'launch' ? '唤起' : '直连'));
     button.addEventListener('click', () => run(async () => {
-      await action('selectModel', { targetAgent: row.id });
-      targetAgent = row.id;
-      prefs.targetAgent = row.id;
+      const switchEpoch = ++targetSwitchEpoch;
+      const nextAgent = row.id;
+      const prevCwd = currentCwd;
+      const savedForAgent = prefs.cwdByAgent?.[nextAgent];
+
+      await action('selectModel', { targetAgent: nextAgent });
+      if (switchEpoch !== targetSwitchEpoch) return;
+
+      targetAgent = nextAgent;
+      prefs.targetAgent = nextAgent;
       prefs.activeSessionId = null;
+      contextSessionId = null;
       activeSessionTitle = '';
       prefs.activeSessionTitle = '';
+      if (savedForAgent && !isBareHomeDir(savedForAgent)) {
+        currentCwd = savedForAgent;
+        prefs.cwd = currentCwd;
+      }
       savePrefs();
       updateWorkspaceSectionLabel();
       renderModel();
       renderTargetOptions(targets);
-      const [nextWorkspaces, nextSessions] = await Promise.all([
-        action('workspaces', { targetAgent, includeExtra: contextExtraOpen }).catch(() => null),
-        action('sessions', { targetAgent, cwd: currentCwd || undefined }).catch(() => null),
-      ]);
-      if (Array.isArray(nextWorkspaces?.workspaces)) {
-        workspaceOptions = nextWorkspaces.workspaces;
-        if (!currentCwd && nextWorkspaces?.currentCwd) {
-          currentCwd = nextWorkspaces.currentCwd;
-          prefs.cwd = currentCwd;
-          savePrefs();
-          renderModel();
-        }
-        renderWorkspaceOptions(workspaceOptions);
-      }
+
+      const nextWorkspaces = await action('workspaces', { targetAgent: nextAgent, includeExtra: contextExtraOpen }).catch(() => null);
+      if (switchEpoch !== targetSwitchEpoch) return;
+
+      if (nextWorkspaces?.homeDir) hostHomeDir = nextWorkspaces.homeDir;
+      const nextList = Array.isArray(nextWorkspaces?.workspaces) ? nextWorkspaces.workspaces : [];
+      workspaceOptions = nextList;
       if (contextExtraOpen && Array.isArray(nextWorkspaces?.extraWorkspaces)) {
         extraWorkspaceOptions = nextWorkspaces.extraWorkspaces;
-        renderExtraWorkspaceOptions(extraWorkspaceOptions);
       }
-      if (Array.isArray(nextSessions?.sessions)) {
-        sessionOptions = nextSessions.sessions;
-        renderSessionOptions(sessionOptions);
+
+      const firstReal = nextList.find(w => w?.path && !isBareHomeDir(w.path))
+        || (nextWorkspaces?.suggestedCwd && !isBareHomeDir(nextWorkspaces.suggestedCwd) ? { path: nextWorkspaces.suggestedCwd } : null);
+      const hasSaved = Boolean(savedForAgent && !isBareHomeDir(savedForAgent));
+      let nextCwd = '';
+      if (hasSaved) {
+        nextCwd = savedForAgent;
+      } else if (firstReal) {
+        nextCwd = firstReal.path;
+      } else if (nextList[0]?.path) {
+        nextCwd = nextList[0].path;
+      } else if (hostHomeDir) {
+        nextCwd = hostHomeDir;
+      } else if (nextWorkspaces?.currentCwd) {
+        nextCwd = nextWorkspaces.currentCwd;
       }
+
+      if (nextCwd) {
+        setActiveCwd(nextCwd, nextAgent, { persistAgent: !isBareHomeDir(nextCwd) });
+      }
+
+      const cwdChanged = Boolean(nextCwd) && normalizeDirPath(nextCwd) !== normalizeDirPath(prevCwd);
+      let sel = null;
+      if (nextCwd && cwdChanged) {
+        sel = await action('selectWorkspace', { cwd: nextCwd, targetAgent: nextAgent }).catch(() => null);
+        if (switchEpoch !== targetSwitchEpoch) return;
+        if (!sel && hasSaved) {
+          delete prefs.cwdByAgent[nextAgent];
+          const fallbackCwd = firstReal?.path || nextList[0]?.path || hostHomeDir || nextWorkspaces?.currentCwd || '';
+          if (fallbackCwd) {
+            setActiveCwd(fallbackCwd, nextAgent, { persistAgent: !isBareHomeDir(fallbackCwd) });
+            if (normalizeDirPath(fallbackCwd) !== normalizeDirPath(prevCwd)) {
+              sel = await action('selectWorkspace', { cwd: fallbackCwd, targetAgent: nextAgent }).catch(() => null);
+              if (switchEpoch !== targetSwitchEpoch) return;
+            }
+          }
+        }
+        if (sel?.currentCwd) {
+          setActiveCwd(sel.currentCwd, nextAgent, { persistAgent: !isBareHomeDir(sel.currentCwd) });
+        }
+        if (Array.isArray(sel?.workspaces)) {
+          workspaceOptions = sel.workspaces;
+        }
+      }
+
+      if (Array.isArray(sel?.sessions)) {
+        sessionOptions = sel.sessions;
+      } else {
+        const nextSessions = await action('sessions', { targetAgent: nextAgent, cwd: currentCwd || undefined }).catch(() => null);
+        if (switchEpoch !== targetSwitchEpoch) return;
+        sessionOptions = Array.isArray(nextSessions?.sessions) ? nextSessions.sessions : [];
+      }
+
+      renderModel();
+      renderWorkspaceOptions(workspaceOptions);
+      if (contextExtraOpen) renderExtraWorkspaceOptions(extraWorkspaceOptions);
+      renderSessionOptions(sessionOptions);
+      refreshFilesForWorkspace();
       showFeedback(mode === 'launch'
         ? `已切换至 ${label}（发送时将复制指令并打开应用）`
         : `已切换对话目标：${label}`);
@@ -770,14 +906,18 @@ function renderTargetOptions(targets) {
   }
 }
 async function refreshFilesForWorkspace() {
-  if (!contextSessionId) return;
+  const activeAgent = targetAgent;
+  const activeCwd = currentCwd;
+  const sid = contextSessionId || await ensureContextSession().catch(() => null);
+  if (!sid || targetAgent !== activeAgent || currentCwd !== activeCwd) return;
+  contextSessionId = sid;
   const query = $('context-query')?.value || '';
   const result = await action('files', {
-    sessionId: contextSessionId,
+    sessionId: sid,
     query,
     cwd: currentCwd || undefined,
   }).catch(() => null);
-  if (!result) return;
+  if (!result || targetAgent !== activeAgent || currentCwd !== activeCwd) return;
   renderOptions($('context-files'), result.candidates ?? [], {
     label: row => `@${row.path ?? row.name ?? row.value ?? ''}`, emptyText: '输入文件名以搜索',
     onPick: row => { insertIntoQuickInput(`@${row.path ?? row.name ?? row.value ?? ''} `); },
@@ -785,12 +925,12 @@ async function refreshFilesForWorkspace() {
 }
 async function selectWorkspacePath(cwdPath, displayName, { isExtra = false } = {}) {
   const res = await action('selectWorkspace', { cwd: cwdPath, targetAgent });
-  currentCwd = res?.currentCwd || cwdPath;
-  prefs.cwd = currentCwd;
+  const resolvedCwd = res?.currentCwd || cwdPath;
   prefs.activeSessionId = null;
+  contextSessionId = null;
   activeSessionTitle = '';
   prefs.activeSessionTitle = '';
-  savePrefs();
+  setActiveCwd(resolvedCwd, targetAgent);
   if (Array.isArray(res?.workspaces)) workspaceOptions = res.workspaces;
   if (Array.isArray(res?.sessions)) {
     sessionOptions = res.sessions;
@@ -818,7 +958,9 @@ function makeWorkspaceChip(w, { isExtra = false } = {}) {
   button.append(el('span', 'context-option-label', `${isExtra ? '🗂' : '📁'} ${dirName}`));
   if (w.isOpen) button.append(el('span', 'context-open-tag', '已打开'));
   button.title = w.isOpen ? `${w.path}（已打开）` : w.path;
-  if (w.path === currentCwd || (!currentCwd && !isExtra && w.active)) button.classList.add('is-active');
+  const matchesCurrent = w.path === currentCwd
+    || (currentCwd && normalizeDirPath(w.path) === normalizeDirPath(currentCwd));
+  if (matchesCurrent || (!currentCwd && !isExtra && w.active)) button.classList.add('is-active');
   button.addEventListener('click', () => run(() => selectWorkspacePath(w.path, dirName, { isExtra })));
   return button;
 }
@@ -861,6 +1003,7 @@ async function fetchExtraWorkspaces({ forceScan = false } = {}) {
   renderExtraWorkspaceOptions(extraWorkspaceOptions, { loading: true });
   try {
     const res = await action('workspaces', { targetAgent, includeExtra: true, forceScan });
+    if (res?.homeDir) hostHomeDir = res.homeDir;
     if (Array.isArray(res?.workspaces)) {
       workspaceOptions = res.workspaces;
       renderWorkspaceOptions(workspaceOptions);
@@ -879,6 +1022,7 @@ async function fetchExtraWorkspaces({ forceScan = false } = {}) {
 async function selectNewSession() {
   await action('selectSession', { sessionId: 'new', targetAgent }).catch(() => null);
   prefs.activeSessionId = null;
+  contextSessionId = null;
   activeSessionTitle = '';
   prefs.activeSessionTitle = '';
   savePrefs();
@@ -917,13 +1061,15 @@ function renderSessionOptions(sessions = sessionOptions) {
       prefs.activeSessionId = picked?.sessionId || s.sessionId;
       activeSessionTitle = picked?.title || s.title || '';
       prefs.activeSessionTitle = activeSessionTitle;
-      if (picked?.cwd || s.cwd) {
-        currentCwd = picked?.cwd || s.cwd;
-        prefs.cwd = currentCwd;
+      const nextSessionCwd = picked?.cwd || s.cwd;
+      if (nextSessionCwd) {
+        setActiveCwd(nextSessionCwd, targetAgent);
+      } else {
+        savePrefs();
       }
-      savePrefs();
       renderModel();
       renderWorkspaceOptions(workspaceOptions);
+      if (contextExtraOpen) renderExtraWorkspaceOptions(extraWorkspaceOptions);
       renderSessionOptions(sessionOptions);
       refreshFilesForWorkspace();
       showFeedback(`已绑定会话：${activeSessionTitle || '历史会话'}（发消息将直接续聊）`);
@@ -945,13 +1091,25 @@ async function loadContext(sessionId, { includeExtra = contextExtraOpen } = {}) 
     action('sessions', { targetAgent, cwd: currentCwd || undefined }),
   ]);
   const skillRows = skills.status === 'fulfilled' ? skills.value.skills ?? [] : [];
-  const fileRows = files.status === 'fulfilled' ? files.value.candidates ?? [] : [];
+  let fileRows = files.status === 'fulfilled' ? files.value.candidates ?? [] : [];
   let targetRows = [];
+  let targetChanged = false;
   if (models.status === 'fulfilled') {
+    const prevTarget = targetAgent;
     if (Array.isArray(models.value?.targets) && models.value.targets.length) {
       targetRows = models.value.targets;
       chatTargets = targetRows;
-      if (!prefs.targetAgent && models.value.current) targetAgent = models.value.current;
+      if (!prefs.targetAgent && models.value.current) {
+        targetAgent = models.value.current;
+        prefs.targetAgent = targetAgent;
+        const saved = prefs.cwdByAgent?.[targetAgent];
+        if (saved && !isBareHomeDir(saved)) {
+          currentCwd = saved;
+          prefs.cwd = currentCwd;
+        }
+        savePrefs();
+      }
+      targetChanged = targetAgent !== prevTarget;
       renderModel();
     } else if (Array.isArray(models.value?.groups)) {
       targetRows = models.value.groups.flatMap(group => (group.models ?? []).map(m => ({
@@ -961,26 +1119,65 @@ async function loadContext(sessionId, { includeExtra = contextExtraOpen } = {}) 
     }
   }
   if (!targetRows.length) targetRows = chatTargets;
-  if (workspaces.status === 'fulfilled') {
-    workspaceOptions = Array.isArray(workspaces.value?.workspaces) ? workspaces.value.workspaces : [];
+  let workspacesPayload = workspaces.status === 'fulfilled' ? workspaces.value : null;
+  if (targetChanged) {
+    workspacesPayload = await action('workspaces', { targetAgent, includeExtra }).catch(() => workspacesPayload);
+  }
+  let sessionsPayload = sessions.status === 'fulfilled' ? sessions.value : null;
+  let cwdAutoSwitched = false;
+  if (workspacesPayload) {
+    if (workspacesPayload.homeDir) hostHomeDir = workspacesPayload.homeDir;
+    workspaceOptions = Array.isArray(workspacesPayload.workspaces) ? workspacesPayload.workspaces : [];
     if (includeExtra) {
-      extraWorkspaceOptions = Array.isArray(workspaces.value?.extraWorkspaces) ? workspaces.value.extraWorkspaces : [];
+      extraWorkspaceOptions = Array.isArray(workspacesPayload.extraWorkspaces) ? workspacesPayload.extraWorkspaces : [];
     }
-    if (!currentCwd && workspaces.value?.currentCwd) {
-      currentCwd = workspaces.value.currentCwd;
-      prefs.cwd = currentCwd;
-      savePrefs();
-      renderModel();
+    const firstRealWorkspace = workspaceOptions.find(w => w?.path && !isBareHomeDir(w.path))
+      || (workspacesPayload.suggestedCwd && !isBareHomeDir(workspacesPayload.suggestedCwd)
+        ? { path: workspacesPayload.suggestedCwd }
+        : null);
+    if (!currentCwd || isBareHomeDir(currentCwd)) {
+      if (firstRealWorkspace) {
+        const prevCwd = currentCwd;
+        setActiveCwd(firstRealWorkspace.path, targetAgent);
+        cwdAutoSwitched = normalizeDirPath(currentCwd) !== normalizeDirPath(prevCwd);
+        renderModel();
+      } else if (!currentCwd && workspacesPayload.currentCwd) {
+        setActiveCwd(workspacesPayload.currentCwd, targetAgent, {
+          persistAgent: !isBareHomeDir(workspacesPayload.currentCwd),
+        });
+        renderModel();
+      }
     }
   } else {
     workspaceOptions = [];
     if (includeExtra) extraWorkspaceOptions = [];
   }
-  if (sessions.status === 'fulfilled') {
-    sessionOptions = Array.isArray(sessions.value?.sessions) ? sessions.value.sessions : [];
-  } else {
-    sessionOptions = [];
+  if (targetChanged) {
+    contextSessionId = null;
+    sessionId = await ensureContextSession().catch(() => sessionId);
+    contextSessionId = sessionId;
   }
+  if (cwdAutoSwitched) {
+    const [sel, nextFiles] = await Promise.all([
+      action('selectWorkspace', { cwd: currentCwd, targetAgent }).catch(() => null),
+      action('files', { sessionId, query: '', cwd: currentCwd || undefined }).catch(() => null),
+    ]);
+    if (Array.isArray(sel?.workspaces)) workspaceOptions = sel.workspaces;
+    if (Array.isArray(sel?.sessions)) {
+      sessionsPayload = { sessions: sel.sessions };
+    } else {
+      sessionsPayload = await action('sessions', { targetAgent, cwd: currentCwd || undefined }).catch(() => sessionsPayload);
+    }
+    if (Array.isArray(nextFiles?.candidates)) fileRows = nextFiles.candidates;
+  } else if (targetChanged) {
+    const [nextSessions, nextFiles] = await Promise.all([
+      action('sessions', { targetAgent, cwd: currentCwd || undefined }).catch(() => null),
+      action('files', { sessionId, query: '', cwd: currentCwd || undefined }).catch(() => null),
+    ]);
+    if (nextSessions) sessionsPayload = nextSessions;
+    if (Array.isArray(nextFiles?.candidates)) fileRows = nextFiles.candidates;
+  }
+  sessionOptions = Array.isArray(sessionsPayload?.sessions) ? sessionsPayload.sessions : [];
   renderOptions($('context-skills'), skillRows, {
     label: row => `/${row.name}`, emptyText: '没有可用技能',
     onPick: row => { insertIntoQuickInput(`/${row.name} `); },
@@ -1086,6 +1283,7 @@ function closeTranscript() {
 }
 function startNewChat() {
   prefs.activeSessionId = null; prefs.activeSessionTitle = ''; prefs.model = null;
+  contextSessionId = null;
   activeSessionTitle = '';
   savePrefs();
   pendingImages = []; quoted = null; transcriptSessionId = null;
@@ -1282,12 +1480,11 @@ $('context-browse-cwd')?.addEventListener('click', () => run(async () => {
   const res = await action('selectWorkspace', { browse: true, targetAgent });
   if (res?.canceled) return;
   if (res?.currentCwd) {
-    currentCwd = res.currentCwd;
-    prefs.cwd = currentCwd;
     prefs.activeSessionId = null;
+    contextSessionId = null;
     activeSessionTitle = '';
     prefs.activeSessionTitle = '';
-    savePrefs();
+    setActiveCwd(res.currentCwd, targetAgent);
   }
   if (Array.isArray(res?.workspaces)) workspaceOptions = res.workspaces;
   if (Array.isArray(res?.sessions)) sessionOptions = res.sessions;
@@ -1321,8 +1518,13 @@ $('context-query').addEventListener('input', event => {
   clearTimeout(fileQueryTimer);
   const query = event.target.value;
   fileQueryTimer = setTimeout(() => run(async () => {
-    if (!contextSessionId) return;
-    const result = await action('files', { sessionId: contextSessionId, query, cwd: currentCwd || undefined });
+    const activeAgent = targetAgent;
+    const activeCwd = currentCwd;
+    const sid = contextSessionId || await ensureContextSession().catch(() => null);
+    if (!sid || targetAgent !== activeAgent || currentCwd !== activeCwd) return;
+    contextSessionId = sid;
+    const result = await action('files', { sessionId: sid, query, cwd: currentCwd || undefined });
+    if (targetAgent !== activeAgent || currentCwd !== activeCwd) return;
     renderOptions($('context-files'), result.candidates ?? [], {
       label: row => `@${row.path ?? row.name ?? row.value ?? ''}`, emptyText: '没有匹配的文件',
       onPick: row => insertIntoQuickInput(`@${row.path ?? row.name ?? row.value ?? ''} `),
@@ -1389,8 +1591,12 @@ if (native) {
       targetAgent = mode.source;
       prefs.targetAgent = mode.source;
       prefs.activeSessionId = null;
+      contextSessionId = null;
       activeSessionTitle = '';
       prefs.activeSessionTitle = '';
+      const saved = prefs.cwdByAgent?.[targetAgent];
+      currentCwd = (saved && !isBareHomeDir(saved)) ? saved : '';
+      prefs.cwd = currentCwd;
       savePrefs();
       renderModel();
     }
@@ -1398,6 +1604,7 @@ if (native) {
       source = mode.source;
       if (sourceInitialized) {
         prefs.activeSessionId = null;
+        contextSessionId = null;
         activeSessionTitle = '';
         prefs.activeSessionTitle = '';
         prefs.model = null;
@@ -1416,6 +1623,7 @@ if (native) {
           if (info.localEngine) localEngine = info.localEngine;
           syncTargetFromInfo(info);
         }
+        await ensureDefaultWorkspaceForTarget();
         await poll();
       });
     }
@@ -1428,6 +1636,7 @@ if (native) {
     voiceButton.dataset.available = String(Boolean(info.speechAvailable));
     if (info.localEngine) localEngine = info.localEngine;
     syncTargetFromInfo(info);
+    await ensureDefaultWorkspaceForTarget();
   });
   // Click-through must follow real geometry, not CSS `:hover`. Turning on
   // `setIgnoreMouseEvents` makes the page stop receiving hover, which hides the
@@ -1474,6 +1683,7 @@ if (native) {
   run(async () => {
     const info = await action('info').catch(() => null);
     syncTargetFromInfo(info);
+    await ensureDefaultWorkspaceForTarget();
   });
 }
 renderModel(); renderAttachments(); renderQuote();
