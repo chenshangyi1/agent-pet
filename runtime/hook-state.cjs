@@ -1,6 +1,7 @@
 'use strict';
 // Shared lifecycle reducer for hook-based read-only providers (WorkBuddy, Antigravity).
 // Only normalized metadata enters this reducer; prompts/tool arguments never do.
+const { hookProvidersMap } = require('../connectors/catalog.cjs');
 const ACTIVE_TTL = 30 * 60_000;
 const HISTORY_TTL = 24 * 60 * 60_000;
 const LABELS = {
@@ -12,11 +13,7 @@ const LABELS = {
   idle: '空闲',
   unknown: '状态待更新',
 };
-const PROVIDERS = {
-  workbuddy: { id: 'workbuddy', label: 'WorkBuddy' },
-  antigravity: { id: 'antigravity', label: 'Antigravity' },
-  codex: { id: 'codex', label: 'Codex' },
-};
+const PROVIDERS = hookProvidersMap();
 const QUESTION_TOOL = /ask_?question|ask_user|request_user_input/i;
 const ANTIGRAVITY_BLOCKED_REASONS = new Set([
   'ERROR',
@@ -96,7 +93,7 @@ function applyEvent(store, event, expectedProvider) {
       if (reason === 'USER_CANCELED') {
         row.status = 'cancelled';
         row.detail = '本轮已取消';
-      } else if (provider.id === 'antigravity' && (ANTIGRAVITY_BLOCKED_REASONS.has(reason) || event.hasError)) {
+      } else if (ANTIGRAVITY_BLOCKED_REASONS.has(reason) || event.hasError) {
         row.status = 'blocked';
         row.detail = `本轮执行异常，请在 ${provider.label} 查看`;
       } else {

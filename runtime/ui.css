@@ -40,7 +40,7 @@ body[data-status=running] #mini-pill{background:#34c759;border-color:rgba(255,25
    stays visible under the character. Only an explicit click expands the notice
    stack; hovering must never fan cards out across the desktop. */
 #panel{position:absolute;left:var(--panel-left,10px);top:calc(var(--panel-top,148px) - 16px);width:380px;padding-top:16px;display:flex;flex-direction:column;align-items:center;gap:10px;opacity:1;visibility:visible;transform:none;transition:opacity .16s ease;pointer-events:none}
-#panel > #toolbar{pointer-events:auto}
+#panel > #toolbar,#panel > #feedback{pointer-events:auto}
 #pet.expanded #panel{pointer-events:auto}
 /* In the collapsed state only the capsule survives. Scoping the suppression to
    :not(.expanded) leaves every child's own display rule intact when opened.
@@ -59,7 +59,6 @@ body[data-status=running] #mini-pill{background:#34c759;border-color:rgba(255,25
 /* Every panel child gets an explicit order so the compact bar stays adjacent to
    the character in both placements, exactly like Codex's persistent controls. */
 #pet[data-panel-order=controls-first] #toolbar{order:0}
-#pet[data-panel-order=controls-first] #quick-restore{order:1}
 #pet[data-panel-order=controls-first] #attachment-strip{order:2}
 #pet[data-panel-order=controls-first] #context-popover{order:3}
 #pet[data-panel-order=controls-first] #transcript{order:4}
@@ -72,7 +71,6 @@ body[data-status=running] #mini-pill{background:#34c759;border-color:rgba(255,25
 #pet[data-panel-order=controls-last] #activity-list{order:2}
 #pet[data-panel-order=controls-last] #transcript{order:3}
 #pet[data-panel-order=controls-last] #toolbar{order:4}
-#pet[data-panel-order=controls-last] #quick-restore{order:5}
 #pet[data-panel-order=controls-last] #attachment-strip{order:6}
 #pet[data-panel-order=controls-last] #context-popover{order:7}
 #pet[data-panel-order=controls-last] #feedback{order:8}
@@ -124,7 +122,8 @@ body[data-status=running] #mini-pill{background:#34c759;border-color:rgba(255,25
 #quick-send:hover{background:#3a3d43}
 #quick-send:active{transform:scale(.94)}
 #quick-send:disabled{opacity:.45;cursor:default}
-.tool-button.recording{background:#f7e7e4;color:#ae4f45;animation:pulse 1s ease-in-out infinite alternate}
+.tool-button.recording{background:#f7e7e4;color:#ae4f45;box-shadow:0 0 0 calc(2px + var(--voice-level,0) * 6px) rgba(174,79,69,.16);animation:pulse 1s ease-in-out infinite alternate}
+.tool-button.recording svg{transform:scale(calc(1 + var(--voice-level,0) * .18));transition:transform .08s linear}
 .tool-button.voice-processing{background:#f1e9fa;color:#725498;animation:pulse 1.4s ease-in-out infinite alternate}
 @keyframes pulse{to{box-shadow:0 0 0 5px rgba(174,79,69,.12)}}
 
@@ -135,29 +134,50 @@ body[data-status=running] #mini-pill{background:#34c759;border-color:rgba(255,25
 .awake-body{font-size:11px;color:#6d7178;line-height:16px}
 #awake-dismiss{align-self:flex-start;margin-top:4px;padding:3px 10px;border-radius:11px;background:rgba(25,30,40,.08);color:#3c4047;font-size:11px}
 #awake-dismiss:hover{background:rgba(25,30,40,.14)}
-#activity-stack{width:100%;padding:6px 12px;border-radius:12px;background:rgba(255,255,255,.55);border:1px solid rgba(255,255,255,.5);box-shadow:0 3px 12px rgba(24,29,38,.08);color:#5d626b;font-size:11px;backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px)}
+#activity-stack{width:min(100%,348px);padding:5px 12px;border-radius:999px;background:rgba(255,255,255,.55);border:1px solid rgba(255,255,255,.5);box-shadow:0 3px 12px rgba(24,29,38,.08);color:#5d626b;font-size:11px;backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px)}
 #activity-stack:hover{background:rgba(255,255,255,.7)}
 
 /* Reaching the pet must reveal the sessions themselves, not just a toolbar. */
-#activity-list{width:100%;display:none;flex-direction:column;gap:10px;max-height:260px;overflow-y:auto;overscroll-behavior:contain;padding:2px}
+#activity-list{width:min(100%,348px);display:none;flex-direction:column;gap:8px;max-height:360px;overflow-y:auto;overscroll-behavior:contain;padding:2px}
 /* Only an explicit click (bell, character, shortcut, error) expands notices.
    A pointer drifting over the sprite keeps the collapsed capsule untouched. */
 #pet.expanded.activities-open #activity-list,#pet.expanded.show #activity-list{display:flex}
-/* Compact card, sized to read like Codex Pet's activity rows rather than a
-   dashboard tile. The main row stays a fixed 72px so the stack is dead level. */
+/* Compact card, sized to match Codex Pet's capsule width with ONLY the Agent
+   icon anchored cleanly on the left. */
+#activity-list.is-stacked{gap:0;overflow:visible;max-height:none;padding-bottom:6px;cursor:pointer}
+#activity-list.is-stacked .activity-card{transition:margin-top .22s cubic-bezier(.2,.8,.2,1),transform .22s cubic-bezier(.2,.8,.2,1),opacity .18s ease,border-radius .16s ease,background .16s ease}
+#activity-list.is-stacked .activity-card[data-stack-layer="0"]{position:relative;z-index:4;box-shadow:0 8px 22px rgba(24,29,38,.12)}
+#activity-list.is-stacked .activity-card[data-stack-layer="0"]:hover{border-radius:999px;background:rgba(255,255,255,.68);transform:translateY(-1px)}
+#activity-list.is-stacked .activity-card[data-stack-layer="1"]{position:relative;z-index:3;height:52px;min-height:52px;margin-top:-42px;transform:scale(.95);transform-origin:center bottom;opacity:.9;overflow:hidden;pointer-events:auto;background:rgba(255,255,255,.42)}
+#activity-list.is-stacked .activity-card[data-stack-layer="2"]{position:relative;z-index:2;height:52px;min-height:52px;margin-top:-43px;transform:scale(.90);transform-origin:center bottom;opacity:.76;overflow:hidden;pointer-events:auto;background:rgba(255,255,255,.36)}
+#activity-list.is-stacked .activity-card[data-stack-layer="1"] .activity-main,
+#activity-list.is-stacked .activity-card[data-stack-layer="2"] .activity-main{visibility:hidden}
+#activity-list.is-stacked .activity-actions,
+#activity-list.is-stacked .activity-approval,
+#activity-list.is-stacked .activity-followup,
+#activity-list.is-stacked .activity-progress-row,
+#activity-list.is-stacked .activity-detail-full{display:none!important}
+#activity-list.is-stacked .activity-card:hover .activity-detail{display:block!important}
+#activity-list:not(.is-stacked){max-height:360px}
+.activity-stack-count{flex:0 0 auto;margin-left:auto;padding:1px 7px;border-radius:999px;background:rgba(25,30,40,.08);color:#484c54;font-size:10.5px;font-weight:600;line-height:15px}
 .activity-card{position:relative;width:100%;padding:0;border-radius:14px;background:rgba(255,255,255,.92);border:1px solid rgba(255,255,255,.9);box-shadow:0 4px 14px rgba(24,29,38,.1);backdrop-filter:blur(22px);-webkit-backdrop-filter:blur(22px);transition:transform .14s ease,background .14s ease}
 .activity-card:hover{transform:translateY(-1px);background:rgba(255,255,255,.99)}
 .activity-card[data-muted=true]{opacity:.55}
-.activity-main{display:flex;align-items:center;gap:10px;width:100%;min-height:70px;padding:10px 14px 10px 12px;text-align:left;background:transparent}
+.activity-main{display:flex;align-items:center;gap:10px;width:100%;min-height:52px;padding:8px 14px 8px 12px;text-align:left;background:transparent}
 .activity-main:active{transform:scale(.995)}
-.activity-glyph{flex:0 0 24px;width:24px;height:24px;display:grid;place-items:center;border-radius:50%;background:rgba(25,30,40,.06);color:#6a6f77;font-size:12px;font-weight:600}
-.activity-card[data-status=waiting] .activity-glyph{background:rgba(211,167,77,.16);color:#a47726}
-.activity-card[data-status=blocked] .activity-glyph{background:rgba(216,132,120,.16);color:#ad6258}
-.activity-card[data-status=ready] .activity-glyph{background:rgba(131,168,139,.18);color:#64896c}
-.activity-copy{display:flex;flex-direction:column;gap:2px;min-width:0;flex:1}
-.activity-head{display:flex;align-items:center;gap:7px;min-width:0}
-.activity-provider-icon{flex:0 0 18px;width:18px;height:18px;display:block;object-fit:contain;border-radius:4px}
-.activity-title{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;font-size:13px;font-weight:600;letter-spacing:-.1px;line-height:17px}
+.activity-avatar{flex:0 0 24px;width:24px;height:24px;display:grid;place-items:center}
+.activity-provider-icon{width:24px;height:24px;display:block;object-fit:contain;border-radius:6px}
+.activity-glyph{flex:0 0 16px;width:16px;height:16px;display:grid;place-items:center;border-radius:50%;color:#fff;background:#a5aab2}
+.activity-glyph svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2.1;stroke-linecap:round;stroke-linejoin:round}
+.activity-card[data-status=running] .activity-glyph{background:transparent}
+.activity-spinner{width:14px;height:14px;border-radius:50%;border:2px solid rgba(92,126,184,.24);border-top-color:#5c7eb8;animation:activity-spin .9s linear infinite}
+@keyframes activity-spin{to{transform:rotate(360deg)}}
+.activity-card[data-status=waiting] .activity-glyph{background:#d3a74d}
+.activity-card[data-status=blocked] .activity-glyph{background:#d88478}
+.activity-card[data-status=ready] .activity-glyph{background:#34c759}
+.activity-copy{display:flex;flex-direction:column;gap:1px;min-width:0;flex:1}
+.activity-head{display:flex;align-items:center;gap:6px;min-width:0}
+.activity-title{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;font-size:13.5px;font-weight:600;letter-spacing:-.15px;line-height:18px}
 .activity-status{flex:0 0 auto;padding:1px 7px;border-radius:8px;background:rgba(25,30,40,.055);color:#6b7078;font-size:10px;line-height:15px}
 .activity-detail{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#777b81;font-size:11px;font-weight:450;line-height:15px}
 .activity-card[data-expanded=true] .activity-detail{white-space:normal}
@@ -213,8 +233,6 @@ body[data-status=running] #mini-pill{background:#34c759;border-color:rgba(255,25
 #transcript-input{flex:1;min-width:0;height:26px;padding:0 9px;border-radius:13px;background:rgba(25,30,40,.06);outline:none;font-size:11px;cursor:text;user-select:text}
 #transcript-send{flex:0 0 26px;width:26px;height:26px;border-radius:50%;background:#25272a;color:#fff;font-size:13px;line-height:1}
 #transcript-send:hover{background:#3a3d43}
-#quick-restore{align-self:center;padding:4px 12px;border-radius:12px;background:rgba(255,255,255,.6);border:1px solid rgba(255,255,255,.5);color:#555a62;font-size:10px;backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px)}
-#quick-restore:hover{background:rgba(255,255,255,.78)}
 #attachment-strip{display:flex;flex-wrap:wrap;gap:5px;width:100%}
 .attachment-chip{display:inline-flex;align-items:center;gap:4px;max-width:170px;padding:3px 4px 3px 9px;border-radius:11px;background:rgba(255,255,255,.7);border:1px solid rgba(255,255,255,.6);color:#555a62;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .attachment-chip button{width:16px;height:16px;border-radius:50%;background:rgba(25,30,40,.07);font-size:11px;line-height:1}
@@ -235,8 +253,8 @@ body[data-status=running] #mini-pill{background:#34c759;border-color:rgba(255,25
 .context-empty{color:#8a8e95;font-size:10px}
 .context-note{margin:8px 0 0;color:#8a8e95;font-size:10px}
 
-#empty{width:100%;margin:0;padding:16px;text-align:center;color:#73777e;border-radius:26px;background:rgba(255,255,255,.84);box-shadow:0 8px 28px rgba(24,29,38,.1)}
-#feedback{display:none;align-items:center;gap:8px;max-width:360px;margin:-2px 0 0;padding:7px 9px 7px 13px;border-radius:16px;background:rgba(255,255,255,.93);color:#5d626b;box-shadow:0 6px 22px rgba(24,29,38,.11);font-size:12px;user-select:text}
+#empty{width:100%;margin:0;padding:11px 16px;text-align:center;color:#73777e;font-size:12.5px;border-radius:999px;background:rgba(255,255,255,.52);border:1px solid rgba(255,255,255,.58);box-shadow:0 4px 16px rgba(24,29,38,.08);backdrop-filter:blur(22px) saturate(160%);-webkit-backdrop-filter:blur(22px) saturate(160%)}
+#feedback{display:none;align-items:center;gap:8px;max-width:348px;margin:-2px 0 0;padding:7px 9px 7px 13px;border-radius:16px;background:rgba(255,255,255,.93);color:#5d626b;box-shadow:0 6px 22px rgba(24,29,38,.11);font-size:12px;user-select:text}
 #feedback.visible{display:flex}
 #feedback[data-error=true]{color:#a64c43}
 #feedback-text{flex:1;min-width:0}
@@ -244,33 +262,22 @@ body[data-status=running] #mini-pill{background:#34c759;border-color:rgba(255,25
 #feedback-retry:hover{background:rgba(166,76,67,.2)}
 
 /* -------------------------------------------------------------------------- */
-/* Codex form A: ONE full-width frosted banner, in two layers.                 */
-/*  - folded (pointer away): plain pill, bold title + ONE short grey line;     */
-/*    no glyph, no action row, no progress track;                              */
-/*  - hovered / expanded: the glyph, the untouched detail payload and the      */
-/*    action row come back, so no functionality is lost.                       */
-/* Placed last so it wins over the older per-status card rules above.         */
+/* Codex form A: frosted capsule matching Codex-Pet width (~330px) plus the  */
+/* left Agent avatar slot (~348px total). Placed last to override base rules. */
 /* -------------------------------------------------------------------------- */
-#activity-list{width:min(100%,370px)}
+#activity-list{width:min(100%,348px)}
 .activity-card{border-radius:999px;background:rgba(255,255,255,.46);border:1px solid rgba(255,255,255,.6);box-shadow:0 4px 16px rgba(24,29,38,.07);backdrop-filter:blur(22px) saturate(160%);-webkit-backdrop-filter:blur(22px) saturate(160%)}
 .activity-card:hover,.activity-card[data-expanded=true]{border-radius:22px;background:rgba(255,255,255,.66)}
-.activity-main{min-height:56px;padding:8px 20px 8px 22px;gap:10px}
-.activity-glyph{flex:0 0 22px;width:22px;height:22px;font-size:12px;color:#fff;background:#879bb8}
-.activity-card[data-status=waiting] .activity-glyph{background:#d3a74d;color:#fff}
-.activity-card[data-status=blocked] .activity-glyph{background:#d88478;color:#fff}
-.activity-card[data-status=ready] .activity-glyph{background:#34c759;color:#fff}
-/* visibility (not display) keeps the 22px slot, so the title never jumps when
-   the pointer arrives and the glyph fades in. */
-.activity-card:not(:hover):not([data-expanded=true]) .activity-glyph{visibility:hidden}
+.activity-main{min-height:52px;padding:8px 14px 8px 12px;gap:10px}
 .activity-status{display:none}
-.activity-title{font-size:15px;font-weight:650;line-height:20px;letter-spacing:-.2px}
-.activity-detail,.activity-card[data-status=waiting] .activity-detail,.activity-card[data-status=blocked] .activity-detail,.activity-card[data-status=ready] .activity-detail{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#5f646c;font-size:13.5px;line-height:19px;font-weight:400}
-.activity-detail-full{display:none;color:#5f646c;font-size:12px;line-height:17px;font-weight:450;white-space:normal;overflow-wrap:anywhere}
+.activity-title{font-size:13.5px;font-weight:650;line-height:18px;letter-spacing:-.2px}
+.activity-detail,.activity-card[data-status=waiting] .activity-detail,.activity-card[data-status=blocked] .activity-detail,.activity-card[data-status=ready] .activity-detail{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#5f646c;font-size:12.5px;line-height:17px;font-weight:400}
+.activity-detail-full{display:none;color:#5f646c;font-size:11.5px;line-height:16px;font-weight:450;white-space:normal;overflow-wrap:anywhere}
 .activity-card:hover .activity-detail,.activity-card[data-expanded=true] .activity-detail{display:none}
 .activity-card:hover .activity-detail-full,.activity-card[data-expanded=true] .activity-detail-full{display:block;max-height:102px;overflow:hidden}
 /* The progress track belongs to the expanded detail view only. */
 .activity-card:not([data-expanded=true]) .activity-progress-row{display:none}
-.activity-actions{padding:0 12px 9px 44px}
+.activity-actions{padding:0 12px 9px 46px}
 
 body.control-only #character{display:none}
 body.control-only #panel{top:var(--panel-top,8px)}

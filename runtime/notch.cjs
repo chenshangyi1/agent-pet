@@ -21,7 +21,7 @@ function createNotch({ getState, command }) {
         let event;
         try { event = JSON.parse(line); } catch { continue; }
         if (event.type === 'status') { expanded = Boolean(event.expanded); send(); }
-        else if (event.type === 'action' && ['show', 'hide', 'source', 'open'].includes(event.action)) {
+        else if (event.type === 'action' && ['show', 'hide', 'source', 'open', 'manage', 'reset'].includes(event.action)) {
           Promise.resolve().then(() => command(event.action, event.value)).then(send)
             .catch(() => write({ type: 'error' }));
         }

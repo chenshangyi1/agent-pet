@@ -4,15 +4,15 @@ const os = require('node:os');
 const path = require('node:path');
 const { applyEvent, sessionRows, HISTORY_TTL, PROVIDERS } = require('./hook-state.cjs');
 const { CodexSessionReader } = require('./codex-sessions.cjs');
+const { CONNECTOR_CATALOG } = require('../connectors/catalog.cjs');
 
 const rank = { waiting: 0, blocked: 1, running: 2, ready: 3, unknown: 4, idle: 5, history: 6, cancelled: 7 };
-const HOOK_PROVIDERS = Object.keys(PROVIDERS);
-const SOURCE_META = [
-  { id: 'dsh', label: 'DSH', emptyDetail: '未连接' },
-  { id: 'workbuddy', label: 'WorkBuddy', emptyDetail: '等待首个任务' },
-  { id: 'antigravity', label: 'Antigravity', emptyDetail: '等待首个任务' },
-  { id: 'codex', label: 'Codex', emptyDetail: '等待首个任务' },
-];
+const ALL_HOOK_PROVIDERS = Object.keys(PROVIDERS);
+const SOURCE_META = CONNECTOR_CATALOG.map(entry => ({
+  id: entry.id,
+  label: entry.label,
+  emptyDetail: entry.id === 'dsh' ? '未连接' : '等待首个任务',
+}));
 
 function sortRows(rows) {
   return rows.sort((a, b) => (rank[a.status] ?? 6) - (rank[b.status] ?? 6) || Number(b.updatedAt) - Number(a.updatedAt));
@@ -22,7 +22,9 @@ class Providers {
   constructor(dataDir, legacy = {}, options = {}) {
     this.dataDir = dataDir;
     this.legacy = legacy;
-    this.hookStores = Object.fromEntries(HOOK_PROVIDERS.map(id => [id, { ready: false, sessions: {} }]));
+    this.hookStores = Object.fromEntries(ALL_HOOK_PROVIDERS.map(id => [id, { ready: false, sessions: {} }]));
+    this.enabledSet = null;
+    if (options.enabledProviders !== undefined) this.setEnabledProviders(options.enabledProviders);
     const defaultCompanionDir = path.join(os.homedir(), '.dsh', 'companion');
     const codexSessionsDir = options.codexSessionsDir !== undefined
       ? options.codexSessionsDir
@@ -34,6 +36,20 @@ class Providers {
     this.codexReader = codexSessionsDir ? new CodexSessionReader(codexSessionsDir) : null;
     this.flight = null;
     this.snapshot = { items: [], sources: [] };
+  }
+
+  setEnabledProviders(ids) {
+    this.enabledSet = new Set(Array.isArray(ids) ? ids : [...(ids || [])]);
+  }
+
+  activeHookProviders() {
+    if (!this.enabledSet) return ALL_HOOK_PROVIDERS;
+    return ALL_HOOK_PROVIDERS.filter(id => this.enabledSet.has(id));
+  }
+
+  activeSourceMeta() {
+    if (!this.enabledSet) return SOURCE_META;
+    return SOURCE_META.filter(meta => this.enabledSet.has(meta.id));
   }
 
   async dsh(body) {
@@ -100,27 +116,34 @@ class Providers {
   }
 
   async load() {
+    const activeHooks = this.activeHookProviders();
+    const includeDsh = !this.enabledSet || this.enabledSet.has('dsh');
     const [dshResult, ...hookResults] = await Promise.allSettled([
-      this.dsh({ action: 'list' }),
-      ...HOOK_PROVIDERS.map(id => this.readHookProvider(id)),
+      includeDsh ? this.dsh({ action: 'list' }) : Promise.resolve({ items: [] }),
+      ...activeHooks.map(id => this.readHookProvider(id)),
     ]);
-    const dsh = dshResult.status === 'fulfilled' ? dshResult.value.items ?? [] : [];
-    const hookRows = HOOK_PROVIDERS.flatMap((_, index) => (hookResults[index].status === 'fulfilled' ? hookResults[index].value : []));
+    const dsh = includeDsh && dshResult.status === 'fulfilled' ? dshResult.value.items ?? [] : [];
+    const hookRows = activeHooks.flatMap((_, index) => (hookResults[index].status === 'fulfilled' ? hookResults[index].value : []));
     const items = sortRows([
       ...dsh.map(row => ({ ...row, provider: 'dsh', providerLabel: 'DSH', capabilities: { reply: true, cancel: true, open: true } })),
       ...hookRows,
     ]);
-    const sources = SOURCE_META.map(meta => {
+    const sources = this.activeSourceMeta().map(meta => {
       const rows = items.filter(row => row.provider === meta.id);
       const current = rows.find(row => !['history', 'idle', 'cancelled'].includes(row.status)
         && (row.status !== 'ready' || row.unread && Date.now() - Number(row.updatedAt) < 600_000));
-      const connected = meta.id === 'dsh' ? dshResult.status === 'fulfilled' : rows.length > 0;
+      const connected = meta.id === 'dsh' ? (includeDsh && dshResult.status === 'fulfilled') : rows.length > 0;
+      const detail = current && current.title && current.title !== meta.label
+        ? `${current.title} · ${current.detail || current.statusText || '进行中'}`
+        : current?.detail || current?.statusText || (connected ? '空闲' : meta.emptyDetail);
       return {
         id: meta.id,
         label: meta.label,
         connected,
         status: current?.status ?? 'idle',
-        detail: current?.statusText || (connected ? '空闲' : meta.emptyDetail),
+        detail,
+        sessionCount: rows.length,
+        sessionTitle: current?.title || '',
         activityCount: rows.filter(row => ['running', 'waiting', 'blocked'].includes(row.status)).length,
       };
     });

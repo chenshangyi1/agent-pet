@@ -17,24 +17,55 @@ const composeButton = $('tool-compose');
 const activitiesButton = $('tool-activities');
 const miniPill = $('mini-pill');
 const labels = { running: '正在工作', waiting: '需要你确认', blocked: '遇到问题', ready: '已完成', cancelled: '已取消', idle: '空闲' };
-const glyphs = { waiting: '?', blocked: '!', ready: '✓', running: '·', cancelled: '×', idle: '·' };
+const svgEl = (tag, attrs = {}) => {
+  const node = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
+  return node;
+};
+function makeStatusGlyph(status) {
+  const glyph = el('span', 'activity-glyph');
+  glyph.setAttribute('aria-hidden', 'true');
+  if (status === 'running') {
+    glyph.append(el('span', 'activity-spinner'));
+    return glyph;
+  }
+  const svg = svgEl('svg', { viewBox: '0 0 16 16' });
+  if (status === 'ready') {
+    svg.append(svgEl('path', { d: 'M4.3 8.2 6.8 10.7 11.7 5.6' }));
+  } else if (status === 'waiting') {
+    svg.append(svgEl('path', { d: 'M6.2 6a1.9 1.9 0 0 1 3.7.5c0 1.3-1.9 1.7-1.9 3' }));
+    svg.append(svgEl('circle', { cx: '8', cy: '12.1', r: '0.75', fill: 'currentColor', stroke: 'none' }));
+  } else if (status === 'blocked') {
+    svg.append(svgEl('path', { d: 'M8 4.4v4.7' }));
+    svg.append(svgEl('circle', { cx: '8', cy: '11.8', r: '0.75', fill: 'currentColor', stroke: 'none' }));
+  } else if (status === 'cancelled') {
+    svg.append(svgEl('path', { d: 'm5.4 5.4 5.2 5.2m0-5.2-5.2 5.2' }));
+  } else {
+    svg.append(svgEl('path', { d: 'M5.2 8h5.6' }));
+  }
+  glyph.append(svg);
+  return glyph;
+}
 const el = (tag, className, text) => {
   const node = document.createElement(tag);
   if (className) node.className = className;
   if (text !== undefined) node.textContent = text;
   return node;
 };
-const VALID_PROVIDERS = new Set(['dsh', 'antigravity', 'workbuddy', 'codex']);
 function makeProviderIcon(provider = 'dsh') {
-  const id = VALID_PROVIDERS.has(provider) ? provider : 'dsh';
+  const id = typeof provider === 'string' && /^[a-z0-9-]+$/.test(provider) ? provider : 'dsh';
   const img = el('img', 'activity-provider-icon');
   img.src = native ? `../assets/icons/${id}.png` : `/companion/icon-${id}`;
   img.alt = '';
   img.setAttribute('aria-hidden', 'true');
   img.decoding = 'async';
+  img.addEventListener('error', () => {
+    const fallback = native ? '../assets/icons/dsh.png' : '/companion/icon-dsh';
+    if (!img.src.endsWith('/dsh.png') && !img.src.endsWith('/icon-dsh')) img.src = fallback;
+  }, { once: true });
   return img;
 }
-let source = 'auto', dshConnected = false;
+let source = 'auto', dshConnected = false, knownSources = [];
 let items = [], current, animationKey, polling = false, noticeTimer, drag, suppressClick = false;
 
 /* -------------------------------------------------------------------------- */
@@ -104,7 +135,10 @@ function showFeedback(message, isError = false, retry) {
    activity stack out: the collapsed dock is a stable resting state, and the
    feedback strip is exempt from the collapsed suppression so it stays readable. */
 function notice() { clearTimeout(noticeTimer); pet.classList.add('pinned'); noticeTimer = setTimeout(() => pet.classList.remove('pinned'), 6000); }
-function report(error, retry) { showFeedback(error.message ?? 'DSH 暂时未连接', true, retry); notice(); }
+function cleanErrorMessage(message) {
+  return String(message || 'DSH 暂时未连接').replace(/^Error invoking remote method '[^']+':\s*(?:Error:\s*)?/i, '').trim() || 'DSH 暂时未连接';
+}
+function report(error, retry) { showFeedback(cleanErrorMessage(error?.message), true, retry); notice(); }
 function run(fn) { Promise.resolve().then(fn).catch(report); }
 
 /* -------------------------------------------------------------------------- */
@@ -213,23 +247,35 @@ function shortDetail(text) {
   if (message) return readable(message[1]);
   return raw.length > 80 ? `${raw.slice(0, 77)}…` : raw;
 }
-function makeCard(item) {
+function makeCard(item, { stacked = false, stackLayer = 0, stackTotal = 1 } = {}) {
   const id = item.sessionId;
   const card = el('div', 'activity-card');
   card.dataset.status = item.status;
   card.dataset.sessionId = id;
-  card.dataset.expanded = String(expanded.has(id));
+  card.dataset.expanded = String(!stacked && expanded.has(id));
+  if (stacked) card.dataset.stackLayer = String(stackLayer);
   if (muted.has(id)) card.dataset.muted = 'true';
 
   const main = el('button', 'activity-main');
   main.type = 'button';
-  main.setAttribute('aria-label', `${item.title}，${item.detail || labels[item.status] || '打开会话'}`);
-  main.append(el('span', 'activity-glyph', glyphs[item.status] ?? '·'));
+  main.setAttribute(
+    'aria-label',
+    stacked
+      ? `展开全部 ${stackTotal} 项活动，当前最新：${item.title}`
+      : `${item.title}，${item.detail || labels[item.status] || '打开会话'}`,
+  );
+  if (stacked) main.title = `点击展开全部 ${stackTotal} 项活动`;
+  const avatar = el('span', 'activity-avatar');
+  avatar.append(makeProviderIcon(item.provider || 'dsh'));
+  main.append(avatar);
   const copy = el('span', 'activity-copy');
   const head = el('span', 'activity-head');
-  head.append(makeProviderIcon(item.provider || 'dsh'));
-  head.append(el('span', 'activity-title', (item.providerLabel ? item.providerLabel + ' · ' : '') + (item.title || '未命名会话')));
+  head.append(makeStatusGlyph(item.status));
+  head.append(el('span', 'activity-title', item.title || (item.providerLabel ? `${item.providerLabel} · 会话` : '未命名会话')));
   head.append(el('span', 'activity-status', item.statusText || labels[item.status] || ''));
+  if (stacked && stackLayer === 0 && stackTotal > 1) {
+    head.append(el('span', 'activity-stack-count', `${stackTotal} 项 ⌄`));
+  }
   copy.append(head);
   const fallback = item.detail || labels[item.status] || '打开 DSH 会话';
   copy.append(el('span', 'activity-detail', shortDetail(fallback) || labels[item.status] || '打开 DSH 会话'));
@@ -257,7 +303,15 @@ function makeCard(item) {
     }
   }
   main.append(copy);
-  main.addEventListener('click', () => run(() => openDsh(item)));
+  main.addEventListener('click', () => {
+    if (stacked) {
+      prefs.stackCollapsed = false;
+      savePrefs();
+      renderActivities();
+      return;
+    }
+    run(() => openDsh(item));
+  });
   card.append(main);
 
   if (item.pending?.length) {
@@ -326,26 +380,26 @@ function renderActivities() {
   // notice competing with real activities for the same 480px window.
   $('first-awake').hidden = Boolean(prefs.firstAwakeSeen) || items.length > 0;
 
-  const collapsed = prefs.stackCollapsed && items.length > 3;
+  const collapsed = prefs.stackCollapsed && items.length > 1;
+  list.classList.toggle('is-stacked', collapsed);
   const stack = $('activity-stack');
-  stack.hidden = items.length <= 3;
+  stack.hidden = items.length <= 1 || collapsed;
   if (!stack.hidden) {
-    stack.textContent = collapsed ? `展开活动（${items.length} 项）` : '收起活动';
-    stack.setAttribute('aria-expanded', String(!collapsed));
+    stack.textContent = `收起堆叠（${items.length} 项）⌃`;
+    stack.setAttribute('aria-expanded', 'true');
   }
-  const shown = collapsed ? items.slice(0, 2) : items;
-  for (const item of shown) {
-    const card = makeCard(item);
+  const shown = collapsed ? items.slice(0, 3) : items;
+  shown.forEach((item, index) => {
+    const card = makeCard(item, { stacked: collapsed, stackLayer: index, stackTotal: items.length });
     const draft = drafts.get(item.sessionId);
-    if (draft) {
+    if (draft && !collapsed) {
       const form = card.querySelector('.activity-followup');
       form.hidden = !draft.open;
       form.querySelector('input').value = draft.text;
     }
     list.append(card);
-  }
+  });
 
-  $('quick-restore').hidden = !prefs.activeSessionId || !$('transcript').hidden;
   const badge = $('activity-badge');
   badge.hidden = items.length === 0;
   badge.textContent = items.length > 99 ? '99+' : String(items.length);
@@ -365,9 +419,10 @@ async function poll() {
   polling = true;
   try {
     const response = await action('list');
+    knownSources = Array.isArray(response.sources) ? response.sources : knownSources;
     dshConnected = response.sources ? Boolean(response.sources.find(row => row.id === 'dsh')?.connected) : true;
-    const readOnlySources = { workbuddy: 'WorkBuddy', antigravity: 'Antigravity', codex: 'Codex' };
-    const readOnlyLabel = readOnlySources[source];
+    const isReadOnlySource = source !== 'auto' && source !== 'dsh';
+    const readOnlyLabel = isReadOnlySource ? (knownSources.find(row => row.id === source)?.label || source) : '';
     composeButton.disabled = !readOnlyLabel && !dshConnected;
     composeButton.title = readOnlyLabel ? `打开 ${readOnlyLabel}` : dshConnected ? '新建 DSH 聊天' : '请先启动 DSH';
     composeButton.setAttribute('aria-label', composeButton.title);
@@ -384,7 +439,7 @@ async function poll() {
     document.body.dataset.status = status;
     syncView();
     $('dot').hidden = !current;
-    character.setAttribute('aria-label', current ? `Agent Pet：${items.length} 项活动，${current.title}，双击打开` : 'Agent Pet：拖动移动，点击查看活动，双击打开工具');
+    character.setAttribute('aria-label', current ? `小鑫：${items.length} 项活动，${current.title}，双击打开` : '小鑫：拖动移动，点击查看活动，双击打开工具');
     await animation(status);
     // Keep the collapsed capsule on screen and just pulse the count, matching
     // Codex Pet's "1 notification, still collapsed" state.
@@ -577,13 +632,11 @@ async function openTranscript(sessionId = prefs.activeSessionId) {
   const row = items.find(item => item.sessionId === sessionId);
   $('transcript-title').textContent = row?.title || '快速聊天';
   renderQuote();
-  $('quick-restore').hidden = true;
   await loadTranscript();
 }
 function closeTranscript() {
   $('transcript').hidden = true;
   pet.classList.remove('transcript-open');
-  $('quick-restore').hidden = !prefs.activeSessionId;
   quoted = null; renderQuote();
 }
 function startNewChat() {
@@ -607,7 +660,14 @@ function setVoiceButton(active, processing = false) {
   voiceButton.title = active ? (processing ? '停止语音对话' : '结束本轮语音') : '开始语音对话';
 }
 
-function speakReply(text, epoch) {
+async function speakReply(text, epoch) {
+  if (native) {
+    const res = await action('speak', { text });
+    if (!res?.stopped && voiceConversation && epoch === voiceEpoch) {
+      recordVoiceChunk(epoch).catch(report);
+    }
+    return;
+  }
   if (!window.speechSynthesis || !window.SpeechSynthesisUtterance) throw new Error('当前桌面环境不支持语音播报');
   const utterance = new SpeechSynthesisUtterance(text);
   utterance.lang = 'zh-CN';
@@ -630,7 +690,7 @@ async function waitForVoiceReply(sessionId, baselineSeq, epoch) {
       const messages = (view.messages ?? []).filter(message => message.seq > baselineSeq);
       const heardPrompt = messages.some(message => message.role === 'user');
       const reply = heardPrompt && [...messages].reverse().find(message => message.role === 'assistant' && message.text?.trim());
-      if (reply) { showFeedback('DSH 正在语音回复…'); speakReply(reply.text, epoch); return true; }
+      if (reply) { showFeedback('DSH 正在语音回复…'); await speakReply(reply.text, epoch); return true; }
     }
     if (['waiting', 'blocked'].includes(view.status)) {
       voiceConversation = false; setVoiceButton(false);
@@ -648,11 +708,42 @@ async function recordVoiceChunk(epoch) {
   mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
   if (!voiceConversation || epoch !== voiceEpoch) { mediaStream.getTracks().forEach(track => track.stop()); mediaStream = undefined; return; }
   const chunks = [];
+  let vadTimer, vadContext, heardSpeech = false, lastSpeechAt = performance.now();
+  const startedAt = performance.now();
+  try {
+    vadContext = new AudioContext();
+    const analyser = vadContext.createAnalyser();
+    analyser.fftSize = 512;
+    vadContext.createMediaStreamSource(mediaStream).connect(analyser);
+    const samples = new Float32Array(analyser.fftSize);
+    vadTimer = setInterval(() => {
+      if (!recorder || recorder.state !== 'recording') return;
+      analyser.getFloatTimeDomainData(samples);
+      let sum = 0;
+      for (let i = 0; i < samples.length; i++) sum += samples[i] * samples[i];
+      const rms = Math.sqrt(sum / samples.length);
+      voiceButton.style.setProperty('--voice-level', String(Math.min(1, rms * 10)));
+      const now = performance.now();
+      if (now - startedAt > 250 && rms > 0.016) {
+        heardSpeech = true;
+        lastSpeechAt = now;
+      } else if (heardSpeech && now - startedAt > 900 && now - lastSpeechAt >= 1350) {
+        recorder.stop();
+      }
+    }, 80);
+  } catch { /* fallback cleanly to manual stop or 24s cap */ }
+  const stopVad = () => {
+    clearInterval(vadTimer);
+    voiceButton.style.removeProperty('--voice-level');
+    vadContext?.close().catch(() => {});
+    vadContext = undefined;
+  };
+
   recorder = new MediaRecorder(mediaStream);
   recorder.addEventListener('dataavailable', event => { if (event.data.size) chunks.push(event.data); });
   recorder.addEventListener('stop', async () => {
     const activeRecorder = recorder;
-    recorder = undefined; clearTimeout(recordingTimer);
+    recorder = undefined; clearTimeout(recordingTimer); stopVad();
     mediaStream?.getTracks().forEach(track => track.stop()); mediaStream = undefined;
     voiceButton.classList.remove('recording'); setVoiceButton(voiceConversation, true);
     if (!voiceConversation || epoch !== voiceEpoch) return;
@@ -672,7 +763,7 @@ async function recordVoiceChunk(epoch) {
   }, { once: true });
   recorder.start();
   voiceButton.classList.add('recording'); setVoiceButton(true);
-  showFeedback('正在聆听；说完后点麦克风发送，DSH 回复后会继续聆听');
+  showFeedback('正在聆听… 说完停顿即自动发送（也可点麦克风结束）');
   recordingTimer = setTimeout(() => { if (recorder?.state === 'recording') recorder.stop(); }, 24_000);
 }
 
@@ -681,13 +772,15 @@ async function startVoice() {
     if (recorder?.state === 'recording') { recorder.stop(); return; }
     voiceConversation = false; voiceEpoch++;
     voiceSessionId = undefined;
+    if (native) action('speak-stop').catch(() => {});
     window.speechSynthesis?.cancel();
     recorder?.state === 'recording' && recorder.stop();
     mediaStream?.getTracks().forEach(track => track.stop()); mediaStream = undefined;
     setVoiceButton(false); showFeedback('语音对话已结束');
     return;
   }
-  if (!window.speechSynthesis || !window.SpeechSynthesisUtterance) throw new Error('当前桌面环境不支持语音播报');
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) throw new Error('当前桌面环境不支持录音');
+  if (!native && (!window.speechSynthesis || !window.SpeechSynthesisUtterance)) throw new Error('当前桌面环境不支持语音播报');
   voiceConversation = true;
   const epoch = ++voiceEpoch;
   setVoiceButton(true);
@@ -701,7 +794,7 @@ async function startVoice() {
 character.addEventListener('click', event => { if (suppressClick) { suppressClick = false; return; } if (event.detail === 1) notice(); });
 character.addEventListener('dblclick', () => { if (!suppressClick) run(() => openDsh()); });
 composeButton.addEventListener('click', event => {
-  if (source === 'workbuddy' || source === 'antigravity' || source === 'codex') { run(() => action('home')); return; }
+  if (source !== 'auto' && source !== 'dsh') { run(() => action('home')); return; }
   const open = pet.classList.toggle('compose-open');
   event.currentTarget.setAttribute('aria-expanded', String(open));
   if (open) { pet.classList.add('show'); closeContext(); setTimeout(() => quickInput.focus(), 30); }
@@ -712,13 +805,13 @@ $('quick-chat').addEventListener('submit', event => {
   run(() => sendPrompt(quickInput.value, { content: pendingImages, reuseActive: true }));
 });
 voiceButton.addEventListener('click', () => {
-  // Voice stays out of scope; the waveform glyph is there for visual parity.
-  // Keep it on screen even when the host has no speech provider.
-  if (voiceButton.dataset.available === 'false') { showFeedback('请先在 DSH 中配置语音识别'); notice(); return; }
+  if (!dshConnected) { showFeedback('请先启动 DSH 后再开始语音对话'); notice(); return; }
+  if (voiceButton.dataset.available === 'false') { showFeedback('当前桌面环境未找到语音识别组件'); notice(); return; }
   run(startVoice);
 });
 activitiesButton.addEventListener('click', event => {
   const open = pet.classList.toggle('activities-open');
+  if (!open) { prefs.stackCollapsed = true; savePrefs(); }
   event.currentTarget.setAttribute('aria-pressed', String(open));
   event.currentTarget.setAttribute('aria-label', open ? '收起活动' : '显示活动');
   event.currentTarget.title = open ? '收起活动' : '显示活动';
@@ -756,7 +849,6 @@ $('context-query').addEventListener('input', event => {
     });
   }), 220);
 });
-$('quick-restore').addEventListener('click', () => run(() => openTranscript()));
 $('transcript-close').addEventListener('click', closeTranscript);
 $('transcript-new').addEventListener('click', startNewChat);
 $('transcript-quote-remove').addEventListener('click', () => { quoted = null; renderQuote(); });
@@ -791,11 +883,14 @@ character.addEventListener('lostpointercapture', endDrag);
 character.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); run(openDsh); } });
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape') {
-    voiceConversation = false; voiceEpoch++; voiceSessionId = undefined; window.speechSynthesis?.cancel();
+    voiceConversation = false; voiceEpoch++; voiceSessionId = undefined;
+    if (native) action('speak-stop').catch(() => {});
+    window.speechSynthesis?.cancel();
     if (recorder?.state === 'recording') recorder.stop();
     mediaStream?.getTracks().forEach(track => track.stop()); mediaStream = undefined;
     setVoiceButton(false);
     closeContext(); closeTranscript();
+    prefs.stackCollapsed = true; savePrefs();
     pet.classList.remove('show', 'compose-open', 'activities-open'); character.blur();
   }
 });
@@ -834,6 +929,7 @@ if (native) {
   // reach the buttons to turn passthrough back off.
   const toolbar = $('toolbar');
   const anchor = () => ([character.getBoundingClientRect(), miniPill.getBoundingClientRect(), toolbar.getBoundingClientRect(),
+    ...(feedback.classList.contains('visible') ? [feedback.getBoundingClientRect()] : []),
     ...(hovering && pet.classList.contains('expanded') ? [panel.getBoundingClientRect()] : [])]);
   const release = () => {
     clearTimeout(releaseTimer);

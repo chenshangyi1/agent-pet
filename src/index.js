@@ -7,6 +7,9 @@ import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { sessionView, sortSessions } from './session-view.js';
+import catalog from '../connectors/catalog.cjs';
+
+const { CONNECTOR_CATALOG } = catalog;
 
 export const name = 'companion';
 export const inject = ['sessionController', 'sessions', 'sessionProjections', 'webServer', 'connection'];
@@ -237,10 +240,7 @@ export function apply(ctx, input = {}) {
   const assets = { '/': [join(root, 'runtime/app.html'), 'text/html'],
     '/ui.js': [join(root, 'runtime/ui.js'), 'text/javascript'], '/ui.css': [join(root, 'runtime/ui.css'), 'text/css'],
     '/audio.js': [join(root, 'runtime/audio.js'), 'text/javascript'],
-    '/icon-dsh': [join(root, 'assets/icons/dsh.png'), 'image/png'],
-    '/icon-antigravity': [join(root, 'assets/icons/antigravity.png'), 'image/png'],
-    '/icon-workbuddy': [join(root, 'assets/icons/workbuddy.png'), 'image/png'],
-    '/icon-codex': [join(root, 'assets/icons/codex.png'), 'image/png'],
+    ...Object.fromEntries(CONNECTOR_CATALOG.map(c => [`/icon-${c.id}`, [join(root, `assets/icons/${c.id}.png`), 'image/png']])),
     '/portrait': [join(config.petRoot, 'assets/main-character.png'), 'image/png'] };
   const animations = { idle: '待机呼吸休闲', running: '工作状态-忙碌点按', waiting: '工作状态-原地踱步张望', blocked: '工作状态-垂头叹气冒汗', ready: '工作状态-雀跃庆祝' };
   for (const [key, file] of Object.entries(animations)) assets['/animation-' + key] = [join(config.petRoot, 'assets/webm', file + '.webm'), 'video/webm'];

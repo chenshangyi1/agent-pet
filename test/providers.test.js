@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, writeFile, rm, mkdir, readdir } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, rm, mkdir, readdir, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
@@ -11,6 +11,9 @@ const require = createRequire(import.meta.url);
 const { applyEvent, sessionRows, ACTIVE_TTL } = require('../runtime/workbuddy-state.cjs');
 const hookState = require('../runtime/hook-state.cjs');
 const { Providers } = require('../runtime/providers.cjs');
+const { CONNECTOR_CATALOG } = require('../connectors/catalog.cjs');
+const { ConnectorRegistry } = require('../connectors/registry.cjs');
+const { validateWaveBase64, sanitizeSpeechText } = require('../runtime/local-speech.cjs');
 const event = (name, at, extra = {}) => ({ v:1, id:randomUUID(), provider:'workbuddy', sessionId:'one', event:name, at, ...extra });
 const agyEvent = (name, at, extra = {}) => ({ v:1, id:randomUUID(), provider:'antigravity', sessionId:'conv-1', event:name, at, ...extra });
 
@@ -292,4 +295,413 @@ test('Codex rollout 日志增量读取只保留状态元数据且实时反映运
 
   const stateContent = await readFile(join(dir, 'data/codex/state.json'), 'utf8');
   assert.ok(!stateContent.includes('SECRET'));
+});
+
+test('ConnectorRegistry 默认只启用 dsh 并能检测本机已安装 AI Agent', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'agent-pet-reg-detect-'));
+  const home = join(dir, 'home');
+  const apps = join(dir, 'Applications');
+  const data = join(dir, 'data');
+  await mkdir(join(apps, 'Cursor.app'), { recursive: true });
+  await mkdir(join(apps, 'OpenCode.app'), { recursive: true });
+  await mkdir(join(home, '.claude'), { recursive: true });
+  await mkdir(join(home, '.kiro'), { recursive: true });
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const reg = new ConnectorRegistry({
+    rootDir: new URL('..', import.meta.url).pathname.replace(/\/$/, ''),
+    homeDir: home,
+    dataDir: data,
+    appsDirs: [apps],
+    pathDirs: [],
+    pythonPath: 'python3',
+  });
+
+  assert.deepEqual(reg.enabledIds(), ['dsh']);
+  const detected = reg.detectAll();
+  assert.equal(detected.find(x => x.id === 'dsh').enabled, true);
+  assert.equal(detected.find(x => x.id === 'cursor').installed, true);
+  assert.equal(detected.find(x => x.id === 'cursor').enabled, false);
+  assert.equal(detected.find(x => x.id === 'opencode').installed, true);
+  assert.equal(detected.find(x => x.id === 'claude').installed, true);
+  assert.equal(detected.find(x => x.id === 'kiro').installed, true);
+  assert.equal(detected.find(x => x.id === 'trae').installed, false);
+  assert.throws(() => reg.disable('dsh'), /不可关闭/);
+});
+
+test('ConnectorRegistry 接入与卸载会备份原配置、保留无关配置并幂等清理', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'agent-pet-reg-toggle-'));
+  const home = join(dir, 'home');
+  const data = join(dir, 'data');
+  await mkdir(join(home, '.claude'), { recursive: true });
+  await writeFile(join(home, '.claude/settings.json'), JSON.stringify({
+    model: 'sonnet',
+    hooks: {
+      PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo user-hook' }] }],
+    },
+  }));
+  await mkdir(join(home, '.cursor'), { recursive: true });
+  await writeFile(join(home, '.cursor/hooks.json'), JSON.stringify({
+    version: 1,
+    hooks: { stop: [{ command: 'echo user-stop' }] },
+  }));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const reg = new ConnectorRegistry({
+    rootDir: new URL('..', import.meta.url).pathname.replace(/\/$/, ''),
+    homeDir: home,
+    dataDir: data,
+    appsDirs: [],
+    pathDirs: [],
+    pythonPath: 'python3',
+  });
+
+  for (const id of ['claude', 'cursor', 'opencode', 'kiro', 'trae', 'antigravity']) {
+    reg.enable(id);
+  }
+  assert.deepEqual(reg.enabledIds(), ['dsh', 'claude', 'cursor', 'opencode', 'antigravity', 'kiro', 'trae']);
+
+  // Repeated enable stays idempotent without duplicating hook entries.
+  reg.enable('claude');
+  const claudeCfg = JSON.parse(await readFile(join(home, '.claude/settings.json'), 'utf8'));
+  assert.equal(claudeCfg.model, 'sonnet');
+  assert.equal(claudeCfg.hooks.PreToolUse.length, 2);
+
+  const cursorCfg = JSON.parse(await readFile(join(home, '.cursor/hooks.json'), 'utf8'));
+  assert.equal(cursorCfg.hooks.stop.length, 2);
+
+  // Backups exist before modification.
+  const backups = await readdir(join(data, 'backups'));
+  assert.ok(backups.some(name => name.startsWith('connector-enable-claude-')));
+
+  // Disable restores clean user-only configs & deletes drop-in files.
+  for (const id of ['claude', 'cursor', 'opencode', 'kiro', 'trae', 'antigravity']) {
+    reg.disable(id);
+  }
+  assert.deepEqual(reg.enabledIds(), ['dsh']);
+
+  const claudeAfter = JSON.parse(await readFile(join(home, '.claude/settings.json'), 'utf8'));
+  assert.equal(claudeAfter.model, 'sonnet');
+  assert.equal(claudeAfter.hooks.PreToolUse.length, 1);
+  assert.equal(claudeAfter.hooks.PreToolUse[0].hooks[0].command, 'echo user-hook');
+  assert.equal(claudeAfter.hooks.Stop, undefined);
+
+  const cursorAfter = JSON.parse(await readFile(join(home, '.cursor/hooks.json'), 'utf8'));
+  assert.equal(cursorAfter.hooks.stop.length, 1);
+  assert.equal(cursorAfter.hooks.stop[0].command, 'echo user-stop');
+
+  await assert.rejects(() => readFile(join(home, '.config/opencode/plugins/agent-pet.js')));
+  await assert.rejects(() => readFile(join(home, '.kiro/hooks/agent-pet.json')));
+
+  // Corrupt target JSON fails loudly instead of overwriting user file.
+  await writeFile(join(home, '.claude/settings.json'), '{broken json');
+  assert.throws(() => reg.enable('claude'));
+});
+
+test('统一 hooks/emit.py 兼容 Cursor/Kiro/Claude 格式且绝不记录提示词与工具参数', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'agent-pet-unified-emit-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const emitPath = new URL('../connectors/hooks/emit.py', import.meta.url).pathname;
+
+  const runEmit = (args, payload) => new Promise((resolve, reject) => {
+    const child = spawn('python3', [emitPath, ...args], { env: { ...process.env, AGENT_PET_DATA: dir } });
+    let stdout = '';
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.on('error', reject);
+    child.on('close', code => code === 0 ? resolve(stdout.trim()) : reject(new Error(`exit ${code}`)));
+    child.stdin.end(JSON.stringify(payload));
+  });
+
+  assert.equal(await runEmit(['--provider', 'cursor', '--format', 'cursor'], {
+    hook_event_name: 'beforeSubmitPrompt',
+    conversation_id: 'cur-1',
+    workspace_roots: ['/tmp/my-cursor-app'],
+    prompt: 'SECRET_CURSOR_PROMPT',
+  }), '{}');
+  assert.equal(await runEmit(['--provider', 'cursor', '--format', 'cursor'], {
+    hook_event_name: 'stop',
+    conversation_id: 'cur-1',
+    status: 'aborted',
+    error_message: 'SECRET_ERR',
+  }), '{}');
+  assert.equal(await runEmit(['--provider', 'kiro', '--format', 'kiro', '--event', 'UserPromptSubmit'], {
+    cwd: '/tmp/kiro-proj',
+    prompt: 'SECRET_KIRO_PROMPT',
+  }), '{}');
+  assert.equal(await runEmit(['--provider', 'claude', '--format', 'standard'], {
+    hook_event_name: 'PreToolUse',
+    session_id: 'claude-1',
+    tool_name: 'Bash',
+    tool_input: { command: 'SECRET_CMD' },
+    cwd: '/tmp/claude-proj',
+  }), '{}');
+
+  const providers = new Providers(dir);
+  await providers.refresh();
+
+  assert.equal(providers.list('cursor').items.find(r => r.sessionId === 'cursor:cur-1').status, 'cancelled');
+  assert.equal(providers.list('kiro').items.find(r => r.provider === 'kiro').status, 'running');
+  const claudeRow = providers.list('claude').items.find(r => r.sessionId === 'claude:claude-1');
+  assert.equal(claudeRow.status, 'running');
+  assert.match(claudeRow.detail, /Bash/);
+
+  for (const id of ['cursor', 'kiro', 'claude']) {
+    const raw = await readFile(join(dir, `${id}/state.json`), 'utf8');
+    assert.ok(!raw.includes('SECRET'));
+  }
+});
+
+test('Providers 按 enabledProviders 动态过滤并在运行时热切换无需重启', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'agent-pet-enabled-filter-'));
+  const claudeInbox = join(dir, 'claude/inbox');
+  await mkdir(claudeInbox, { recursive: true });
+  await writeFile(join(claudeInbox, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json'), JSON.stringify({
+    v: 1, id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', provider: 'claude',
+    sessionId: 'c1', event: 'UserPromptSubmit', at: Date.now(), workspace: 'demo',
+  }));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const providers = new Providers(dir, {}, { enabledProviders: ['dsh'] });
+  await providers.refresh();
+  assert.deepEqual(providers.snapshot.sources.map(s => s.id), ['dsh']);
+  assert.equal(providers.list('auto').items.length, 0);
+
+  providers.setEnabledProviders(['dsh', 'claude']);
+  await providers.refresh();
+  assert.deepEqual(providers.snapshot.sources.map(s => s.id), ['dsh', 'claude']);
+  assert.equal(providers.list('auto').items.length, 1);
+  assert.equal(providers.list('auto').items[0].providerLabel, 'Claude Code');
+});
+
+test('LocalSpeech 校验 16kHz 单声道 WAV 与语音播报文本清洗', () => {
+  assert.throws(() => validateWaveBase64('not-valid!'), /格式无效/);
+  const buf = Buffer.alloc(44 + 320);
+  buf.write('RIFF', 0);
+  buf.writeUInt32LE(36 + 320, 4);
+  buf.write('WAVE', 8);
+  buf.write('fmt ', 12);
+  buf.writeUInt32LE(16, 16);
+  buf.writeUInt16LE(1, 20);
+  buf.writeUInt16LE(1, 22);
+  buf.writeUInt32LE(16000, 24);
+  buf.writeUInt32LE(32000, 28);
+  buf.writeUInt16LE(2, 32);
+  buf.writeUInt16LE(16, 34);
+  buf.write('data', 36);
+  buf.writeUInt32LE(320, 40);
+  assert.equal(validateWaveBase64(buf.toString('base64')).length, 44 + 320);
+
+  const spoken = sanitizeSpeechText('请看 [文档](https://example.com) 中的 `foo()`：\n```js\nconst a = 1;\n```\n已**完成**！');
+  assert.equal(spoken, '请看 文档 中的 foo()： 代码已略过 已 完成 ！');
+});
+
+test('ConnectorRegistry.enableAllInstalled 仅一键接入本机已安装的 AI Agent', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'agent-pet-reg-enable-all-'));
+  const home = join(dir, 'home');
+  const apps = join(dir, 'Applications');
+  const data = join(dir, 'data');
+  await mkdir(join(apps, 'Cursor.app'), { recursive: true });
+  await mkdir(join(home, '.claude'), { recursive: true });
+  await mkdir(join(home, '.kiro'), { recursive: true });
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const reg = new ConnectorRegistry({
+    rootDir: new URL('..', import.meta.url).pathname.replace(/\/$/, ''),
+    homeDir: home,
+    dataDir: data,
+    appsDirs: [apps],
+    pathDirs: [],
+    pythonPath: 'python3',
+  });
+
+  assert.deepEqual(reg.enabledIds(), ['dsh']);
+  const result = reg.enableAllInstalled();
+  assert.deepEqual(reg.enabledIds(), ['dsh', 'claude', 'cursor', 'kiro']);
+  assert.equal(result.find(x => x.id === 'claude').enabled, true);
+  assert.equal(result.find(x => x.id === 'claude').hookConfigured, true);
+  assert.equal(result.find(x => x.id === 'cursor').enabled, true);
+  assert.equal(result.find(x => x.id === 'cursor').hookConfigured, true);
+  assert.equal(result.find(x => x.id === 'kiro').enabled, true);
+  assert.equal(result.find(x => x.id === 'kiro').hookConfigured, true);
+  assert.equal(result.find(x => x.id === 'trae').enabled, false);
+
+  const saved = JSON.parse(await readFile(join(data, 'connectors.json'), 'utf8'));
+  assert.deepEqual(saved.enabled, ['dsh', 'claude', 'cursor', 'kiro']);
+});
+
+test('Providers.load 聚合 sources 的 sessionCount、sessionTitle 与 detail', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'agent-pet-sources-rich-'));
+  const claudeInbox = join(dir, 'claude/inbox');
+  const cursorInbox = join(dir, 'cursor/inbox');
+  await mkdir(claudeInbox, { recursive: true });
+  await mkdir(cursorInbox, { recursive: true });
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const now = Date.now();
+  await writeFile(join(claudeInbox, '11111111111111111111111111111111.json'), JSON.stringify({
+    v: 1,
+    id: '11111111111111111111111111111111',
+    provider: 'claude',
+    sessionId: 'ses-1',
+    event: 'PreToolUse',
+    tool: 'Bash',
+    toolId: 't1',
+    at: now - 100,
+    workspace: 'pet',
+  }));
+  await writeFile(join(claudeInbox, '22222222222222222222222222222222.json'), JSON.stringify({
+    v: 1,
+    id: '22222222222222222222222222222222',
+    provider: 'claude',
+    sessionId: 'ses-2',
+    event: 'SessionEnd',
+    at: now - 50,
+    workspace: 'other',
+  }));
+  await writeFile(join(cursorInbox, '33333333333333333333333333333333.json'), JSON.stringify({
+    v: 1,
+    id: '33333333333333333333333333333333',
+    provider: 'cursor',
+    sessionId: 'cur-1',
+    event: 'SessionEnd',
+    at: now - 10,
+    workspace: 'web',
+  }));
+
+  const providers = new Providers(dir, {}, { enabledProviders: ['dsh', 'claude', 'cursor', 'kiro'] });
+  await providers.refresh();
+
+  const claudeSource = providers.snapshot.sources.find(s => s.id === 'claude');
+  assert.equal(claudeSource.status, 'running');
+  assert.equal(claudeSource.sessionCount, 2);
+  assert.equal(claudeSource.sessionTitle, 'pet · ses-1');
+  assert.equal(claudeSource.detail, 'pet · ses-1 · 正在使用 Bash');
+  assert.equal(claudeSource.activityCount, 1);
+
+  const cursorSource = providers.snapshot.sources.find(s => s.id === 'cursor');
+  assert.equal(cursorSource.connected, true);
+  assert.equal(cursorSource.status, 'idle');
+  assert.equal(cursorSource.sessionCount, 1);
+  assert.equal(cursorSource.sessionTitle, '');
+  assert.equal(cursorSource.detail, '空闲');
+
+  const kiroSource = providers.snapshot.sources.find(s => s.id === 'kiro');
+  assert.equal(kiroSource.connected, false);
+  assert.equal(kiroSource.sessionCount, 0);
+  assert.equal(kiroSource.sessionTitle, '');
+  assert.equal(kiroSource.detail, '等待首个任务');
+});
+
+test('所有主流 AI Agent 连接器均有图标并支持独立安装与安全卸载', async t => {
+  for (const entry of CONNECTOR_CATALOG) {
+    const iconInfo = await stat(join(process.cwd(), 'assets/icons', `${entry.id}.png`));
+    assert.ok(iconInfo.size > 100, `缺少图标 ${entry.id}.png`);
+  }
+
+  const root = await mkdtemp(join(tmpdir(), 'agent-pet-mainstream-'));
+  const home = join(root, 'home');
+  const data = join(root, 'data');
+  await mkdir(join(home, '.gemini/antigravity'), { recursive: true });
+  await mkdir(join(home, '.vscode/extensions/saoudrizwan.claude-dev-3.0.0'), { recursive: true });
+  await mkdir(join(home, 'Documents/Cline/Rules/Hooks'), { recursive: true });
+  await writeFile(join(home, 'Documents/Cline/Rules/Hooks/TaskStart'), '#!/bin/sh\necho custom-user-hook\n');
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  const reg = new ConnectorRegistry({
+    rootDir: process.cwd(),
+    homeDir: home,
+    dataDir: data,
+    appsDirs: [],
+    pathDirs: [],
+    pythonPath: 'python3',
+  });
+
+  const initial = reg.detectAll();
+  // ~/.gemini/antigravity alone must not false-positive as Gemini CLI
+  assert.equal(initial.find(x => x.id === 'antigravity').installed, true);
+  assert.equal(initial.find(x => x.id === 'gemini-cli').installed, false);
+  // Cline VS Code extension should be detected
+  assert.equal(initial.find(x => x.id === 'cline').installed, true);
+
+  for (const id of ['gemini-cli', 'windsurf', 'copilot', 'cline', 'zcode', 'codebuddy', 'codebuddy-cn', 'qwen-code', 'droid', 'qoder']) {
+    reg.enable(id);
+    assert.equal(reg.isHookConfigured(id), true, `${id} should be configured after enable`);
+  }
+
+  // Existing user Cline hook without agent-pet marker must never be overwritten
+  const customTaskStart = await readFile(join(home, 'Documents/Cline/Rules/Hooks/TaskStart'), 'utf8');
+  assert.match(customTaskStart, /custom-user-hook/);
+
+  const windsurfHooks = JSON.parse(await readFile(join(home, '.codeium/windsurf/hooks.json'), 'utf8'));
+  assert.ok(Array.isArray(windsurfHooks.hooks.pre_run_command));
+  const copilotHooks = JSON.parse(await readFile(join(home, '.copilot/hooks/agent-pet.json'), 'utf8'));
+  assert.equal(copilotHooks.version, 1);
+  assert.ok(Array.isArray(copilotHooks.hooks.userPromptSubmitted));
+  const zcodeCfg = JSON.parse(await readFile(join(home, '.zcode/cli/config.json'), 'utf8'));
+  assert.equal(zcodeCfg.plugins.enabledPlugins['agent-pet@agent-pet-local'], true);
+
+  for (const id of ['gemini-cli', 'windsurf', 'copilot', 'cline', 'zcode', 'codebuddy', 'codebuddy-cn', 'qwen-code', 'droid', 'qoder']) {
+    reg.disable(id);
+    assert.equal(reg.isHookConfigured(id), false, `${id} should be clean after disable`);
+  }
+  const preservedTaskStart = await readFile(join(home, 'Documents/Cline/Rules/Hooks/TaskStart'), 'utf8');
+  assert.match(preservedTaskStart, /custom-user-hook/);
+});
+
+test('统一 hooks/emit.py 兼容 Windsurf/Gemini CLI/Copilot/Cline 事件格式', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'agent-pet-emit-mainstream-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const emitPy = join(process.cwd(), 'connectors/hooks/emit.py');
+
+  const cases = [
+    {
+      provider: 'windsurf',
+      format: 'windsurf',
+      payload: { agent_action_name: 'pre_run_command', trajectory_id: 'traj-1', execution_id: 'exec-1', tool_info: { file_path: '/tmp/myproj/a.js' } },
+      expectedOut: '{}',
+      expectedEvent: 'PreToolUse',
+      expectedTool: 'run_command',
+      expectedWorkspace: 'myproj',
+    },
+    {
+      provider: 'gemini-cli',
+      format: 'gemini',
+      payload: { hookEventName: 'BeforeTool', session_id: 'gem-1', tool_name: 'write_file', cwd: '/tmp/app' },
+      expectedOut: '{}',
+      expectedEvent: 'PreToolUse',
+      expectedTool: 'write_file',
+    },
+    {
+      provider: 'copilot',
+      format: 'copilot',
+      payload: { hook_event_name: 'userPromptSubmitted', sessionId: 'cop-1', cwd: '/tmp/repo' },
+      expectedOut: '{}',
+      expectedEvent: 'UserPromptSubmit',
+    },
+    {
+      provider: 'cline',
+      format: 'cline',
+      payload: { hookEventName: 'TaskCancel', taskId: 'task-1', cwd: '/tmp/clineproj' },
+      expectedOut: '{"cancel":false}',
+      expectedEvent: 'Stop',
+      expectedReason: 'USER_CANCELED',
+    },
+  ];
+
+  for (const tc of cases) {
+    const res = spawnSync('python3', [emitPy, '--provider', tc.provider, '--format', tc.format], {
+      input: JSON.stringify(tc.payload),
+      env: { ...process.env, AGENT_PET_DATA: dir },
+      encoding: 'utf8',
+    });
+    assert.equal(res.status, 0);
+    assert.equal(res.stdout.trim(), tc.expectedOut);
+    const files = await readdir(join(dir, tc.provider, 'inbox'));
+    assert.equal(files.length, 1);
+    const written = JSON.parse(await readFile(join(dir, tc.provider, 'inbox', files[0]), 'utf8'));
+    assert.equal(written.event, tc.expectedEvent);
+    if (tc.expectedTool) assert.equal(written.tool, tc.expectedTool);
+    if (tc.expectedWorkspace) assert.equal(written.workspace, tc.expectedWorkspace);
+    if (tc.expectedReason) assert.equal(written.terminationReason, tc.expectedReason);
+  }
 });

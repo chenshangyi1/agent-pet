@@ -1,9 +1,9 @@
 {
   "name": "dsh-companion",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
-  "description": "独立运行的 Agent Pet，连接 DSH、WorkBuddy、Antigravity、Codex 与刘海收纳",
+  "description": "独立运行的 Agent Pet（小鑫），默认接入 DSH，可自动检测并按需接入本机各类 AI Agent",
   "main": "./src/index.js",
   "exports": {
     ".": "./src/index.js",
@@ -12,10 +12,10 @@
   },
   "scripts": {
     "test": "node --test test/*.test.js",
-    "check": "node --check src/index.js && node --check src/session-view.js && node --check runtime/main.cjs && node --check runtime/placement.cjs && node --check runtime/preload.cjs && node --check runtime/ui.js && node --check runtime/activity-notices.js && node --check src/client.js && node --check runtime/audio.js && node --check runtime/providers.cjs && node --check runtime/hook-state.cjs && node --check runtime/workbuddy-state.cjs && node --check runtime/codex-sessions.cjs && node --check runtime/notch.cjs && node --check scripts/start.cjs",
+    "check": "node --check src/index.js && node --check src/session-view.js && node --check connectors/catalog.cjs && node --check connectors/registry.cjs && node --check connectors/opencode/agent-pet.js && node --check runtime/main.cjs && node --check runtime/placement.cjs && node --check runtime/preload.cjs && node --check runtime/manager-preload.cjs && node --check runtime/manager.js && node --check runtime/ui.js && node --check runtime/activity-notices.js && node --check src/client.js && node --check runtime/audio.js && node --check runtime/local-speech.cjs && node --check runtime/providers.cjs && node --check runtime/hook-state.cjs && node --check runtime/workbuddy-state.cjs && node --check runtime/codex-sessions.cjs && node --check runtime/notch.cjs && node --check scripts/start.cjs && python3 -m py_compile connectors/hooks/emit.py connectors/workbuddy/emit.py connectors/antigravity/emit.py connectors/codex/emit.py scripts/install.py",
     "start": "node scripts/start.cjs",
     "install:local": "python3 scripts/install.py",
-    "build:notch": "mkdir -p bin && xcrun swiftc runtime/NotchPanel.swift -o bin/notch-panel && xcrun swiftc scripts/screen-info.swift -o bin/screen-info"
+    "build:notch": "mkdir -p bin bin/AgentPetSpeech.app/Contents/MacOS && xcrun swiftc runtime/NotchPanel.swift -o bin/notch-panel && xcrun swiftc scripts/screen-info.swift -o bin/screen-info && xcrun swiftc scripts/speech-helper.swift -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker scripts/speech-info.plist -o bin/speech-helper && cp bin/speech-helper bin/AgentPetSpeech.app/Contents/MacOS/speech-helper && cp scripts/speech-info.plist bin/AgentPetSpeech.app/Contents/Info.plist && codesign --force -s - bin/speech-helper && codesign --force --deep -s - bin/AgentPetSpeech.app"
   },
   "dsh": {
     "bundle": {

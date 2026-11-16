@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key>
+  <string>speech-helper</string>
+  <key>CFBundleIdentifier</key>
+  <string>local.chenmingxin.agent-pet.speech</string>
+  <key>CFBundleName</key>
+  <string>AgentPetSpeech</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>LSBackgroundOnly</key>
+  <true/>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>用于小鑫识别你的语音并与 AI 对话</string>
+</dict>
+</plist>

@@ -10,6 +10,9 @@ const { randomBytes, timingSafeEqual } = require('node:crypto');
 const { Providers } = require('./providers.cjs');
 const { createNotch } = require('./notch.cjs');
 const { layoutPet } = require('./placement.cjs');
+const { ConnectorRegistry } = require('../connectors/registry.cjs');
+const { CATALOG_BY_ID } = require('../connectors/catalog.cjs');
+const { LocalSpeech } = require('./local-speech.cjs');
 app.setName('Agent Pet');
 const dataDir = process.env.AGENT_PET_DATA || process.env.DSH_COMPANION_DATA || path.join(homedir(), '.dsh/companion');
 const petRoot = process.env.DSH_COMPANION_PET_ROOT || path.join(homedir(), '.dsh/profiles/web/node_modules/dsh-pet');
@@ -18,23 +21,24 @@ const token = process.env.DSH_COMPANION_TOKEN;
 const hostPid = Number(process.env.DSH_COMPANION_HOST_PID);
 mkdirSync(dataDir, { recursive: true, mode: 0o700 });
 app.setPath('userData', path.join(dataDir, 'electron'));
-const providers = new Providers(dataDir, { endpoint, token });
+const registry = new ConnectorRegistry({ rootDir: path.dirname(__dirname), dataDir });
+const localSpeech = new LocalSpeech({ rootDir: path.dirname(__dirname) });
+const providers = new Providers(dataDir, { endpoint, token }, { enabledProviders: registry.enabledIds() });
 if (!app.requestSingleInstanceLock()) { app.quit(); } else {
 app.on('second-instance', () => { if (process.env.AGENT_PET_SHOW_ON_LAUNCH === '1') showPet(); });
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 const settingsFile = path.join(dataDir, 'desktop.json');
-let win, tray, notch, commandServer, refreshTimer, quitting = false, dragStart, dragTimer, placement;
+let win, managerWin, tray, notch, commandServer, refreshTimer, quitting = false, dragStart, dragTimer, placement;
 let settings = { hidden: false, mini: false, controlOnly: false, source: 'auto' };
 try { settings = { ...settings, ...JSON.parse(readFileSync(settingsFile, 'utf8')) }; } catch (error) {
   if (error.code !== 'ENOENT') process.stderr.write('[companion] 无法读取桌宠偏好，使用默认值\n');
 }
-const VALID_SOURCES = ['auto', 'dsh', 'workbuddy', 'antigravity', 'codex'];
-const READ_ONLY_APPS = {
-  workbuddy: { label: 'WorkBuddy', bundleId: 'com.tencent.workbuddy.mac' },
-  antigravity: { label: 'Antigravity', bundleId: 'com.google.antigravity' },
-  codex: { label: 'Codex', bundleId: 'com.openai.codex' },
-};
-if (!VALID_SOURCES.includes(settings.source)) settings.source = 'auto';
+function validSources() { return ['auto', ...registry.enabledIds()]; }
+function isReadOnlyConnector(id) {
+  const entry = CATALOG_BY_ID[id];
+  return Boolean(entry && !entry.replySupported);
+}
+if (!validSources().includes(settings.source)) settings.source = 'auto';
 function save() {
   mkdirSync(dataDir, { recursive: true });
   writeFileSync(settingsFile + '.tmp', JSON.stringify(settings), { mode: 0o600 });
@@ -91,49 +95,70 @@ function updateDrag() {
 }
 function endDrag() { updateDrag(); clearInterval(dragTimer); dragTimer = undefined; dragStart = undefined; save(); }
 function menuTemplate() {
+  const enabled = registry.enabledIds().map(id => CATALOG_BY_ID[id]).filter(Boolean);
+  const followChoices = [['auto', '自动跟随'], ...enabled.map(entry => [entry.id, entry.label])];
+  const openItems = enabled.map(entry => ({
+    label: `打开 ${entry.label}`,
+    click: () => (entry.id === 'dsh' ? openDsh() : openBundle(entry.id)).catch(() => process.stderr.write(`[companion] 无法打开 ${entry.label}\n`)),
+  }));
   return [
-    { label: '跟随工具', submenu: [['auto','自动跟随'],['dsh','DSH'],['workbuddy','WorkBuddy'],['antigravity','Antigravity'],['codex','Codex']].map(([id,label]) => ({ label, type: 'radio', checked: settings.source === id, click: () => setSource(id) })) },
+    { label: '跟随工具', submenu: followChoices.map(([id, label]) => ({ label, type: 'radio', checked: settings.source === id, click: () => setSource(id) })) },
+    { label: '管理 AI Agent...', click: openManagerWindow },
     { label: '收回刘海', click: hidePet },
     { label: '打开刘海面板', click: () => notch?.expand(true) },
-    { label: '打开 WorkBuddy', click: () => openBundle('workbuddy').catch(() => process.stderr.write('[companion] 无法打开 WorkBuddy\n')) },
-    { label: '打开 Antigravity', click: () => openBundle('antigravity').catch(() => process.stderr.write('[companion] 无法打开 Antigravity\n')) },
-    { label: '打开 Codex', click: () => openBundle('codex').catch(() => process.stderr.write('[companion] 无法打开 Codex\n')) },
-    { label: '打开 DSH', click: () => openDsh().catch(() => process.stderr.write('[companion] DSH 暂时未连接\n')) },
+    ...(openItems.length > 1 ? [{ label: '打开应用', submenu: openItems }] : openItems),
     { label: '桌宠大小', submenu: [.7, .8, .9, 1, 1.1, 1.2].map(value => ({
       label: `${Math.round(value * 100)}%`, type: 'radio', checked: Math.abs(petScale() - value) < .01,
       click: () => setPetScale(value),
     })) },
     { label: '仅显示控制条', type: 'checkbox', checked: Boolean(settings.controlOnly), click: () => setControlOnly(!settings.controlOnly) },
     { label: '重置位置', click: resetPosition },
-    { label: '隐藏桌宠', click: hidePet },
+    { label: '隐藏小鑫', click: hidePet },
     { type: 'separator' },
-    { label: '退出桌宠', click: () => app.quit() },
+    { label: '退出小鑫', click: () => app.quit() },
   ];
 }
 function setSource(source) {
-  if (!VALID_SOURCES.includes(source)) throw new Error('来源无效');
+  if (!validSources().includes(source)) throw new Error('来源无效');
   settings.source = source; save(); win?.webContents.send('companion:mode', mode()); notch?.send();
 }
 function openBundle(providerId) {
-  const appInfo = READ_ONLY_APPS[providerId];
-  if (!appInfo) return Promise.reject(new Error('应用配置无效'));
-  return new Promise((resolve, reject) => execFile('/usr/bin/open', ['-b', appInfo.bundleId], error => error ? reject(new Error(`无法打开 ${appInfo.label}`)) : resolve({ opened: true })));
+  const entry = CATALOG_BY_ID[providerId];
+  if (!entry || !entry.bundleId) return Promise.reject(new Error('应用配置无效'));
+  return new Promise((resolve, reject) => execFile('/usr/bin/open', ['-b', entry.bundleId], error => error ? reject(new Error(`无法打开 ${entry.label}`)) : resolve({ opened: true })));
 }
 async function rpc(body) { return providers.dsh(body); }
 async function agentAction(body) {
   if (body.action === 'list') { await providers.refresh(); return providers.list(settings.source); }
   if (body.action === 'info') {
-    try { return { ...await rpc(body), source: settings.source }; } catch { return { connected: false, speechAvailable: false, source: settings.source }; }
+    try {
+      const info = await rpc(body);
+      return { ...info, speechAvailable: Boolean(info.speechAvailable || localSpeech.hasRecognizer()), source: settings.source };
+    } catch {
+      return { connected: false, speechAvailable: localSpeech.hasRecognizer(), source: settings.source };
+    }
+  }
+  if (body.action === 'speak') return localSpeech.speak(body.text);
+  if (body.action === 'speak-stop') { localSpeech.stopSpeaking(); return { stopped: true }; }
+  if (body.action === 'hear') {
+    try {
+      const info = await rpc({ action: 'info' });
+      if (info?.speechAvailable) return await rpc(body);
+    } catch {}
+    return localSpeech.transcribeWave(body.audio, typeof body.locale === 'string' ? body.locale : 'zh-CN');
   }
   const sessionId = String(body.sessionId || '');
-  const sessionProvider = Object.keys(READ_ONLY_APPS).find(id => sessionId.startsWith(`${id}:`));
-  const targetProvider = sessionProvider || (body.action === 'home' && READ_ONLY_APPS[settings.source] ? settings.source : null);
+  const prefixIdx = sessionId.indexOf(':');
+  const sessionProvider = prefixIdx > 0 ? sessionId.slice(0, prefixIdx) : '';
+  const targetProvider = isReadOnlyConnector(sessionProvider)
+    ? sessionProvider
+    : (body.action === 'home' && isReadOnlyConnector(settings.source) ? settings.source : null);
   if (targetProvider) {
     if (['focus', 'home'].includes(body.action)) return openBundle(targetProvider);
-    throw new Error(`请在 ${READ_ONLY_APPS[targetProvider].label} 中继续此任务`);
+    throw new Error(`请在 ${CATALOG_BY_ID[targetProvider].label} 中继续此任务`);
   }
-  if (READ_ONLY_APPS[settings.source] && !body.sessionId && !['list', 'info'].includes(body.action)) {
-    throw new Error(`请在 ${READ_ONLY_APPS[settings.source].label} 中新建任务`);
+  if (isReadOnlyConnector(settings.source) && !body.sessionId && !['list', 'info'].includes(body.action)) {
+    throw new Error(`请在 ${CATALOG_BY_ID[settings.source].label} 中新建任务`);
   }
   return ['focus','home'].includes(body.action) ? openDsh(body) : rpc(body);
 }
@@ -182,9 +207,68 @@ async function openDsh(body = { action: 'home' }) {
 function trusted(event) {
   if (!win || win.isDestroyed() || event.sender !== win.webContents || event.senderFrame !== win.webContents.mainFrame) throw new Error('拒绝未知窗口');
 }
+function trustedManager(event) {
+  if (!managerWin || managerWin.isDestroyed() || event.sender !== managerWin.webContents || event.senderFrame !== managerWin.webContents.mainFrame) throw new Error('拒绝未知管理窗口');
+}
+async function syncConnectorsAfterChange(list) {
+  providers.setEnabledProviders(registry.enabledIds());
+  if (!validSources().includes(settings.source)) settings.source = 'auto';
+  save();
+  await providers.refresh();
+  win?.webContents.send('companion:mode', mode());
+  notch?.send();
+  if (managerWin && !managerWin.isDestroyed()) managerWin.webContents.send('companion:connectors-updated', list);
+  return list;
+}
+function openManagerWindow() {
+  notch?.expand(false);
+  if (process.platform === 'darwin') app.focus({ steal: true });
+  if (managerWin && !managerWin.isDestroyed()) {
+    managerWin.show();
+    managerWin.focus();
+    managerWin.webContents.send('companion:connectors-updated', registry.detectAll());
+    return;
+  }
+  managerWin = new BrowserWindow({
+    width: 560,
+    height: 620,
+    minWidth: 460,
+    minHeight: 460,
+    title: '小鑫 · AI Agent 管理',
+    resizable: true,
+    minimizable: true,
+    maximizable: false,
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'manager-preload.cjs'),
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false,
+      webSecurity: true,
+    },
+  });
+  managerWin.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  managerWin.webContents.on('will-navigate', event => event.preventDefault());
+  managerWin.on('closed', () => { managerWin = null; });
+  managerWin.once('ready-to-show', () => { managerWin.show(); managerWin.focus(); });
+  managerWin.loadFile(path.join(__dirname, 'manager.html')).catch(() => {});
+}
+ipcMain.handle('companion:connectors', async (event, body) => {
+  trustedManager(event);
+  const action = body?.action;
+  if (action === 'list') return registry.detectAll();
+  if (action === 'enable-all') return syncConnectorsAfterChange(registry.enableAllInstalled());
+  if (action === 'enable') return syncConnectorsAfterChange(registry.enable(String(body.id || '')));
+  if (action === 'disable') return syncConnectorsAfterChange(registry.disable(String(body.id || '')));
+  if (action === 'open') {
+    const id = String(body.id || '');
+    return id === 'dsh' ? openDsh() : openBundle(id);
+  }
+  throw new Error('不支持的操作');
+});
 ipcMain.handle('companion:action', async (event, body) => {
   trusted(event);
-  if (!body || !['list','focus','home','info','create','prompt','cancel','models','selectModel','skills','files','hear','conversation'].includes(body.action)) throw new Error('不支持的操作');
+  if (!body || !['list','focus','home','info','create','prompt','cancel','models','selectModel','skills','files','hear','speak','speak-stop','conversation'].includes(body.action)) throw new Error('不支持的操作');
   return agentAction(body);
 });
 ipcMain.handle('companion:window', (event, action, value) => {
@@ -215,7 +299,7 @@ app.whenReady().then(async () => {
   placement = layout({ x: Number.isFinite(settings.petX) ? settings.petX : Number.isFinite(settings.x) ? settings.x + 70 : area.x + area.width - 194,
     y: Number.isFinite(settings.petY) ? settings.petY : Number.isFinite(settings.y) ? settings.y + 85 : area.y + area.height - 159 });
   win = new BrowserWindow({ ...placement.bounds,
-    title: 'Agent Pet', frame: false, transparent: true, backgroundColor: '#00000000', alwaysOnTop: true,
+    title: '小鑫', frame: false, transparent: true, backgroundColor: '#00000000', alwaysOnTop: true,
     skipTaskbar: true, resizable: false, show: false, hasShadow: false,
     webPreferences: { preload: path.join(__dirname, 'preload.cjs'), sandbox: true, contextIsolation: true, nodeIntegration: false, webSecurity: true },
   });
@@ -235,18 +319,39 @@ app.whenReady().then(async () => {
   await startCommands();
   await providers.refresh();
   notch = createNotch({
-    getState: () => ({ visible: !settings.hidden, source: settings.source, sources: providers.snapshot.sources,
-      status: providers.snapshot.sources.filter(row => settings.source === 'auto' || row.id === settings.source)
-        .sort((a,b) => ['waiting','blocked','running','ready','unknown','idle'].indexOf(a.status) - ['waiting','blocked','running','ready','unknown','idle'].indexOf(b.status))[0]?.status || 'idle' }),
+    getState: () => {
+      const priority = ['waiting', 'blocked', 'running', 'ready', 'unknown', 'idle'];
+      const rankOf = s => {
+        const idx = priority.indexOf(s);
+        return idx === -1 ? priority.length : idx;
+      };
+      const candidates = providers.snapshot.sources
+        .filter(row => settings.source === 'auto' || row.id === settings.source)
+        .sort((a, b) => rankOf(a.status) - rankOf(b.status));
+      const top = candidates[0];
+      const activeSource = settings.source === 'auto'
+        ? (top && top.status !== 'idle' ? top.id : 'dsh')
+        : settings.source;
+      return {
+        visible: !settings.hidden,
+        source: settings.source,
+        activeSource,
+        sources: providers.snapshot.sources,
+        status: top?.status || 'idle',
+      };
+    },
     command: async (action, value) => {
       if (action === 'source') setSource(value);
       else if (action === 'hide') hidePet();
-      else if (action === 'show') { setSource(value); showPet(); }
-      else if (action === 'open') await agentAction({ action: 'home' });
-    } });
+      else if (action === 'show') { if (typeof value === 'string' && value) setSource(value); showPet(); }
+      else if (action === 'open') { if (typeof value === 'string' && value && value !== 'dsh') await openBundle(value); else await agentAction({ action: 'home' }); }
+      else if (action === 'manage') openManagerWindow();
+      else if (action === 'reset') { resetPosition(); showPet(); }
+    },
+  });
   refreshTimer = setInterval(() => providers.refresh().then(() => notch.send()).catch(() => {}), 1500);
   const shortcut = process.env.DSH_COMPANION_SHORTCUT || 'Alt+Space';
-  const shortcutOk = globalShortcut.register(shortcut, () => showPet(!READ_ONLY_APPS[settings.source]));
+  const shortcutOk = globalShortcut.register(shortcut, () => showPet(!isReadOnlyConnector(settings.source)));
   writeFileSync(path.join(dataDir, 'desktop-runtime.json'), JSON.stringify({ pid: process.pid, hostPid, shortcut, shortcutRegistered: shortcutOk, ready: true, mode: 'multi-agent', project: path.dirname(__dirname) }), { mode: 0o600 });
   process.stdout.write('[companion] pet ready\n');
   // A photographic character is illegible at menu-bar size, so the tray uses a
@@ -256,8 +361,8 @@ app.whenReady().then(async () => {
   trayIcon.addRepresentation({ scaleFactor: 2, buffer: readFileSync(path.join(__dirname, '../assets/trayTemplate@2x.png')) });
   trayIcon.setTemplateImage(true);
   tray = new Tray(trayIcon);
-  tray.setToolTip('Agent Pet · ' + shortcut);
-  tray.on('right-click', () => tray.popUpContextMenu(Menu.buildFromTemplate([{ label: '显示桌宠', click: () => showPet() }, ...menuTemplate()])));
+  tray.setToolTip('小鑫 · ' + shortcut);
+  tray.on('right-click', () => tray.popUpContextMenu(Menu.buildFromTemplate([{ label: '显示小鑫', click: () => showPet() }, ...menuTemplate()])));
   tray.on('click', () => notch?.expand(true));
   // Independent lifetime: a disconnected Agent does not close the pet.
   screen.on('display-removed', () => { positionPet(currentPosition()); save(); });
@@ -269,7 +374,7 @@ process.on('message', message => {
     process.send?.({ type: 'companion:desktop-result', id: message.id, state: desktopState() });
   } catch { process.send?.({ type: 'companion:desktop-result', id: message.id, error: '桌宠操作失败，请重试' }); }
 });
-app.on('before-quit', () => { quitting = true; clearInterval(dragTimer); clearInterval(refreshTimer); commandServer?.close(); notch?.destroy(); globalShortcut.unregisterAll(); tray?.destroy(); });
+app.on('before-quit', () => { quitting = true; localSpeech.stopSpeaking(); clearInterval(dragTimer); clearInterval(refreshTimer); commandServer?.close(); notch?.destroy(); if (managerWin && !managerWin.isDestroyed()) managerWin.destroy(); globalShortcut.unregisterAll(); tray?.destroy(); });
 app.on('window-all-closed', () => app.quit());
 
 }

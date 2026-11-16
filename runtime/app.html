@@ -1,16 +1,16 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'">
-<title>Agent Pet</title><link rel="stylesheet" href="./ui.css"></head>
+<title>小鑫 · Agent Pet</title><link rel="stylesheet" href="./ui.css"></head>
 <body><main id="pet">
-  <button id="character" aria-label="DSH 桌宠：拖动移动，点击查看活动，双击打开 DSH"><video id="animation" muted autoplay loop playsinline aria-label="蓝发小女仆"></video><span id="dot" hidden></span></button>
+  <button id="character" aria-label="小鑫：拖动移动，点击查看活动，双击打开工具"><video id="animation" muted autoplay loop playsinline aria-label="小鑫"></video><span id="dot" hidden></span></button>
   <!-- Stable resting state: with the pointer away the whole dock collapses to
        one short pale pill. Hovering the character or this pill fades the glass
        capsule back in; a running turn only recolours the pill to green. -->
   <div id="mini-pill" aria-hidden="true"></div>
-  <section id="panel" aria-label="DSH 桌宠控制条">
+  <section id="panel" aria-label="小鑫控制条">
     <div id="first-awake" class="glass-card" hidden>
-      <span class="awake-title">Hi, I'm 蓝发小女仆</span>
+      <span class="awake-title">Hi, I'm 小鑫</span>
       <span class="awake-body">我会跟随你选择的工具，帮你留意任务状态。</span>
       <button id="awake-dismiss" type="button">知道了</button>
     </div>
@@ -47,7 +47,6 @@
       <button class="tool-button" id="tool-activities" type="button" aria-label="显示活动" aria-pressed="false" title="显示活动"><svg class="icon-bell" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 20a2 2 0 0 0 4 0"/></svg><svg class="icon-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg><span id="activity-badge" hidden>1</span></button>
     </div>
 
-    <button id="quick-restore" type="button" hidden>恢复快速聊天</button>
     <div id="attachment-strip" hidden aria-label="待发送的图片"></div>
     <div id="context-popover" class="glass-card" hidden>
       <div class="context-head"><span>添加上下文</span><button id="context-close" type="button" aria-label="关闭">×</button></div>
