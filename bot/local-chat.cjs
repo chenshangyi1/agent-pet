@@ -29,6 +29,218 @@ const PROVIDER_LABELS = {
 
 const DIRECT_ENGINES = new Set(['claude', 'codex', 'opencode']);
 const VALID_ENGINES = new Set(['claude', 'codex', 'opencode', 'dsh']);
+const MAX_DISCOVER_FILES = 15;
+const MAX_DISCOVER_WORKSPACES = 12;
+const MAX_DISCOVER_SESSIONS = 10;
+const JSONL_HEAD_BYTES = 65536;
+
+function safeRealpath(targetPath) {
+  if (typeof targetPath !== 'string' || !targetPath.trim()) return null;
+  try {
+    return fs.realpathSync(path.resolve(targetPath.trim()));
+  } catch {
+    return null;
+  }
+}
+
+function isExistingDirectory(dirPath) {
+  if (!dirPath) return false;
+  try {
+    return fs.statSync(dirPath).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function readHeadLines(filePath, maxBytes = JSONL_HEAD_BYTES) {
+  let fd;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const buf = Buffer.allocUnsafe(maxBytes);
+    const bytesRead = fs.readSync(fd, buf, 0, maxBytes, 0);
+    if (bytesRead <= 0) return [];
+    return buf.subarray(0, bytesRead).toString('utf8').split('\n');
+  } catch {
+    return [];
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
+}
+
+function collectRecentJsonlFiles(rootDir, maxDepth = 4, limit = MAX_DISCOVER_FILES) {
+  if (!isExistingDirectory(rootDir)) return [];
+  const found = [];
+  const stack = [{ dir: rootDir, depth: 0 }];
+
+  while (stack.length > 0) {
+    const { dir, depth } = stack.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith('.')) continue;
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (depth < maxDepth) {
+          stack.push({ dir: fullPath, depth: depth + 1 });
+        }
+      } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+        try {
+          const stat = fs.statSync(fullPath);
+          found.push({ filePath: fullPath, mtimeMs: stat.mtimeMs });
+        } catch {}
+      }
+    }
+  }
+
+  found.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return found.slice(0, limit);
+}
+
+function collectSubdirectories(rootDir, maxDepth = 2) {
+  if (!isExistingDirectory(rootDir)) return [];
+  const dirs = [];
+  const queue = [{ dir: rootDir, depth: 0 }];
+  while (queue.length > 0) {
+    const { dir, depth } = queue.shift();
+    if (depth >= maxDepth) continue;
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith('.') || SKIP_DIRS.has(entry.name)) continue;
+      if (!entry.isDirectory()) continue;
+      const fullPath = path.join(dir, entry.name);
+      dirs.push(fullPath);
+      if (depth + 1 < maxDepth) {
+        queue.push({ dir: fullPath, depth: depth + 1 });
+      }
+    }
+  }
+  return dirs;
+}
+
+function isBoilerplateUserText(text) {
+  const trimmed = String(text || '').trim();
+  if (!trimmed) return true;
+  return (
+    trimmed.startsWith('# AGENTS.md')
+    || trimmed.startsWith('<INSTRUCTIONS>')
+    || trimmed.startsWith('<environment_context>')
+    || trimmed.startsWith('<user_instructions>')
+    || trimmed.startsWith('<permissions instructions>')
+    || trimmed.startsWith('<app-context>')
+    || trimmed.startsWith('<turn_aborted>')
+    || trimmed.startsWith('<local-command-caveat>')
+  );
+}
+
+function extractTextFromContent(content) {
+  if (typeof content === 'string') return content.trim();
+  if (Array.isArray(content)) {
+    const parts = [];
+    for (const block of content) {
+      if (typeof block === 'string' && block.trim()) {
+        parts.push(block.trim());
+      } else if (block && typeof block === 'object' && typeof block.text === 'string' && block.text.trim()) {
+        parts.push(block.text.trim());
+      }
+    }
+    return parts.join(' ').trim();
+  }
+  return '';
+}
+
+function parseCodexSessionMeta(filePath, mtimeMs) {
+  const lines = readHeadLines(filePath, JSONL_HEAD_BYTES);
+  let id = null;
+  let cwd = null;
+  let snippet = '';
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || !trimmed.startsWith('{')) continue;
+    let obj;
+    try {
+      obj = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (!obj || typeof obj !== 'object') continue;
+    if (obj.type === 'session_meta' && obj.payload && typeof obj.payload === 'object') {
+      if (!id) id = obj.payload.id || obj.payload.session_id || null;
+      if (!cwd && typeof obj.payload.cwd === 'string' && obj.payload.cwd.trim()) {
+        cwd = obj.payload.cwd.trim();
+      }
+    } else if (!snippet && obj.type === 'event_msg' && obj.payload?.type === 'user_message') {
+      const candidate = extractTextFromContent(obj.payload.message);
+      if (!isBoilerplateUserText(candidate)) {
+        snippet = candidate.replace(/\s+/g, ' ').slice(0, 36);
+      }
+    } else if (!snippet && obj.type === 'response_item' && obj.payload?.type === 'message' && obj.payload?.role === 'user') {
+      const candidate = extractTextFromContent(obj.payload.content);
+      if (!isBoilerplateUserText(candidate)) {
+        snippet = candidate.replace(/\s+/g, ' ').slice(0, 36);
+      }
+    }
+    if (id && cwd && snippet) break;
+  }
+
+  if (!id) return null;
+  const fallbackName = cwd ? path.basename(cwd) : 'Codex';
+  return {
+    sessionId: id,
+    cliSessionId: id,
+    provider: 'codex',
+    cwd: cwd || '',
+    title: snippet || `${fallbackName || 'Codex'} · ${id.slice(0, 8)}`,
+    updatedAt: mtimeMs,
+    filePath,
+  };
+}
+
+function parseClaudeSessionMeta(filePath, mtimeMs) {
+  const sessionId = path.basename(filePath, '.jsonl');
+  if (!sessionId) return null;
+  const lines = readHeadLines(filePath, JSONL_HEAD_BYTES);
+  let cwd = '';
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || !trimmed.startsWith('{')) continue;
+    let obj;
+    try {
+      obj = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (!obj || typeof obj !== 'object') continue;
+    const candidateCwd = obj.cwd || obj.attachment?.snapshot?.workingDirectory;
+    if (typeof candidateCwd === 'string' && candidateCwd.trim()) {
+      cwd = candidateCwd.trim();
+      break;
+    }
+  }
+
+  const base = cwd ? path.basename(cwd) : 'Claude';
+  return {
+    sessionId,
+    cliSessionId: sessionId,
+    provider: 'claude',
+    cwd,
+    title: `${base || 'Claude'} · ${sessionId.slice(0, 8)}`,
+    updatedAt: mtimeMs,
+    filePath,
+  };
+}
 
 function getProviderLabel(id) {
   return PROVIDER_LABELS[id] || CATALOG_BY_ID[id]?.label || id;
@@ -111,12 +323,17 @@ function listWorkspaceFiles(rootDir, query = '', limit = MAX_LIST_FILES) {
 }
 
 class LocalChatBridge {
-  constructor({ dispatcher, getConfig } = {}) {
+  constructor({ dispatcher, getConfig, onUpdate, codexSessionsDir, claudeProjectsDir } = {}) {
     this.dispatcher = dispatcher || null;
     this.getConfig = typeof getConfig === 'function' ? getConfig : () => ({});
+    this.onUpdate = typeof onUpdate === 'function' ? onUpdate : null;
     this.sessions = new Map();
     this.sessionAliases = new Map();
     this.selectedEngine = null;
+    this.selectedCwd = null;
+    this.selectedSessionId = null;
+    this._codexSessionsDir = codexSessionsDir || path.join(os.homedir(), '.codex', 'sessions');
+    this._claudeProjectsDir = claudeProjectsDir || path.join(os.homedir(), '.claude', 'projects');
   }
 
   _defaultCwd() {
@@ -124,6 +341,170 @@ class LocalChatBridge {
     return (typeof cfg.defaultCwd === 'string' && cfg.defaultCwd.trim())
       || this.dispatcher?.defaultCwd
       || os.homedir();
+  }
+
+  currentCwd() {
+    return this.selectedCwd || this._defaultCwd();
+  }
+
+  _validateOrResolveCwd(targetDir, { allowUserSelection = false } = {}) {
+    const raw = typeof targetDir === 'string' ? targetDir.trim() : '';
+    if (!raw) throw new Error('工作目录不能为空');
+    const expanded = raw === '~'
+      ? os.homedir()
+      : raw.startsWith('~/')
+        ? path.join(os.homedir(), raw.slice(2))
+        : raw;
+    const real = safeRealpath(expanded);
+    if (!real || !isExistingDirectory(real)) {
+      throw new Error(`工作目录不存在或不可访问: ${targetDir}`);
+    }
+    if (this.dispatcher && typeof this.dispatcher.validateWorkspace === 'function') {
+      if (allowUserSelection) {
+        const list = Array.isArray(this.dispatcher.allowedWorkspaces)
+          ? this.dispatcher.allowedWorkspaces
+          : [];
+        const covered = list.some(root => {
+          const realRoot = safeRealpath(root);
+          return realRoot && (real === realRoot || real.startsWith(realRoot === path.sep ? realRoot : realRoot + path.sep));
+        });
+        if (!covered) {
+          this.dispatcher.allowedWorkspaces = [...list, real];
+        }
+      }
+      return this.dispatcher.validateWorkspace(real);
+    }
+    return real;
+  }
+
+  discoverWorkspaces() {
+    const candidates = [];
+    const pushCandidate = dir => {
+      if (typeof dir === 'string' && dir.trim()) {
+        candidates.push(dir.trim());
+      }
+    };
+
+    pushCandidate(this.currentCwd());
+    pushCandidate(this._defaultCwd());
+    for (const s of this.sessions.values()) {
+      pushCandidate(s.cwd);
+    }
+
+    const recentCodexFiles = collectRecentJsonlFiles(this._codexSessionsDir, 4, MAX_DISCOVER_FILES);
+    for (const { filePath, mtimeMs } of recentCodexFiles) {
+      const meta = parseCodexSessionMeta(filePath, mtimeMs);
+      if (meta?.cwd) pushCandidate(meta.cwd);
+    }
+
+    const home = os.homedir();
+    for (const dir of collectSubdirectories(path.join(home, 'AI', 'Codex'), 2)) {
+      pushCandidate(dir);
+    }
+    for (const dir of collectSubdirectories(path.join(home, 'AI'), 2)) {
+      pushCandidate(dir);
+    }
+
+    pushCandidate(process.cwd());
+
+    const activeReal = safeRealpath(this.currentCwd()) || this.currentCwd();
+    const seen = new Set();
+    const out = [];
+
+    for (const cand of candidates) {
+      if (out.length >= MAX_DISCOVER_WORKSPACES) break;
+      const real = safeRealpath(cand);
+      if (!real || seen.has(real) || !isExistingDirectory(real)) continue;
+      if (this.dispatcher && typeof this.dispatcher.validateWorkspace === 'function') {
+        try {
+          this.dispatcher.validateWorkspace(real);
+        } catch {
+          continue;
+        }
+      }
+      seen.add(real);
+      out.push({
+        path: real,
+        name: path.basename(real) || real,
+        active: real === activeReal,
+      });
+    }
+
+    return out;
+  }
+
+  discoverSessions({ engine, cwd } = {}) {
+    const reqEng = String(engine || '').trim().toLowerCase();
+    const eng = VALID_ENGINES.has(reqEng) ? reqEng : this.resolveEngine('auto');
+    const filterCwd = cwd || this.currentCwd();
+    const normFilterCwd = safeRealpath(filterCwd) || filterCwd;
+
+    const selectedObj = this.selectedSessionId ? this._resolveSession(this.selectedSessionId) : null;
+    const selectedCliId = selectedObj?.cliSessionId || null;
+
+    const items = [];
+    const seenCliIds = new Set();
+
+    for (const s of this.sessions.values()) {
+      if (s.provider !== eng) continue;
+      if (s.cliSessionId) seenCliIds.add(s.cliSessionId);
+      const normSessionCwd = safeRealpath(s.cwd) || s.cwd || '';
+      items.push({
+        sessionId: s.sessionId,
+        cliSessionId: s.cliSessionId || null,
+        provider: eng,
+        cwd: s.cwd || this.currentCwd(),
+        title: s.title || '本地对话',
+        updatedAt: Number(s.updatedAt || 0),
+        matchesCwd: Boolean(normFilterCwd && normSessionCwd === normFilterCwd),
+        active: s.sessionId === this.selectedSessionId,
+      });
+    }
+
+    if (eng === 'codex') {
+      const files = collectRecentJsonlFiles(this._codexSessionsDir, 4, MAX_DISCOVER_FILES);
+      for (const { filePath, mtimeMs } of files) {
+        const meta = parseCodexSessionMeta(filePath, mtimeMs);
+        if (!meta || seenCliIds.has(meta.cliSessionId)) continue;
+        seenCliIds.add(meta.cliSessionId);
+        const normCwd = safeRealpath(meta.cwd) || meta.cwd || '';
+        items.push({
+          sessionId: meta.sessionId,
+          cliSessionId: meta.cliSessionId,
+          provider: 'codex',
+          cwd: meta.cwd || this.currentCwd(),
+          title: meta.title,
+          updatedAt: meta.updatedAt,
+          matchesCwd: Boolean(normFilterCwd && normCwd === normFilterCwd),
+          active: meta.sessionId === this.selectedSessionId || (Boolean(selectedCliId) && meta.cliSessionId === selectedCliId),
+        });
+      }
+    } else if (eng === 'claude') {
+      const files = collectRecentJsonlFiles(this._claudeProjectsDir, 2, MAX_DISCOVER_FILES);
+      for (const { filePath, mtimeMs } of files) {
+        const meta = parseClaudeSessionMeta(filePath, mtimeMs);
+        if (!meta || seenCliIds.has(meta.cliSessionId)) continue;
+        seenCliIds.add(meta.cliSessionId);
+        const normCwd = safeRealpath(meta.cwd) || meta.cwd || '';
+        items.push({
+          sessionId: meta.sessionId,
+          cliSessionId: meta.cliSessionId,
+          provider: 'claude',
+          cwd: meta.cwd || this.currentCwd(),
+          title: meta.title,
+          updatedAt: meta.updatedAt,
+          matchesCwd: Boolean(normFilterCwd && normCwd === normFilterCwd),
+          active: meta.sessionId === this.selectedSessionId || (Boolean(selectedCliId) && meta.cliSessionId === selectedCliId),
+        });
+      }
+    }
+
+    items.sort((a, b) => {
+      if (a.matchesCwd !== b.matchesCwd) return a.matchesCwd ? -1 : 1;
+      return Number(b.updatedAt || 0) - Number(a.updatedAt || 0);
+    });
+
+    return items.slice(0, MAX_DISCOVER_SESSIONS);
   }
 
   resolveEngine(preferredSource = 'auto') {
@@ -170,7 +551,7 @@ class LocalChatBridge {
       providerLabel: getProviderLabel(engine),
       cliSessionId: null,
       title: '本地对话',
-      cwd: this._defaultCwd(),
+      cwd: this.currentCwd(),
       model: engine,
       status: 'idle',
       statusText: '空闲',
@@ -183,6 +564,100 @@ class LocalChatBridge {
     };
     this.sessions.set(canonicalId, session);
     return session;
+  }
+
+  _hydrateHistoricalMessages(session, limit = 20) {
+    if (!session || !session.cliSessionId || session.messages.length > 0) return;
+    let filePath = null;
+    if (session.provider === 'codex') {
+      const files = collectRecentJsonlFiles(this._codexSessionsDir, 4, 30);
+      for (const f of files) {
+        const meta = parseCodexSessionMeta(f.filePath, f.mtimeMs);
+        if (meta?.cliSessionId === session.cliSessionId) {
+          filePath = f.filePath;
+          break;
+        }
+      }
+    } else if (session.provider === 'claude') {
+      const files = collectRecentJsonlFiles(this._claudeProjectsDir, 2, 30);
+      for (const f of files) {
+        if (path.basename(f.filePath, '.jsonl') === session.cliSessionId) {
+          filePath = f.filePath;
+          break;
+        }
+      }
+    }
+    if (!filePath) return;
+
+    try {
+      const stat = fs.statSync(filePath);
+      const readSize = Math.min(stat.size, 262144);
+      const offset = Math.max(0, stat.size - readSize);
+      const fd = fs.openSync(filePath, 'r');
+      let raw = '';
+      try {
+        const buf = Buffer.allocUnsafe(readSize);
+        const bytesRead = fs.readSync(fd, buf, 0, readSize, offset);
+        raw = buf.subarray(0, bytesRead).toString('utf8');
+      } finally {
+        fs.closeSync(fd);
+      }
+      const lines = raw.split('\n');
+      if (offset > 0) lines.shift();
+      const parsedMsgs = [];
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith('{')) continue;
+        let obj;
+        try { obj = JSON.parse(trimmed); } catch { continue; }
+        if (!obj || typeof obj !== 'object') continue;
+
+        if (session.provider === 'codex') {
+          if (obj.type === 'event_msg' && obj.payload?.type === 'user_message') {
+            const text = extractTextFromContent(obj.payload.message);
+            if (!isBoilerplateUserText(text)) {
+              parsedMsgs.push({ role: 'user', text, ts: Date.parse(obj.timestamp) || Date.now() });
+            }
+          } else if (obj.type === 'event_msg' && obj.payload?.type === 'agent_message') {
+            const text = extractTextFromContent(obj.payload.message);
+            if (text) parsedMsgs.push({ role: 'assistant', text, ts: Date.parse(obj.timestamp) || Date.now() });
+          } else if (obj.type === 'response_item' && obj.payload?.type === 'message') {
+            const role = obj.payload.role;
+            if (role === 'user' || role === 'assistant') {
+              const text = extractTextFromContent(obj.payload.content);
+              if (text && (role !== 'user' || !isBoilerplateUserText(text))) {
+                const prev = parsedMsgs[parsedMsgs.length - 1];
+                if (!prev || prev.role !== role || prev.text !== text) {
+                  parsedMsgs.push({ role, text, ts: Date.parse(obj.timestamp) || Date.now() });
+                }
+              }
+            }
+          }
+        } else if (session.provider === 'claude') {
+          if (obj.type === 'user' && obj.message) {
+            const text = extractTextFromContent(obj.message.content);
+            if (!isBoilerplateUserText(text)) {
+              parsedMsgs.push({ role: 'user', text, ts: Date.parse(obj.timestamp) || Date.now() });
+            }
+          } else if (obj.type === 'assistant' && obj.message) {
+            const text = extractTextFromContent(obj.message.content);
+            if (text) parsedMsgs.push({ role: 'assistant', text, ts: Date.parse(obj.timestamp) || Date.now() });
+          }
+        }
+      }
+
+      for (const m of parsedMsgs.slice(-limit)) {
+        session.lastSeq += 1;
+        session.messages.push({
+          id: randomUUID(),
+          seq: session.lastSeq,
+          role: m.role,
+          text: m.text,
+          createdAt: m.ts,
+        });
+      }
+    } catch {}
   }
 
   _extractPromptAndImages(body = {}) {
@@ -361,6 +836,96 @@ class LocalChatBridge {
       return { model: this.selectedEngine || this.resolveEngine(currentSource) };
     }
 
+    if (action === 'workspaces') {
+      return {
+        currentCwd: this.currentCwd(),
+        workspaces: this.discoverWorkspaces(),
+      };
+    }
+
+    if (action === 'selectWorkspace') {
+      const resolvedCwd = this._validateOrResolveCwd(body.cwd, {
+        allowUserSelection: Boolean(body.userSelected || body.browse),
+      });
+      this.selectedCwd = resolvedCwd;
+      this.selectedSessionId = null;
+      const reqEng = String(body.targetAgent || body.engine || '').trim().toLowerCase();
+      const eng = VALID_ENGINES.has(reqEng) ? reqEng : this.resolveEngine(currentSource);
+      this.onUpdate?.({ type: 'workspace', currentCwd: this.selectedCwd });
+      return {
+        currentCwd: this.selectedCwd,
+        workspaces: this.discoverWorkspaces(),
+        sessions: this.discoverSessions({ engine: eng, cwd: this.selectedCwd }),
+      };
+    }
+
+    if (action === 'sessions') {
+      const reqEng = String(body.targetAgent || body.engine || '').trim().toLowerCase();
+      const eng = VALID_ENGINES.has(reqEng) ? reqEng : this.resolveEngine(currentSource);
+      const targetCwd = body.cwd || this.currentCwd();
+      return {
+        currentCwd: this.currentCwd(),
+        currentSessionId: this.selectedSessionId,
+        sessions: this.discoverSessions({ engine: eng, cwd: targetCwd }),
+      };
+    }
+
+    if (action === 'selectSession') {
+      if (!body.sessionId || body.sessionId === 'new') {
+        this.selectedSessionId = null;
+        this.onUpdate?.({ type: 'session', sessionId: null });
+        return {
+          sessionId: null,
+          isNew: true,
+          currentCwd: this.currentCwd(),
+        };
+      }
+
+      const existing = this._resolveSession(body.sessionId);
+      if (existing) {
+        this.selectedSessionId = existing.sessionId;
+        if (existing.cwd) {
+          this.selectedCwd = existing.cwd;
+        }
+        this.onUpdate?.({ type: 'session', sessionId: existing.sessionId });
+        return {
+          sessionId: existing.sessionId,
+          cliSessionId: existing.cliSessionId,
+          cwd: this.selectedCwd || existing.cwd || this.currentCwd(),
+          title: existing.title,
+        };
+      }
+
+      const reqEng = String(body.provider || body.targetAgent || body.engine || '').trim().toLowerCase();
+      const eng = VALID_ENGINES.has(reqEng) ? reqEng : this.resolveEngine(currentSource);
+      const session = this._createSession(eng);
+      session.cliSessionId = String(body.cliSessionId || body.sessionId);
+      if (typeof body.cwd === 'string' && body.cwd.trim()) {
+        try {
+          const validCwd = this._validateOrResolveCwd(body.cwd);
+          session.cwd = validCwd;
+          this.selectedCwd = validCwd;
+        } catch {
+          session.cwd = this.currentCwd();
+        }
+      } else {
+        session.cwd = this.currentCwd();
+      }
+      session.title = typeof body.title === 'string' && body.title.trim() ? body.title.trim() : '历史会话';
+      if (session.cliSessionId) {
+        this.sessionAliases.set(session.cliSessionId, session.sessionId);
+      }
+      this._hydrateHistoricalMessages(session);
+      this.selectedSessionId = session.sessionId;
+      this.onUpdate?.({ type: 'session', sessionId: session.sessionId });
+      return {
+        sessionId: session.sessionId,
+        cliSessionId: session.cliSessionId,
+        cwd: session.cwd,
+        title: session.title,
+      };
+    }
+
     if (action === 'skills') {
       return {
         skills: [
@@ -371,7 +936,7 @@ class LocalChatBridge {
     }
 
     if (action === 'files') {
-      const files = listWorkspaceFiles(this._defaultCwd(), body.query || '', MAX_LIST_FILES);
+      const files = listWorkspaceFiles(this.currentCwd(), body.query || '', MAX_LIST_FILES);
       return { files, candidates: files };
     }
 
@@ -411,6 +976,7 @@ class LocalChatBridge {
       session.detail = '任务已取消';
       session.lastSeq += 1;
       session.updatedAt = Date.now();
+      this.onUpdate?.({ type: 'chat', sessionId: session.sessionId, status: session.status });
       return { cancelled: true };
     }
 
@@ -418,15 +984,22 @@ class LocalChatBridge {
       const { text: promptText, images, tempFiles, inlineEngine } = this._extractPromptAndImages(body);
       const requested = String(inlineEngine || body.targetAgent || body.engine || '').trim().toLowerCase();
       const engine = VALID_ENGINES.has(requested) ? requested : this.resolveEngine(currentSource);
-      const existing = this._resolveSession(body.sessionId);
+      const lookupId = body.sessionId || this.selectedSessionId || null;
+      const existing = this._resolveSession(lookupId);
       let session = existing && existing.provider === engine ? existing : null;
       if (!session) {
         session = this._createSession(engine, existing ? null : (body.sessionId || null));
       }
 
+      if (typeof body.cwd === 'string' && body.cwd.trim()) {
+        session.cwd = this._validateOrResolveCwd(body.cwd);
+      } else if (!session.cwd) {
+        session.cwd = this.currentCwd();
+      }
+
       if (!promptText && images.length === 0) {
         if (action === 'create') {
-          return { sessionId: session.sessionId, status: session.status };
+          return { sessionId: session.sessionId, status: session.status, cwd: session.cwd };
         }
         throw new Error('任务内容不能为空');
       }
@@ -454,12 +1027,14 @@ class LocalChatBridge {
       session.detail = '正在思考';
       session.unread = false;
       session.updatedAt = Date.now();
+      this.onUpdate?.({ type: 'chat', sessionId: session.sessionId, status: session.status });
 
       const dispatchEngine = session.provider || engine;
+      const dispatchCwd = session.cwd || this.currentCwd();
       const runPromise = this.dispatcher.dispatch({
         engine: dispatchEngine,
         prompt: effectivePrompt,
-        cwd: session.cwd,
+        cwd: dispatchCwd,
         sessionId: session.cliSessionId,
         images,
         onProgress: ev => {
@@ -468,10 +1043,12 @@ class LocalChatBridge {
             session.detail = `正在使用 ${ev.tool}`;
             session.lastSeq += 1;
             session.updatedAt = Date.now();
+            this.onUpdate?.({ type: 'chat', sessionId: session.sessionId, status: session.status });
           } else if (ev?.text) {
             session.detail = String(ev.text).slice(0, 80);
             session.lastSeq += 1;
             session.updatedAt = Date.now();
+            this.onUpdate?.({ type: 'chat', sessionId: session.sessionId, status: session.status });
           }
         },
       });
@@ -488,6 +1065,7 @@ class LocalChatBridge {
           session.activeJobId = null;
           if (res?.sessionId) {
             session.cliSessionId = res.sessionId;
+            this.sessionAliases.set(res.sessionId, session.sessionId);
           }
           if (res?.status === 'cancelled' || session.status === 'cancelled') {
             if (session.status !== 'cancelled') {
@@ -497,6 +1075,7 @@ class LocalChatBridge {
               session.lastSeq += 1;
               session.updatedAt = Date.now();
             }
+            this.onUpdate?.({ type: 'chat', sessionId: session.sessionId, status: session.status });
             return;
           }
           if (res?.status === 'failed') {
@@ -513,6 +1092,7 @@ class LocalChatBridge {
             session.statusText = '遇到问题';
             session.detail = errMsg.slice(0, 80);
             session.updatedAt = Date.now();
+            this.onUpdate?.({ type: 'chat', sessionId: session.sessionId, status: session.status });
             return;
           }
           const replyText = String(res?.text || '（执行完成，无文本输出）').trim();
@@ -529,6 +1109,7 @@ class LocalChatBridge {
           session.detail = replyText.slice(0, 80);
           session.unread = true;
           session.updatedAt = Date.now();
+          this.onUpdate?.({ type: 'chat', sessionId: session.sessionId, status: session.status });
         })
         .catch(err => {
           session.activeJobId = null;
@@ -546,6 +1127,7 @@ class LocalChatBridge {
           session.statusText = '遇到问题';
           session.detail = errMsg.slice(0, 80);
           session.updatedAt = Date.now();
+          this.onUpdate?.({ type: 'chat', sessionId: session.sessionId, status: session.status });
         })
         .finally(() => {
           for (const f of tempFiles) {
@@ -553,7 +1135,7 @@ class LocalChatBridge {
           }
         });
 
-      return { sessionId: session.sessionId, status: 'running' };
+      return { sessionId: session.sessionId, status: 'running', cwd: dispatchCwd };
     }
 
     throw new Error(`不支持的本地对话操作: ${action}`);

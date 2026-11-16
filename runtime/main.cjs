@@ -169,7 +169,10 @@ async function rpc(body) {
     throw error;
   }
 }
-const INTERACTIVE_ACTIONS = new Set(['create', 'prompt', 'conversation', 'cancel', 'models', 'selectModel', 'skills', 'files']);
+const INTERACTIVE_ACTIONS = new Set([
+  'create', 'prompt', 'conversation', 'cancel', 'models', 'selectModel', 'skills', 'files',
+  'workspaces', 'selectWorkspace', 'sessions', 'selectSession',
+]);
 const DIRECT_CHAT_SOURCES = new Set(['auto', 'dsh', 'claude', 'codex', 'opencode']);
 
 function isDshOnline() {
@@ -351,6 +354,24 @@ async function agentAction(body) {
       label: CATALOG_BY_ID[id].label,
       targets: getChatTargets(),
     };
+  }
+  if (['workspaces', 'selectWorkspace', 'sessions', 'selectSession'].includes(body.action)) {
+    if (!botService?.localChat) throw new Error('本地对话服务尚未就绪');
+    if (body.action === 'selectWorkspace' && body.browse === true) {
+      const picked = await dialog.showOpenDialog(win, {
+        title: '选择项目工作目录',
+        defaultPath: botService.localChat.currentCwd(),
+        properties: ['openDirectory'],
+      });
+      if (picked.canceled || !picked.filePaths?.length) {
+        return { canceled: true, currentCwd: botService.localChat.currentCwd() };
+      }
+      return botService.localChat.handleAction(
+        { ...body, action: 'selectWorkspace', cwd: picked.filePaths[0], userSelected: true },
+        settings.source
+      );
+    }
+    return botService.localChat.handleAction(body, settings.source);
   }
   const sessionId = String(body.sessionId || '');
   if (body.action === 'create' || body.action === 'prompt') {
@@ -606,7 +627,7 @@ ipcMain.handle('companion:bot', async (event, body) => {
 });
 ipcMain.handle('companion:action', async (event, body) => {
   trusted(event);
-  if (!body || !['list','focus','home','info','create','prompt','cancel','models','selectModel','skills','files','hear','speak','speak-stop','conversation'].includes(body.action)) throw new Error('不支持的操作');
+  if (!body || !['list','focus','home','info','create','prompt','cancel','models','selectModel','skills','files','workspaces','selectWorkspace','sessions','selectSession','hear','speak','speak-stop','conversation'].includes(body.action)) throw new Error('不支持的操作');
   return agentAction(body);
 });
 ipcMain.handle('companion:window', (event, action, value) => {

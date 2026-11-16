@@ -9,6 +9,7 @@ const { EventEmitter } = require('node:events');
 const { TaskDispatcher } = require('./dispatcher.cjs');
 const { CommandRouter } = require('./commands.cjs');
 const { LocalChatBridge } = require('./local-chat.cjs');
+const { MobileBridgeServer, DEFAULT_MOBILE_PORT } = require('./mobile-bridge.cjs');
 const { QQOneBotAdapter } = require('./channels/qq-onebot.cjs');
 const { WeComAdapter } = require('./channels/wecom.cjs');
 
@@ -21,6 +22,7 @@ const DEFAULT_BOT_CONFIG = {
   allowedWorkspaces: [os.homedir()],
   sandboxMode: 'workspace-write',
   pairingCode: '',
+  mobilePort: DEFAULT_MOBILE_PORT,
   authorizedUsers: {
     qq: [],
     wecom: [],
@@ -112,6 +114,11 @@ function normalizeBotConfig(raw = {}, existing = null) {
     ? pairingCandidate
     : generatePairingCode();
 
+  const mobilePortRaw = Number(raw.mobilePort ?? base.mobilePort ?? DEFAULT_MOBILE_PORT);
+  const mobilePort = Number.isInteger(mobilePortRaw) && mobilePortRaw >= 0 && mobilePortRaw <= 65535
+    ? mobilePortRaw
+    : DEFAULT_MOBILE_PORT;
+
   const authRaw = raw.authorizedUsers && typeof raw.authorizedUsers === 'object' ? raw.authorizedUsers : {};
   const authBase = base.authorizedUsers && typeof base.authorizedUsers === 'object' ? base.authorizedUsers : {};
   const authorizedUsers = {
@@ -167,6 +174,7 @@ function normalizeBotConfig(raw = {}, existing = null) {
     allowedWorkspaces,
     sandboxMode,
     pairingCode,
+    mobilePort,
     authorizedUsers,
     notifications,
     qq,
@@ -211,6 +219,7 @@ class BotService extends EventEmitter {
     this.localChat = new LocalChatBridge({
       dispatcher: this.dispatcher,
       getConfig: () => this.config,
+      onUpdate: () => this.mobileBridge?.scheduleBroadcast(),
     });
 
     this.router = options.router || new CommandRouter({
@@ -220,6 +229,13 @@ class BotService extends EventEmitter {
       openApp: this.openApp,
       getConfig: () => this.config,
       onAuthorizeUser: payload => this.authorizeUser(payload),
+    });
+
+    this.mobileBridge = new MobileBridgeServer({
+      botService: this,
+      providers: this.providers,
+      host: options.mobileHost,
+      port: options.mobilePort,
     });
 
     this.qq = new QQOneBotAdapter({
@@ -283,12 +299,15 @@ class BotService extends EventEmitter {
   }
 
   #emitUpdated() {
+    this.mobileBridge?.scheduleBroadcast();
     this.emit('updated', this.getState());
   }
 
   async start() {
     this.started = true;
-    const tasks = [];
+    const tasks = [
+      this.mobileBridge.start().catch(() => {}),
+    ];
     if (this.config.qq.enabled) {
       tasks.push(this.qq.start().catch(() => {}));
     }
@@ -302,7 +321,7 @@ class BotService extends EventEmitter {
 
   async stop() {
     this.started = false;
-    await Promise.allSettled([this.qq.stop(), this.wecom.stop()]);
+    await Promise.allSettled([this.qq.stop(), this.wecom.stop(), this.mobileBridge.stop()]);
     this.#emitUpdated();
   }
 
@@ -313,6 +332,7 @@ class BotService extends EventEmitter {
         qq: this.qq.getStatus(),
         wecom: this.wecom.getStatus(),
       },
+      mobile: this.mobileBridge?.getStatus() || { started: false, host: '0.0.0.0', port: null, clients: 0 },
       engines: this.probeEngines(),
       jobs: this.listJobs(),
     };
@@ -478,6 +498,7 @@ class BotService extends EventEmitter {
     const items = Array.isArray(snapshot?.items) ? snapshot.items : [];
     const isColdBoot = !this.hasSeenInitialSnapshot;
     this.hasSeenInitialSnapshot = true;
+    this.mobileBridge?.scheduleBroadcast();
 
     const notif = this.config.notifications || DEFAULT_BOT_CONFIG.notifications;
     const cooldownMs = Number.isFinite(Number(notif.cooldownMs)) ? Number(notif.cooldownMs) : 15000;

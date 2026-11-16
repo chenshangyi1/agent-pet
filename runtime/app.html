@@ -51,6 +51,14 @@
     <div id="context-popover" class="glass-card" hidden>
       <div class="context-head"><span>添加上下文</span><button id="context-close" type="button" aria-label="关闭">×</button></div>
       <div class="context-section"><p class="context-label">发送给 AI Agent</p><div id="context-models" class="context-options"></div></div>
+      <div class="context-section">
+        <div class="context-row-head"><p class="context-label">项目目录</p><button id="context-browse-cwd" class="context-mini-btn" type="button">📁 选择文件夹…</button></div>
+        <div id="context-workspaces" class="context-options"></div>
+      </div>
+      <div class="context-section">
+        <div class="context-row-head"><p class="context-label">项目会话</p><button id="context-new-session" class="context-mini-btn" type="button">＋ 新建会话</button></div>
+        <div id="context-sessions" class="context-options"></div>
+      </div>
       <button id="context-image" class="context-row" type="button"><span class="context-glyph">▧</span>选择图片<span class="context-hint">最多 5 张</span></button>
       <input id="context-file" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden>
       <div class="context-section"><p class="context-label">技能 <kbd>/</kbd></p><div id="context-skills" class="context-options"></div></div>

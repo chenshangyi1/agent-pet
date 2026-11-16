@@ -99,11 +99,15 @@ let items = [], current, animationKey, polling = false, noticeTimer, drag, suppr
 /* authoritative: dismissal/mute are display-only and never touch DSH data.   */
 /* -------------------------------------------------------------------------- */
 const PREFS_KEY = 'dsh-companion:prefs:v1';
-const defaultPrefs = { firstAwakeSeen: false, muted: [], dismissed: [], activeSessionId: null, model: null, targetAgent: null, stackCollapsed: true, dockCollapsed: true };
+const defaultPrefs = { firstAwakeSeen: false, muted: [], dismissed: [], activeSessionId: null, activeSessionTitle: '', cwd: '', model: null, targetAgent: null, stackCollapsed: true, dockCollapsed: true };
 let prefs;
 try { prefs = { ...defaultPrefs, ...JSON.parse(localStorage.getItem(PREFS_KEY) || '{}') }; }
 catch { prefs = { ...defaultPrefs }; }
 let targetAgent = prefs.targetAgent || 'claude';
+let currentCwd = prefs.cwd || '';
+let activeSessionTitle = prefs.activeSessionTitle || '';
+let workspaceOptions = [];
+let sessionOptions = [];
 function savePrefs() { try { localStorage.setItem(PREFS_KEY, JSON.stringify(prefs)); } catch { /* private mode */ } }
 // Persist the quiet collapsed dock as the boot state. An Electron restart must
 // come back to the pill, never to a panel that happened to be open on exit.
@@ -516,7 +520,11 @@ async function sendPrompt(text, { sessionId: existingSessionId, trackReply = fal
     let sessionId = existingSessionId ?? (reuseActive ? prefs.activeSessionId : null);
     if (!sessionId) {
       const requestedId = `session-${crypto.randomUUID()}`;
-      const created = await action('create', { sessionId: requestedId, targetAgent: promptTarget });
+      const created = await action('create', {
+        sessionId: requestedId,
+        targetAgent: promptTarget,
+        cwd: currentCwd || undefined,
+      });
       sessionId = created?.sessionId || requestedId;
     }
     const isLaunchSession = sessionId.startsWith('launch:')
@@ -533,6 +541,7 @@ async function sendPrompt(text, { sessionId: existingSessionId, trackReply = fal
     const promptResult = await action('prompt', {
       sessionId,
       targetAgent: promptTarget,
+      cwd: currentCwd || undefined,
       requestId: crypto.randomUUID(),
       content: parts,
       clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
@@ -551,7 +560,15 @@ async function sendPrompt(text, { sessionId: existingSessionId, trackReply = fal
       showFeedback(`已复制指令并打开 ${targetLabel}（可直接 ⌘V 粘贴）`);
       return { sessionId, launched: true };
     }
-    if (reuseActive) { prefs.activeSessionId = sessionId; savePrefs(); }
+    if (reuseActive) {
+      prefs.activeSessionId = sessionId;
+      if (!activeSessionTitle && request) {
+        activeSessionTitle = request.slice(0, 24);
+        prefs.activeSessionTitle = activeSessionTitle;
+      }
+      savePrefs();
+      renderModel();
+    }
     finishComposeUi();
     const resolvedTargetId = promptResult?.targetAgent
       || (sessionId.startsWith('local:') ? sessionId.split(':')[1] : promptTarget);
@@ -594,9 +611,21 @@ function getTargetInfo(id = targetAgent) {
   const mode = ['claude', 'codex', 'opencode', 'dsh'].includes(id) ? 'direct' : 'launch';
   return { id, label, mode };
 }
+function cwdBasename(dir = currentCwd) {
+  if (!dir) return '';
+  const normalized = String(dir).replace(/[\\/]+$/, '');
+  if (!normalized) return '/';
+  const parts = normalized.split(/[\\/]/);
+  return parts[parts.length - 1] || normalized;
+}
 function syncTargetFromInfo(info) {
   if (!info) return;
   if (Array.isArray(info.targets)) chatTargets = info.targets;
+  if (info.currentCwd && !currentCwd) {
+    currentCwd = info.currentCwd;
+    prefs.cwd = currentCwd;
+    savePrefs();
+  }
   if (info.targetAgent && (!prefs.targetAgent || (chatTargets.length && !chatTargets.some(t => t.id === targetAgent)))) {
     targetAgent = info.targetAgent;
     prefs.targetAgent = info.targetAgent;
@@ -610,24 +639,42 @@ function renderModel() {
   const labelEl = $('quick-model-label');
   const info = getTargetInfo(targetAgent);
   const label = info?.label || TARGET_LABELS[targetAgent] || targetAgent;
+  const dirName = cwdBasename(currentCwd);
+  const sessionLabel = prefs.activeSessionId ? (activeSessionTitle || '已选会话') : '';
+  const tooltipParts = [`当前 Agent：${label}`];
+  if (dirName) tooltipParts.push(`目录：${dirName}`);
+  tooltipParts.push(sessionLabel ? `会话：${sessionLabel}` : '新建会话');
+  const fullTooltip = `${tooltipParts.join(' · ')}（点击切换 Agent / 目录 / 会话）`;
   chip.hidden = false;
-  chip.title = `当前目标：${label}（点击切换 AI Agent）`;
+  chip.title = fullTooltip;
+  chip.setAttribute('aria-label', fullTooltip);
   if (icon) {
     bindIconFallback(icon);
     icon.src = iconUrl(targetAgent);
   }
   if (labelEl) labelEl.textContent = label;
-  quickInput.placeholder = info?.mode === 'launch'
-    ? `发指令给 ${label}（自动复制并打开应用）…`
-    : `向 ${label} 提问，或输入 @codex / @claude…`;
+  if (info?.mode === 'launch') {
+    quickInput.placeholder = dirName
+      ? `在 ${dirName} 中发指令给 ${label}（复制并打开）…`
+      : `发指令给 ${label}（自动复制并打开应用）…`;
+  } else if (sessionLabel) {
+    quickInput.placeholder = `继续「${sessionLabel}」…`;
+  } else if (dirName) {
+    quickInput.placeholder = `在 ${dirName} 中向 ${label} 提问…`;
+  } else {
+    quickInput.placeholder = `向 ${label} 提问…`;
+  }
 }
-async function ensureSession() {
+async function ensureContextSession() {
   if (prefs.activeSessionId) return prefs.activeSessionId;
+  if (contextSessionId) return contextSessionId;
   const requestedId = `session-${crypto.randomUUID()}`;
-  const created = await action('create', { sessionId: requestedId, targetAgent });
-  const sessionId = created?.sessionId || requestedId;
-  prefs.activeSessionId = sessionId; savePrefs();
-  return sessionId;
+  const created = await action('create', {
+    sessionId: requestedId,
+    targetAgent,
+    cwd: currentCwd || undefined,
+  });
+  return created?.sessionId || requestedId;
 }
 function renderOptions(container, rows, { label, onPick, emptyText }) {
   container.textContent = '';
@@ -662,9 +709,16 @@ function renderTargetOptions(targets) {
       targetAgent = row.id;
       prefs.targetAgent = row.id;
       prefs.activeSessionId = null;
+      activeSessionTitle = '';
+      prefs.activeSessionTitle = '';
       savePrefs();
       renderModel();
       renderTargetOptions(targets);
+      const nextSessions = await action('sessions', { targetAgent, cwd: currentCwd || undefined }).catch(() => null);
+      if (Array.isArray(nextSessions?.sessions)) {
+        sessionOptions = nextSessions.sessions;
+        renderSessionOptions(sessionOptions);
+      }
       showFeedback(mode === 'launch'
         ? `已切换至 ${label}（发送时将复制指令并打开应用）`
         : `已切换对话目标：${label}`);
@@ -672,11 +726,122 @@ function renderTargetOptions(targets) {
     container.append(button);
   }
 }
+async function refreshFilesForWorkspace() {
+  if (!contextSessionId) return;
+  const query = $('context-query')?.value || '';
+  const result = await action('files', {
+    sessionId: contextSessionId,
+    query,
+    cwd: currentCwd || undefined,
+  }).catch(() => null);
+  if (!result) return;
+  renderOptions($('context-files'), result.candidates ?? [], {
+    label: row => `@${row.path ?? row.name ?? row.value ?? ''}`, emptyText: '输入文件名以搜索',
+    onPick: row => { insertIntoQuickInput(`@${row.path ?? row.name ?? row.value ?? ''} `); },
+  });
+}
+function renderWorkspaceOptions(workspaces = workspaceOptions) {
+  const container = $('context-workspaces');
+  if (!container) return;
+  container.textContent = '';
+  if (!workspaces.length) {
+    container.append(el('span', 'context-empty', '暂无目录，点击右上角选择文件夹'));
+    return;
+  }
+  for (const w of workspaces) {
+    const dirName = w.name || cwdBasename(w.path) || w.path;
+    const button = el('button', 'context-option', `📁 ${dirName}`);
+    button.type = 'button';
+    button.title = w.path;
+    if (w.path === currentCwd || (!currentCwd && w.active)) button.classList.add('is-active');
+    button.addEventListener('click', () => run(async () => {
+      const res = await action('selectWorkspace', { cwd: w.path, targetAgent });
+      currentCwd = res?.currentCwd || w.path;
+      prefs.cwd = currentCwd;
+      prefs.activeSessionId = null;
+      activeSessionTitle = '';
+      prefs.activeSessionTitle = '';
+      savePrefs();
+      if (Array.isArray(res?.workspaces)) workspaceOptions = res.workspaces;
+      if (Array.isArray(res?.sessions)) {
+        sessionOptions = res.sessions;
+      } else {
+        const nextSessions = await action('sessions', { targetAgent, cwd: currentCwd }).catch(() => null);
+        if (Array.isArray(nextSessions?.sessions)) sessionOptions = nextSessions.sessions;
+      }
+      renderWorkspaceOptions(workspaceOptions);
+      renderSessionOptions(sessionOptions);
+      renderModel();
+      refreshFilesForWorkspace();
+      showFeedback(`已切换工作目录：${dirName}`);
+    }));
+    container.append(button);
+  }
+}
+async function selectNewSession() {
+  await action('selectSession', { sessionId: 'new', targetAgent }).catch(() => null);
+  prefs.activeSessionId = null;
+  activeSessionTitle = '';
+  prefs.activeSessionTitle = '';
+  savePrefs();
+  renderModel();
+  renderSessionOptions(sessionOptions);
+  showFeedback('已切换为新建会话');
+}
+function renderSessionOptions(sessions = sessionOptions) {
+  const container = $('context-sessions');
+  const newBtn = $('context-new-session');
+  if (newBtn) newBtn.classList.toggle('is-active', !prefs.activeSessionId);
+  if (!container) return;
+  container.textContent = '';
+  if (!sessions.length) {
+    container.append(el('span', 'context-empty', '当前目录暂无历史会话'));
+    return;
+  }
+  for (const s of sessions) {
+    const title = s.title || s.sessionId || '历史会话';
+    const button = el('button', 'context-option', `💬 ${title}`);
+    button.type = 'button';
+    button.title = s.cwd ? `${title}\n目录：${s.cwd}` : title;
+    const isActive = Boolean(
+      prefs.activeSessionId
+      && (s.sessionId === prefs.activeSessionId || (s.cliSessionId && s.cliSessionId === prefs.activeSessionId)),
+    );
+    if (isActive) button.classList.add('is-active');
+    button.addEventListener('click', () => run(async () => {
+      const picked = await action('selectSession', {
+        sessionId: s.sessionId,
+        cliSessionId: s.cliSessionId,
+        cwd: s.cwd || currentCwd || undefined,
+        title: s.title,
+        targetAgent,
+      });
+      prefs.activeSessionId = picked?.sessionId || s.sessionId;
+      activeSessionTitle = picked?.title || s.title || '';
+      prefs.activeSessionTitle = activeSessionTitle;
+      if (picked?.cwd || s.cwd) {
+        currentCwd = picked?.cwd || s.cwd;
+        prefs.cwd = currentCwd;
+      }
+      savePrefs();
+      renderModel();
+      renderWorkspaceOptions(workspaceOptions);
+      renderSessionOptions(sessionOptions);
+      refreshFilesForWorkspace();
+      showFeedback(`已绑定会话：${activeSessionTitle || '历史会话'}（发消息将直接续聊）`);
+    }));
+    container.append(button);
+  }
+}
 async function loadContext(sessionId) {
   const note = $('context-note');
   note.hidden = false; note.textContent = '正在读取上下文…';
-  const [skills, models, files] = await Promise.allSettled([
-    action('skills', { sessionId }), action('models'), action('files', { sessionId, query: '' }),
+  const [skills, models, files, workspaces, sessions] = await Promise.allSettled([
+    action('skills', { sessionId }),
+    action('models'),
+    action('files', { sessionId, query: '', cwd: currentCwd || undefined }),
+    action('workspaces', { targetAgent }),
+    action('sessions', { targetAgent, cwd: currentCwd || undefined }),
   ]);
   const skillRows = skills.status === 'fulfilled' ? skills.value.skills ?? [] : [];
   const fileRows = files.status === 'fulfilled' ? files.value.candidates ?? [] : [];
@@ -695,6 +860,22 @@ async function loadContext(sessionId) {
     }
   }
   if (!targetRows.length) targetRows = chatTargets;
+  if (workspaces.status === 'fulfilled') {
+    workspaceOptions = Array.isArray(workspaces.value?.workspaces) ? workspaces.value.workspaces : [];
+    if (!currentCwd && workspaces.value?.currentCwd) {
+      currentCwd = workspaces.value.currentCwd;
+      prefs.cwd = currentCwd;
+      savePrefs();
+      renderModel();
+    }
+  } else {
+    workspaceOptions = [];
+  }
+  if (sessions.status === 'fulfilled') {
+    sessionOptions = Array.isArray(sessions.value?.sessions) ? sessions.value.sessions : [];
+  } else {
+    sessionOptions = [];
+  }
   renderOptions($('context-skills'), skillRows, {
     label: row => `/${row.name}`, emptyText: '没有可用技能',
     onPick: row => { insertIntoQuickInput(`/${row.name} `); },
@@ -704,6 +885,8 @@ async function loadContext(sessionId) {
     onPick: row => { insertIntoQuickInput(`@${row.path ?? row.name ?? row.value ?? ''} `); },
   });
   renderTargetOptions(targetRows);
+  renderWorkspaceOptions(workspaceOptions);
+  renderSessionOptions(sessionOptions);
   const unavailable = [skills, files, models].filter(result => result.status === 'rejected' || result.value?.unavailable).length;
   note.textContent = unavailable ? '部分目录暂不可用；图片附件仍可添加' : '';
   note.hidden = !unavailable;
@@ -726,7 +909,7 @@ function openContext() {
   if (!open) return;
   renderModel();
   run(async () => {
-    contextSessionId = await ensureSession();
+    contextSessionId = await ensureContextSession();
     await loadContext(contextSessionId);
   });
 }
@@ -784,7 +967,9 @@ function closeTranscript() {
   quoted = null; renderQuote();
 }
 function startNewChat() {
-  prefs.activeSessionId = null; prefs.model = null; savePrefs();
+  prefs.activeSessionId = null; prefs.activeSessionTitle = ''; prefs.model = null;
+  activeSessionTitle = '';
+  savePrefs();
   pendingImages = []; quoted = null; transcriptSessionId = null;
   renderAttachments(); renderQuote(); renderModel();
   closeTranscript(); closeContext();
@@ -969,6 +1154,26 @@ activitiesButton.addEventListener('click', event => {
 $('tool-context').addEventListener('click', openContext);
 $('quick-model')?.addEventListener('click', openContext);
 $('context-close').addEventListener('click', closeContext);
+$('context-browse-cwd')?.addEventListener('click', () => run(async () => {
+  const res = await action('selectWorkspace', { browse: true, targetAgent });
+  if (res?.canceled) return;
+  if (res?.currentCwd) {
+    currentCwd = res.currentCwd;
+    prefs.cwd = currentCwd;
+    prefs.activeSessionId = null;
+    activeSessionTitle = '';
+    prefs.activeSessionTitle = '';
+    savePrefs();
+  }
+  if (Array.isArray(res?.workspaces)) workspaceOptions = res.workspaces;
+  if (Array.isArray(res?.sessions)) sessionOptions = res.sessions;
+  renderWorkspaceOptions(workspaceOptions);
+  renderSessionOptions(sessionOptions);
+  renderModel();
+  refreshFilesForWorkspace();
+  if (currentCwd) showFeedback(`已切换工作目录：${cwdBasename(currentCwd)}`);
+}));
+$('context-new-session')?.addEventListener('click', () => run(selectNewSession));
 $('context-image').addEventListener('click', () => $('context-file').click());
 $('context-file').addEventListener('change', async event => {
   const files = [...(event.target.files ?? [])];
@@ -992,7 +1197,7 @@ $('context-query').addEventListener('input', event => {
   const query = event.target.value;
   fileQueryTimer = setTimeout(() => run(async () => {
     if (!contextSessionId) return;
-    const result = await action('files', { sessionId: contextSessionId, query });
+    const result = await action('files', { sessionId: contextSessionId, query, cwd: currentCwd || undefined });
     renderOptions($('context-files'), result.candidates ?? [], {
       label: row => `@${row.path ?? row.name ?? row.value ?? ''}`, emptyText: '没有匹配的文件',
       onPick: row => insertIntoQuickInput(`@${row.path ?? row.name ?? row.value ?? ''} `),
@@ -1059,6 +1264,8 @@ if (native) {
       targetAgent = mode.source;
       prefs.targetAgent = mode.source;
       prefs.activeSessionId = null;
+      activeSessionTitle = '';
+      prefs.activeSessionTitle = '';
       savePrefs();
       renderModel();
     }
@@ -1066,6 +1273,8 @@ if (native) {
       source = mode.source;
       if (sourceInitialized) {
         prefs.activeSessionId = null;
+        activeSessionTitle = '';
+        prefs.activeSessionTitle = '';
         prefs.model = null;
         savePrefs();
         renderModel();
