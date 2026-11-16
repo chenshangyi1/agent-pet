@@ -1,0 +1,1467 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { createServer } from 'node:http';
+import { spawnSync } from 'node:child_process';
+import net from 'node:net';
+import os, { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+const ROOT_DIR = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
+
+const {
+  TaskDispatcher,
+  parseClaudeStreamLine,
+  parseCodexJsonLine,
+  sanitizeWorkspace,
+  mirrorInboxEvent,
+} = require('../bot/dispatcher.cjs');
+const { CommandRouter } = require('../bot/commands.cjs');
+const {
+  QQOneBotAdapter,
+  WS_GUID,
+  computeWebSocketAccept,
+  encodeWsFrame,
+  decodeWsFrames,
+  extractOneBotText,
+  chunkText,
+  parseOneBotTarget,
+} = require('../bot/channels/qq-onebot.cjs');
+const {
+  WeComAdapter,
+  DEFAULT_WECOM_WS_URL,
+  buildSubscribeFrame,
+  buildPingFrame,
+  buildRespondStreamFrame,
+  buildSendMsgFrame,
+  parseCallbackFrame,
+  chunkMarkdown,
+} = require('../bot/channels/wecom.cjs');
+const {
+  BotService,
+  DEFAULT_BOT_CONFIG,
+  generatePairingCode,
+  formatStatusAlert,
+  normalizeBotConfig,
+} = require('../bot/service.cjs');
+const { startBotServer } = require('../bot/server.cjs');
+const { Providers } = require('../runtime/providers.cjs');
+
+async function makeMockExecutable(filePath, jsSource) {
+  await mkdir(dirname(filePath), { recursive: true });
+  const script = `#!/usr/bin/env node\n${jsSource}\n`;
+  await writeFile(filePath, script, 'utf8');
+  await chmod(filePath, 0o755);
+  return filePath;
+}
+
+async function waitFor(predicate, { timeoutMs = 4000, intervalMs = 20, message = 'condition timed out' } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const res = await predicate();
+    if (res) return res;
+    await new Promise(resolve => setTimeout(resolve, intervalMs));
+  }
+  throw new Error(message);
+}
+
+async function createLoopbackWsServer({ onConnection, onUpgradeCheck } = {}) {
+  const sockets = new Set();
+  const server = createServer((_req, res) => {
+    res.writeHead(426);
+    res.end('Upgrade Required');
+  });
+
+  server.on('upgrade', (req, socket, head) => {
+    if (onUpgradeCheck) {
+      const check = onUpgradeCheck(req);
+      if (check && check.rejectStatus) {
+        socket.write(`HTTP/1.1 ${check.rejectStatus} Rejected\r\nConnection: close\r\n\r\n`);
+        socket.destroy();
+        return;
+      }
+    }
+    const key = String(req.headers['sec-websocket-key'] || '');
+    const accept = computeWebSocketAccept(key);
+    socket.setNoDelay(true);
+    socket.write(
+      'HTTP/1.1 101 Switching Protocols\r\n'
+      + 'Upgrade: websocket\r\n'
+      + 'Connection: Upgrade\r\n'
+      + `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+    );
+    sockets.add(socket);
+
+    let rxBuffer = head && head.length ? Buffer.from(head) : Buffer.alloc(0);
+    const conn = {
+      req,
+      socket,
+      messages: [],
+      sendJson(obj) {
+        if (!socket.destroyed) socket.write(encodeWsFrame(JSON.stringify(obj), { opcode: 0x1 }));
+      },
+      sendText(text) {
+        if (!socket.destroyed) socket.write(encodeWsFrame(String(text), { opcode: 0x1 }));
+      },
+      close() {
+        try { socket.end(encodeWsFrame(Buffer.alloc(0), { opcode: 0x8 })); } catch {}
+        try { socket.destroy(); } catch {}
+      },
+    };
+
+    const flush = () => {
+      const decoded = decodeWsFrames(rxBuffer);
+      rxBuffer = decoded.rest;
+      for (const frame of decoded.frames) {
+        if (frame.opcode === 0x8) {
+          conn.close();
+          return;
+        }
+        if (frame.opcode === 0x9) {
+          socket.write(encodeWsFrame(frame.payload, { opcode: 0xA }));
+          continue;
+        }
+        if (frame.opcode === 0x1) {
+          const text = frame.payload.toString('utf8');
+          conn.messages.push(text);
+          conn.onText?.(text);
+        }
+      }
+    };
+
+    socket.on('data', chunk => {
+      rxBuffer = rxBuffer.length ? Buffer.concat([rxBuffer, chunk]) : Buffer.from(chunk);
+      flush();
+    });
+    socket.on('close', () => sockets.delete(socket));
+    socket.on('error', () => sockets.delete(socket));
+    onConnection?.(conn);
+    if (rxBuffer.length > 0) flush();
+  });
+
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  return {
+    port,
+    url: `ws://127.0.0.1:${port}`,
+    async close() {
+      for (const s of sockets) {
+        try { s.destroy(); } catch {}
+      }
+      sockets.clear();
+      server.closeAllConnections?.();
+      await new Promise(resolve => server.close(resolve));
+    },
+  };
+}
+
+test('TaskDispatcher 引擎探测与 sanitizeWorkspace 工作区白名单及软链逃逸拦截', async t => {
+  const rawDir = await mkdtemp(join(tmpdir(), 'agent-pet-bot-ws-'));
+  const dir = await realpath(rawDir);
+  const allowedRoot = join(dir, 'allowed');
+  const subDir = join(allowedRoot, 'repo');
+  const outsideDir = join(dir, 'outside');
+  const escapedLink = join(allowedRoot, 'escape-link');
+  const fileTarget = join(allowedRoot, 'plain.txt');
+  const binDir = join(dir, 'bin');
+  const dataDir = join(dir, 'data');
+
+  await mkdir(subDir, { recursive: true });
+  await mkdir(outsideDir, { recursive: true });
+  await mkdir(dataDir, { recursive: true });
+  await writeFile(fileTarget, 'not a directory', 'utf8');
+  await symlink(outsideDir, escapedLink, 'dir');
+
+  const mockClaude = await makeMockExecutable(join(binDir, 'claude'), 'process.exit(0);');
+  const mockCodex = await makeMockExecutable(join(binDir, 'codex'), 'process.exit(0);');
+  const mockAgy = await makeMockExecutable(join(binDir, 'agy'), 'process.exit(0);');
+
+  const prevEnv = {
+    CLAUDE_BIN: process.env.CLAUDE_BIN,
+    CODEX_BIN: process.env.CODEX_BIN,
+    AGY_BIN: process.env.AGY_BIN,
+  };
+  t.after(async () => {
+    for (const [k, v] of Object.entries(prevEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    await rm(rawDir, { recursive: true, force: true });
+  });
+
+  assert.equal(sanitizeWorkspace(allowedRoot, [allowedRoot]), allowedRoot);
+  assert.equal(sanitizeWorkspace(subDir, [allowedRoot]), subDir);
+  assert.equal(sanitizeWorkspace('~', [os.homedir()]), await realpath(os.homedir()));
+  assert.throws(() => sanitizeWorkspace('', [allowedRoot]), /不能为空/);
+  assert.throws(() => sanitizeWorkspace(join(allowedRoot, 'does-not-exist'), [allowedRoot]), /不存在/);
+  assert.throws(() => sanitizeWorkspace(fileTarget, [allowedRoot]), /不是目录/);
+  assert.throws(() => sanitizeWorkspace(outsideDir, [allowedRoot]), /白名单/);
+  assert.throws(() => sanitizeWorkspace(escapedLink, [allowedRoot]), /白名单/);
+
+  process.env.CLAUDE_BIN = mockClaude;
+  process.env.CODEX_BIN = mockCodex;
+  process.env.AGY_BIN = mockAgy;
+  await writeFile(join(dataDir, 'dsh-bridge.json'), JSON.stringify({ endpoint: 'http://127.0.0.1:1/action', token: 'tok' }));
+
+  const dispatcher = new TaskDispatcher({
+    dataDir,
+    providers: { snapshot: { sources: [{ id: 'dsh', connected: true }] }, dsh: async () => ({}) },
+    allowedWorkspaces: [allowedRoot],
+    defaultCwd: allowedRoot,
+  });
+  const probes = dispatcher.probeEngines();
+  assert.equal(probes.claude.available, true);
+  assert.equal(probes.claude.path, mockClaude);
+  assert.equal(probes.codex.available, true);
+  assert.equal(probes.codex.path, mockCodex);
+  assert.equal(probes.antigravity.available, true);
+  assert.equal(probes.antigravity.mode, 'cli');
+  assert.equal(probes.antigravity.path, mockAgy);
+  assert.equal(probes.dsh.available, true);
+});
+
+test('parseClaudeStreamLine / parseCodexJsonLine 与 Claude mock 子进程流式派活、inbox 镜像、--resume 及 /stop', async t => {
+  const rawDir = await mkdtemp(join(tmpdir(), 'agent-pet-bot-claude-'));
+  const dir = await realpath(rawDir);
+  const workDir = join(dir, 'work');
+  const dataDir = join(dir, 'data');
+  const argsLog = join(dir, 'claude-args.jsonl');
+  await mkdir(workDir, { recursive: true });
+  await mkdir(dataDir, { recursive: true });
+
+  const mockClaude = await makeMockExecutable(
+    join(dir, 'mock-claude'),
+    `
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(argsLog)}, JSON.stringify(args) + '\\n');
+const pIdx = args.indexOf('-p');
+const prompt = pIdx >= 0 ? args[pIdx + 1] : '';
+const rIdx = args.indexOf('--resume');
+const resumed = rIdx >= 0 ? args[rIdx + 1] : null;
+const sid = resumed || 'ses-claude-mock-1';
+
+if (prompt.includes('SLOW_CANCEL')) {
+  console.log(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'ses-claude-slow' }));
+  process.on('SIGTERM', () => process.exit(0));
+  setTimeout(() => process.exit(0), 10000);
+} else {
+  console.log(JSON.stringify({ type: 'system', subtype: 'init', session_id: sid }));
+  console.log(JSON.stringify({
+    type: 'assistant',
+    session_id: sid,
+    message: { content: [{ type: 'tool_use', id: 'tu-1', name: 'Bash' }, { type: 'text', text: '正在检查项目' }] }
+  }));
+  console.log(JSON.stringify({
+    type: 'user',
+    session_id: sid,
+    message: { content: [{ type: 'tool_result', tool_use_id: 'tu-1', is_error: false }] }
+  }));
+  console.log(JSON.stringify({
+    type: 'result',
+    subtype: 'success',
+    session_id: sid,
+    result: resumed ? '已续接会话: ' + prompt : '首次完成: ' + prompt
+  }));
+}
+`,
+  );
+
+  const prevClaude = process.env.CLAUDE_BIN;
+  process.env.CLAUDE_BIN = mockClaude;
+  t.after(async () => {
+    if (prevClaude === undefined) delete process.env.CLAUDE_BIN;
+    else process.env.CLAUDE_BIN = prevClaude;
+    await rm(rawDir, { recursive: true, force: true });
+  });
+
+  // Unit assertions on line parsers
+  assert.equal(parseClaudeStreamLine(''), null);
+  assert.equal(parseClaudeStreamLine('not-json'), null);
+  const parsedTool = parseClaudeStreamLine(JSON.stringify({
+    type: 'assistant',
+    session_id: 's-1',
+    message: { content: [{ type: 'tool_use', id: 't1', name: 'Read' }, { type: 'text', text: 'hello' }] },
+  }));
+  assert.equal(parsedTool.sessionId, 's-1');
+  assert.deepEqual(parsedTool.tools, [{ name: 'Read', id: 't1' }]);
+  assert.equal(parsedTool.text, 'hello');
+
+  const parsedErr = parseClaudeStreamLine(JSON.stringify({
+    type: 'result',
+    subtype: 'error_max_turns',
+    session_id: 's-1',
+    errors: ['max turns reached'],
+  }));
+  assert.equal(parsedErr.isResult, true);
+  assert.equal(parsedErr.isError, true);
+  assert.equal(parsedErr.text, 'max turns reached');
+
+  assert.equal(parseCodexJsonLine('plain text'), null);
+  const codexCmd = parseCodexJsonLine(JSON.stringify({
+    type: 'item.started',
+    item: { id: 'cmd-1', type: 'command_execution', command: 'npm test' },
+  }));
+  assert.equal(codexCmd.tool, 'command_execution');
+  assert.match(codexCmd.toolSummary, /npm test/);
+
+  const codexFail = parseCodexJsonLine(JSON.stringify({
+    type: 'turn.failed',
+    error: { message: 'boom' },
+  }));
+  assert.equal(codexFail.hasError, true);
+  assert.equal(codexFail.errorMessage, 'boom');
+
+  // Dispatch + inbox mirror + Providers.refresh + resume + stopJob
+  const providers = new Providers(dataDir, {}, { enabledProviders: ['dsh', 'claude', 'codex'] });
+  const dispatcher = new TaskDispatcher({
+    dataDir,
+    providers,
+    allowedWorkspaces: [dir],
+    defaultCwd: workDir,
+    sandboxMode: 'auto',
+  });
+
+  const progressEvents = [];
+  const res1 = await dispatcher.dispatch({
+    engine: 'claude',
+    prompt: 'SECRET_CLAUDE_PROMPT_NEVER_IN_INBOX',
+    cwd: workDir,
+    onProgress: ev => progressEvents.push(ev),
+  });
+  assert.equal(res1.status, 'completed');
+  assert.equal(res1.sessionId, 'ses-claude-mock-1');
+  assert.match(res1.text, /首次完成/);
+  assert.deepEqual(res1.toolsUsed, ['Bash']);
+  assert.ok(progressEvents.some(e => e.type === 'tool' && e.tool === 'Bash'));
+  assert.ok(progressEvents.some(e => e.type === 'text' && e.text.includes('正在检查项目')));
+  assert.equal(dispatcher.isDispatchedSession('claude:ses-claude-mock-1'), true);
+
+  // Check inbox files before Providers consumes them: 32hex filenames, 0600 mode, zero secret prompt leaks
+  const claudeInbox = join(dataDir, 'claude/inbox');
+  const inboxFiles = await readdir(claudeInbox);
+  assert.ok(inboxFiles.length >= 4);
+  for (const fname of inboxFiles) {
+    assert.match(fname, /^[a-f0-9]{32}\.json$/);
+    const st = await stat(join(claudeInbox, fname));
+    assert.equal(st.mode & 0o777, 0o600);
+    const content = await readFile(join(claudeInbox, fname), 'utf8');
+    assert.ok(!content.includes('SECRET_CLAUDE_PROMPT_NEVER_IN_INBOX'));
+  }
+
+  await providers.refresh();
+  assert.equal((await readdir(claudeInbox)).length, 0);
+  const claudeRow = providers.snapshot.items.find(r => r.sessionId === 'claude:ses-claude-mock-1');
+  assert.ok(claudeRow);
+  assert.equal(claudeRow.status, 'ready');
+
+  // Follow-up resume
+  const res2 = await dispatcher.dispatch({
+    engine: 'claude',
+    prompt: '继续验证',
+    cwd: workDir,
+    sessionId: res1.sessionId,
+  });
+  assert.equal(res2.status, 'completed');
+  assert.equal(res2.sessionId, 'ses-claude-mock-1');
+  assert.match(res2.text, /已续接会话: 继续验证/);
+
+  const invocations = (await readFile(argsLog, 'utf8')).trim().split('\n').map(l => JSON.parse(l));
+  assert.equal(invocations.length, 2);
+  assert.ok(invocations[0].includes('--permission-mode'));
+  assert.ok(invocations[0].includes('acceptEdits'));
+  assert.ok(!invocations[0].includes('--resume'));
+  assert.ok(invocations[1].includes('--resume'));
+  assert.equal(invocations[1][invocations[1].indexOf('--resume') + 1], 'ses-claude-mock-1');
+
+  // Cancel slow job
+  const slowPromise = dispatcher.dispatch({ engine: 'claude', prompt: 'SLOW_CANCEL', cwd: workDir });
+  const running = await waitFor(() => dispatcher.listJobs(5).find(j => j.status === 'running'));
+  const stopRes = await dispatcher.stopJob(running.jobId);
+  assert.equal(stopRes.stopped, true);
+  assert.equal(stopRes.engine, 'claude');
+  const cancelledRes = await slowPromise;
+  assert.equal(cancelledRes.status, 'cancelled');
+});
+
+test('Codex mock 派活与 --resume 续接、Antigravity 缺省 CLI 提示及 DSH 桥接调度', async t => {
+  const rawDir = await mkdtemp(join(tmpdir(), 'agent-pet-bot-codex-dsh-'));
+  const dir = await realpath(rawDir);
+  const workDir = join(dir, 'work');
+  const dataDir = join(dir, 'data');
+  const codexArgsLog = join(dir, 'codex-args.jsonl');
+  await mkdir(workDir, { recursive: true });
+  await mkdir(dataDir, { recursive: true });
+
+  const mockCodex = await makeMockExecutable(
+    join(dir, 'mock-codex'),
+    `
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(codexArgsLog)}, JSON.stringify(args) + '\\n');
+const isResume = args[0] === 'exec' && args[1] === 'resume';
+const prompt = args[args.length - 1];
+const tid = isResume ? args[args.length - 2] : 'thread-codex-99';
+
+if (prompt.includes('SLOW_CODEX')) {
+  console.log(JSON.stringify({ type: 'thread.started', thread_id: 'thread-slow' }));
+  process.on('SIGTERM', () => process.exit(0));
+  setTimeout(() => process.exit(0), 10000);
+} else {
+  console.log(JSON.stringify({ type: 'thread.started', thread_id: tid }));
+  console.log(JSON.stringify({ type: 'item.started', item: { id: 'i1', type: 'command_execution', command: 'ls -la' } }));
+  console.log(JSON.stringify({ type: 'item.completed', item: { id: 'i1', type: 'command_execution', status: 'completed', exit_code: 0 } }));
+  console.log(JSON.stringify({ type: 'item.completed', item: { id: 'i2', type: 'file_change', changes: [{ path: 'a.js' }] } }));
+  console.log(JSON.stringify({ type: 'item.completed', item: { id: 'm1', type: 'agent_message', text: (isResume ? 'Codex 续接: ' : 'Codex 完成: ') + prompt } }));
+  console.log(JSON.stringify({ type: 'turn.completed' }));
+}
+`,
+  );
+
+  const prevCodex = process.env.CODEX_BIN;
+  const prevAgy = process.env.AGY_BIN;
+  process.env.CODEX_BIN = mockCodex;
+  delete process.env.AGY_BIN;
+  t.after(async () => {
+    if (prevCodex === undefined) delete process.env.CODEX_BIN;
+    else process.env.CODEX_BIN = prevCodex;
+    if (prevAgy === undefined) delete process.env.AGY_BIN;
+    else process.env.AGY_BIN = prevAgy;
+    await rm(rawDir, { recursive: true, force: true });
+  });
+
+  // Mock DSH RPC backend
+  const dshCalls = [];
+  const dshSessions = new Map();
+  const providers = new Providers(dataDir, {}, { enabledProviders: ['dsh', 'codex'] });
+  providers.dsh = async body => {
+    dshCalls.push(body);
+    if (body.action === 'create') {
+      const sid = body.sessionId || 'dsh-s1';
+      dshSessions.set(sid, { status: 'idle', lastSeq: 0, messages: [], pollCount: 0 });
+      return { sessionId: sid };
+    }
+    if (body.action === 'prompt') {
+      const s = dshSessions.get(body.sessionId) || { status: 'idle', lastSeq: 0, messages: [], pollCount: 0 };
+      s.status = 'running';
+      s.detail = 'DSH 正在思考';
+      s.messages.push({ role: 'user', text: body.text });
+      s.lastSeq++;
+      s.pollCount = 0;
+      dshSessions.set(body.sessionId, s);
+      return { ok: true };
+    }
+    if (body.action === 'list') {
+      return {
+        items: [...dshSessions.entries()].map(([id, s]) => ({
+          sessionId: id,
+          status: s.status,
+          detail: s.detail || '',
+        })),
+      };
+    }
+    if (body.action === 'conversation') {
+      const s = dshSessions.get(body.sessionId);
+      if (!s) return null;
+      if (s.status === 'running') {
+        s.pollCount++;
+        if (s.pollCount >= 2 && !s.messages.some(m => m.text === 'SLOW_DSH')) {
+          s.status = 'ready';
+          s.detail = '完成';
+          const lastUser = [...s.messages].reverse().find(m => m.role === 'user')?.text || '';
+          s.messages.push({ role: 'assistant', text: `DSH 回复: ${lastUser}` });
+          s.lastSeq++;
+        }
+      }
+      return {
+        status: s.status,
+        detail: s.detail,
+        lastSeq: s.lastSeq,
+        messages: [...s.messages],
+      };
+    }
+    if (body.action === 'cancel') {
+      const s = dshSessions.get(body.sessionId);
+      if (s) s.status = 'cancelled';
+      return { ok: true };
+    }
+    return {};
+  };
+
+  const dispatcher = new TaskDispatcher({
+    dataDir,
+    providers,
+    allowedWorkspaces: [dir],
+    defaultCwd: workDir,
+    dshPollIntervalMs: 15,
+    dshTimeoutMs: 2000,
+  });
+
+  // 1. Codex initial + resume + inbox + stop
+  const codexProgress = [];
+  const cdx1 = await dispatcher.dispatch({
+    engine: 'codex',
+    prompt: 'SECRET_CODEX_PROMPT',
+    cwd: workDir,
+    onProgress: ev => codexProgress.push(ev),
+  });
+  assert.equal(cdx1.status, 'completed');
+  assert.equal(cdx1.sessionId, 'thread-codex-99');
+  assert.match(cdx1.text, /Codex 完成/);
+  assert.ok(codexProgress.some(e => e.tool === 'command_execution'));
+  assert.ok(dispatcher.isDispatchedSession('codex:thread-codex-99'));
+
+  const codexInbox = join(dataDir, 'codex/inbox');
+  const codexFiles = await readdir(codexInbox);
+  assert.ok(codexFiles.length >= 3);
+  for (const name of codexFiles) {
+    assert.ok(!(await readFile(join(codexInbox, name), 'utf8')).includes('SECRET_CODEX_PROMPT'));
+  }
+  await providers.refresh();
+  assert.equal(providers.snapshot.items.find(r => r.sessionId === 'codex:thread-codex-99')?.status, 'ready');
+
+  const cdx2 = await dispatcher.dispatch({
+    engine: 'codex',
+    prompt: '再查一下',
+    cwd: workDir,
+    sessionId: cdx1.sessionId,
+  });
+  assert.equal(cdx2.status, 'completed');
+  assert.match(cdx2.text, /Codex 续接: 再查一下/);
+
+  const codexCalls = (await readFile(codexArgsLog, 'utf8')).trim().split('\n').map(l => JSON.parse(l));
+  assert.equal(codexCalls[0][0], 'exec');
+  assert.equal(codexCalls[0][1], '--json');
+  assert.ok(codexCalls[0].includes('-C'));
+  assert.equal(codexCalls[1][0], 'exec');
+  assert.equal(codexCalls[1][1], 'resume');
+  assert.ok(codexCalls[1].includes('thread-codex-99'));
+
+  const slowCodex = dispatcher.dispatch({ engine: 'codex', prompt: 'SLOW_CODEX', cwd: workDir });
+  const slowJob = await waitFor(() => dispatcher.listJobs(5).find(j => j.engine === 'codex' && j.status === 'running'));
+  await dispatcher.stopJob(slowJob.jobId);
+  assert.equal((await slowCodex).status, 'cancelled');
+
+  // 2. Antigravity missing-CLI error message (verify real host probe when agy not installed, plus fallback probe override)
+  const hostAgyProbe = dispatcher.probeEngines().antigravity;
+  if (!hostAgyProbe.available) {
+    assert.equal(hostAgyProbe.mode, 'gui-only');
+    await assert.rejects(
+      () => dispatcher.dispatch({ engine: 'antigravity', prompt: 'test', cwd: workDir }),
+      /未检测到 Antigravity CLI.*\/open antigravity/,
+    );
+  } else {
+    const origProbe = dispatcher.probeEngines.bind(dispatcher);
+    dispatcher.probeEngines = () => ({
+      ...origProbe(),
+      antigravity: { available: false, mode: 'gui-only', path: null, label: 'Antigravity', note: 'gui-only' },
+    });
+    await assert.rejects(
+      () => dispatcher.dispatch({ engine: 'antigravity', prompt: 'test', cwd: workDir }),
+      /未检测到 Antigravity CLI.*\/open antigravity/,
+    );
+    dispatcher.probeEngines = origProbe;
+  }
+
+  // 3. DSH bridge dispatch + follow-up + cancel
+  const dshProgress = [];
+  const dsh1 = await dispatcher.dispatch({
+    engine: 'dsh',
+    prompt: '总结变更',
+    cwd: workDir,
+    onProgress: ev => dshProgress.push(ev),
+  });
+  assert.equal(dsh1.status, 'completed');
+  assert.equal(dsh1.text, 'DSH 回复: 总结变更');
+  assert.ok(dshProgress.some(e => e.text.includes('DSH 正在思考')));
+  assert.ok(dispatcher.isDispatchedSession(`dsh:${dsh1.sessionId}`));
+
+  const dsh2 = await dispatcher.dispatch({
+    engine: 'dsh',
+    prompt: '补充测试',
+    cwd: workDir,
+    sessionId: dsh1.sessionId,
+  });
+  assert.equal(dsh2.status, 'completed');
+  assert.equal(dsh2.sessionId, dsh1.sessionId);
+  assert.equal(dsh2.text, 'DSH 回复: 补充测试');
+
+  // Cancel slow DSH job
+  const slowDshPromise = dispatcher.dispatch({ engine: 'dsh', prompt: 'SLOW_DSH', cwd: workDir });
+  const slowDshJob = await waitFor(() => dispatcher.listJobs(5).find(j => j.engine === 'dsh' && j.status === 'running'));
+  const dshStop = await dispatcher.stopJob(slowDshJob.jobId);
+  assert.equal(dshStop.stopped, true);
+  assert.equal((await slowDshPromise).status, 'cancelled');
+  assert.ok(dshCalls.some(c => c.action === 'cancel'));
+});
+
+test('CommandRouter 鉴权拦截、/pair 配对与全量指令交互及会话绑定', async t => {
+  const rawDir = await mkdtemp(join(tmpdir(), 'agent-pet-bot-cmd-'));
+  const dir = await realpath(rawDir);
+  const subDir = join(dir, 'project-a');
+  const outsideDir = join(dirname(dir), 'outside-check-nonexist');
+  await mkdir(subDir, { recursive: true });
+  t.after(() => rm(rawDir, { recursive: true, force: true }));
+
+  const authorizedCalls = [];
+  const desktopCalls = [];
+  const openedApps = [];
+  const dispatchCalls = [];
+
+  const mockDispatcher = {
+    defaultCwd: dir,
+    validateWorkspace(target) {
+      return sanitizeWorkspace(target, [dir]);
+    },
+    probeEngines() {
+      return {
+        claude: { available: true, path: '/usr/local/bin/claude', label: 'Claude Code' },
+        codex: { available: true, path: '/usr/local/bin/codex', label: 'Codex' },
+        antigravity: {
+          available: false,
+          mode: 'gui-only',
+          path: null,
+          label: 'Antigravity',
+          note: '仅桌面端状态监听（未安装 CLI）',
+        },
+        dsh: { available: true, path: null, label: 'DSH' },
+      };
+    },
+    listJobs() {
+      return [{
+        jobId: 'job-123456',
+        engine: 'claude',
+        cwd: dir,
+        promptPreview: '检查测试',
+        status: 'running',
+        startedAt: Date.now() - 5000,
+        sessionId: 'ses-c1',
+      }];
+    },
+    async stopJob(jobId) {
+      return { stopped: true, jobId: jobId || 'job-123456', engine: 'claude' };
+    },
+    async dispatch({ engine, prompt, cwd, sessionId, onProgress }) {
+      dispatchCalls.push({ engine, prompt, cwd, sessionId });
+      if (engine === 'antigravity') {
+        throw new Error('当前未检测到 Antigravity CLI (agy)');
+      }
+      onProgress?.({ type: 'tool', tool: 'Read', text: '🔧 正在使用 Read' });
+      const nextSid = sessionId || `${engine}-sid-1`;
+      return {
+        jobId: `job-${engine}-1`,
+        engine,
+        status: 'completed',
+        sessionId: nextSid,
+        text: `[${engine}] ${prompt}`,
+      };
+    },
+  };
+
+  const mockProviders = {
+    snapshot: { items: [], sources: [] },
+    async refresh() {
+      return {
+        sources: [{ id: 'claude', connected: true }, { id: 'dsh', connected: false }],
+        items: [{
+          provider: 'claude',
+          providerLabel: 'Claude Code',
+          sessionId: 'claude:s1',
+          title: 'pet · s1',
+          status: 'waiting',
+          detail: '等待确认 Bash',
+          unread: true,
+          updatedAt: Date.now(),
+        }],
+      };
+    },
+  };
+
+  const router = new CommandRouter({
+    dispatcher: mockDispatcher,
+    providers: mockProviders,
+    desktopCommand: cmd => desktopCalls.push(cmd),
+    openApp: id => openedApps.push(id),
+    getConfig: () => ({ defaultEngine: 'claude', defaultCwd: dir }),
+    onAuthorizeUser: payload => authorizedCalls.push(payload),
+  });
+
+  // Unauthorized check + /pair
+  const unauth = await router.handleMessage({
+    channel: 'qq',
+    chatKey: 'private:1001',
+    senderId: '1001',
+    text: '/status',
+    isAuthorized: false,
+    pairingCode: 'AB12CD',
+  });
+  assert.equal(unauth.handled, false);
+  assert.equal(unauth.unauthorized, true);
+  assert.match(unauth.text, /\/pair/);
+
+  const badPair = await router.handleMessage({
+    channel: 'qq',
+    chatKey: 'private:1001',
+    senderId: '1001',
+    text: '/pair WRONG9',
+    isAuthorized: false,
+    pairingCode: 'AB12CD',
+  });
+  assert.equal(badPair.paired, false);
+
+  const okPair = await router.handleMessage({
+    channel: 'qq',
+    chatKey: 'private:1001',
+    senderId: '1001',
+    senderName: 'Alice',
+    text: '/pair ab12cd',
+    isAuthorized: false,
+    pairingCode: 'AB12CD',
+  });
+  assert.equal(okPair.paired, true);
+  assert.equal(authorizedCalls.length, 1);
+  assert.equal(authorizedCalls[0].senderId, '1001');
+
+  const send = async text => router.handleMessage({
+    channel: 'qq',
+    chatKey: 'private:1001',
+    senderId: '1001',
+    text,
+    isAuthorized: true,
+    pairingCode: 'AB12CD',
+  });
+
+  assert.match((await send('/help')).text, /\/claude/);
+  assert.match((await send('/status')).text, /等待确认 Bash/);
+  assert.match((await send('/engines')).text, /Claude Code/);
+  assert.match((await send('/engines')).text, /Antigravity/);
+
+  assert.match((await send(`/cd ${subDir}`)).text, new RegExp(subDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match((await send('/cd')).text, new RegExp(subDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match((await send(`/cd ${outsideDir}`)).text, /切换失败/);
+
+  assert.match((await send('/use')).text, /当前默认引擎/);
+  assert.match((await send('/use invalid-eng')).text, /不支持的引擎/);
+  assert.match((await send('/use agy')).text, /已切换为：antigravity[\s\S]*仅桌面端状态监听/);
+  assert.match((await send('/use codex')).text, /已切换为：codex/);
+  assert.match((await send('/jobs')).text, /job-123456/);
+  assert.match((await send('/stop job-123456')).text, /已停止任务 job-123456/);
+
+  assert.match((await send('/pet show')).text, /显示小鑫/);
+  assert.match((await send('/pet hide')).text, /隐藏小鑫/);
+  assert.match((await send('/pet reset')).text, /归位小鑫/);
+  assert.match((await send('/pet bad')).text, /用法/);
+  assert.deepEqual(desktopCalls, ['show', 'hide', 'reset']);
+
+  assert.match((await send('/open agy')).text, /已打开 antigravity/);
+  assert.deepEqual(openedApps, ['antigravity']);
+
+  assert.match((await send('/unknowncmd')).text, /未知指令/);
+
+  // Engine dispatch + per-engine session persistence + /new reset
+  const rClaude = await send('@claude 写测试');
+  assert.match(rClaude.text, /\[claude\] 写测试/);
+  assert.match(rClaude.text, /claude-sid-1/);
+
+  const rCodex = await send('@codex 跑检查');
+  assert.match(rCodex.text, /\[codex\] 跑检查/);
+  assert.equal(dispatchCalls[1].sessionId, null);
+
+  const rDsh = await send('@dsh 总结状态');
+  assert.match(rDsh.text, /\[dsh\] 总结状态/);
+
+  const rAgy = await send('/agy 试试看');
+  assert.match(rAgy.text, /派活失败 \(antigravity\)/);
+  assert.equal(dispatchCalls[3].engine, 'antigravity');
+
+  // Plain follow-up uses last bound engine (dsh) and its sessionId (failed /agy did not overwrite ctx.engine)
+  const rFollow = await send('再详细说说');
+  assert.match(rFollow.text, /\[dsh\] 再详细说说/);
+  assert.equal(dispatchCalls[4].engine, 'dsh');
+  assert.equal(dispatchCalls[4].sessionId, 'dsh-sid-1');
+  assert.equal(dispatchCalls[4].cwd, subDir);
+
+  await send('/use claude');
+  await send('/run 补充边界');
+  assert.equal(dispatchCalls[5].engine, 'claude');
+  assert.equal(dispatchCalls[5].sessionId, 'claude-sid-1');
+
+  await send('/new');
+  await send('全新提问');
+  assert.equal(dispatchCalls[6].engine, 'claude');
+  assert.equal(dispatchCalls[6].sessionId, null);
+});
+
+test('QQOneBotAdapter RFC6455 编解码、反向 WS 服务端与正向 WS 客户端全流程', async t => {
+  // 1. Pure RFC6455 & OneBot helpers
+  assert.equal(WS_GUID, '258EAFA5-E914-47DA-95CA-C5AB0DC85B11');
+  assert.equal(computeWebSocketAccept('dGhlIHNhbXBsZSBub25jZQ=='), 's3pPLMBiTxaQ9kYGzzhZRbK+xOo=');
+
+  const shortMasked = encodeWsFrame('hello', { opcode: 0x1, mask: true });
+  const medPayload = 'x'.repeat(300);
+  const medUnmasked = encodeWsFrame(medPayload, { opcode: 0x1, mask: false });
+  const combined = Buffer.concat([shortMasked, medUnmasked, Buffer.from([0x81, 0x05])]);
+  const decoded = decodeWsFrames(combined);
+  assert.equal(decoded.frames.length, 2);
+  assert.equal(decoded.frames[0].text, 'hello');
+  assert.equal(decoded.frames[1].text, medPayload);
+  assert.equal(decoded.rest.length, 2);
+
+  const segExtracted = extractOneBotText({
+    post_type: 'message',
+    message_type: 'group',
+    self_id: 99999,
+    user_id: 12345,
+    group_id: 654321,
+    message: [
+      { type: 'at', data: { qq: '99999' } },
+      { type: 'text', data: { text: ' @claude 帮我看一下 ' } },
+    ],
+  });
+  assert.equal(segExtracted.mentioned, true);
+  assert.equal(segExtracted.isGroup, true);
+  assert.equal(segExtracted.chatKey, 'group:654321');
+  assert.equal(segExtracted.text, '@claude 帮我看一下');
+
+  const rawExtracted = extractOneBotText({
+    post_type: 'message',
+    message_type: 'group',
+    self_id: 99999,
+    user_id: 12345,
+    group_id: 654321,
+    raw_message: '[CQ:at,qq=99999] [CQ:at,qq=88888,name=Bob] /status',
+  });
+  assert.equal(rawExtracted.mentioned, true);
+  assert.equal(rawExtracted.text, '@Bob  /status');
+
+  assert.equal(chunkText('a\n'.repeat(2500), 3500).length, 2);
+  assert.deepEqual(parseOneBotTarget('private:123'), { type: 'private', id: '123' });
+  assert.deepEqual(parseOneBotTarget('group:456'), { type: 'group', id: '456' });
+  assert.deepEqual(parseOneBotTarget('789'), { type: 'private', id: '789' });
+
+  // 2. Reverse WS server mode on 127.0.0.1:0
+  const receivedReverse = [];
+  const reverseAdapter = new QQOneBotAdapter({
+    config: {
+      enabled: true,
+      mode: 'server',
+      listenHost: '127.0.0.1',
+      listenPort: 0,
+      listenPath: '/onebot/v11/ws',
+      accessToken: 'secret-token',
+      groupRequireMention: true,
+      pushTargets: ['private:11111', 'group:22222', '33333'],
+      actionTimeoutMs: 3000,
+    },
+    onMessage: async msg => {
+      receivedReverse.push(msg);
+      if (msg.text === 'BIG_CHUNK') {
+        await msg.reply('L'.repeat(3600));
+      } else {
+        await msg.reply(`echo:${msg.text}`);
+      }
+    },
+  });
+
+  t.after(async () => {
+    await reverseAdapter.stop();
+  });
+
+  const listenStatus = await reverseAdapter.start();
+  assert.equal(listenStatus.status, 'listening');
+  const port = listenStatus.port;
+  assert.ok(port > 0);
+
+  // Auth / path rejection checks via raw TCP HTTP upgrade
+  const checkHttpStatus = (reqPath, extraHeaders = '') => new Promise((resolve, reject) => {
+    const sock = net.createConnection({ host: '127.0.0.1', port }, () => {
+      sock.write(
+        `GET ${reqPath} HTTP/1.1\r\n`
+        + `Host: 127.0.0.1:${port}\r\n`
+        + 'Upgrade: websocket\r\n'
+        + 'Connection: Upgrade\r\n'
+        + 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n'
+        + 'Sec-WebSocket-Version: 13\r\n'
+        + extraHeaders
+        + '\r\n',
+      );
+    });
+    let data = '';
+    sock.on('data', chunk => {
+      data += chunk.toString('utf8');
+      if (data.includes('\r\n\r\n')) {
+        sock.destroy();
+        resolve(data.split('\r\n')[0]);
+      }
+    });
+    sock.on('error', reject);
+  });
+
+  assert.match(await checkHttpStatus('/wrong/path'), /404/);
+  assert.match(await checkHttpStatus('/onebot/v11/ws'), /401/);
+  assert.match(await checkHttpStatus('/onebot/v11/ws?access_token=bad'), /401/);
+
+  // Connect real globalThis.WebSocket client with valid token
+  const clientActions = [];
+  const wsClient = new globalThis.WebSocket(`ws://127.0.0.1:${port}/onebot/v11/ws?access_token=secret-token`);
+  t.after(() => { try { wsClient.close(); } catch {} });
+
+  await new Promise((resolve, reject) => {
+    wsClient.addEventListener('open', resolve, { once: true });
+    wsClient.addEventListener('error', reject, { once: true });
+  });
+  wsClient.addEventListener('message', ev => {
+    const frame = JSON.parse(String(ev.data));
+    clientActions.push(frame);
+    if (frame.echo) {
+      wsClient.send(JSON.stringify({ status: 'ok', retcode: 0, data: { message_id: 1 }, echo: frame.echo }));
+    }
+  });
+
+  await waitFor(() => reverseAdapter.getStatus().status === 'connected');
+
+  // Unmentioned group chatter ignored
+  wsClient.send(JSON.stringify({
+    post_type: 'message',
+    message_type: 'group',
+    self_id: 99999,
+    user_id: 1001,
+    group_id: 22222,
+    raw_message: 'plain chatter without mention',
+  }));
+  await new Promise(r => setTimeout(r, 60));
+  assert.equal(receivedReverse.length, 0);
+
+  // Mentioned group command accepted & chunked reply works
+  wsClient.send(JSON.stringify({
+    post_type: 'message',
+    message_type: 'group',
+    self_id: 99999,
+    user_id: 1001,
+    group_id: 22222,
+    raw_message: '[CQ:at,qq=99999] BIG_CHUNK',
+  }));
+  await waitFor(() => clientActions.filter(a => a.action === 'send_group_msg').length >= 2);
+  const groupChunks = clientActions.filter(a => a.action === 'send_group_msg');
+  assert.equal(groupChunks[0].params.group_id, 22222);
+  assert.equal(groupChunks.map(c => c.params.message).join('').length, 3600);
+
+  // Push to private:, group:, and plain QQ id
+  const pushRes = await reverseAdapter.push('服务告警测试');
+  assert.equal(pushRes.ok, true);
+  assert.equal(pushRes.sent, 3);
+  assert.ok(clientActions.some(a => a.action === 'send_private_msg' && a.params.user_id === 11111));
+  assert.ok(clientActions.some(a => a.action === 'send_group_msg' && a.params.group_id === 22222 && a.params.message === '服务告警测试'));
+  assert.ok(clientActions.some(a => a.action === 'send_private_msg' && a.params.user_id === 33333));
+
+  // Raw TCP client sends Ping + fragmented text frame (fin=false + continuation fin=true)
+  await new Promise((resolve, reject) => {
+    const sock = net.createConnection({ host: '127.0.0.1', port }, () => {
+      sock.write(
+        `GET /onebot/v11/ws HTTP/1.1\r\n`
+        + `Host: 127.0.0.1:${port}\r\n`
+        + 'Authorization: Bearer secret-token\r\n'
+        + 'X-Self-ID: 77777\r\n'
+        + 'Upgrade: websocket\r\n'
+        + 'Connection: Upgrade\r\n'
+        + 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n'
+        + 'Sec-WebSocket-Version: 13\r\n\r\n',
+      );
+    });
+    let upgraded = false;
+    let buf = Buffer.alloc(0);
+    let gotPong = false;
+    sock.on('data', chunk => {
+      buf = Buffer.concat([buf, chunk]);
+      if (!upgraded) {
+        const idx = buf.indexOf('\r\n\r\n');
+        if (idx === -1) return;
+        const headText = buf.subarray(0, idx).toString('utf8');
+        assert.match(headText, /101 Switching Protocols/);
+        upgraded = true;
+        buf = buf.subarray(idx + 4);
+        sock.write(encodeWsFrame('ping1', { opcode: 0x9, mask: true }));
+        const payload = JSON.stringify({
+          post_type: 'message',
+          message_type: 'private',
+          user_id: 555,
+          raw_message: 'frag-ok',
+        });
+        const half = Math.floor(payload.length / 2);
+        sock.write(encodeWsFrame(payload.slice(0, half), { opcode: 0x1, fin: false, mask: true }));
+        sock.write(encodeWsFrame(payload.slice(half), { opcode: 0x0, fin: true, mask: true }));
+      }
+      if (upgraded && buf.length > 0) {
+        const res = decodeWsFrames(buf);
+        buf = res.rest;
+        for (const f of res.frames) {
+          if (f.opcode === 0xA && f.payload.toString('utf8') === 'ping1') gotPong = true;
+          if (f.opcode === 0x1) {
+            const act = JSON.parse(f.text);
+            if (act.echo) {
+              sock.write(encodeWsFrame(JSON.stringify({ status: 'ok', retcode: 0, echo: act.echo }), { opcode: 0x1, mask: true }));
+            }
+            if (act.action === 'send_private_msg' && act.params.message === 'echo:frag-ok' && gotPong) {
+              sock.destroy();
+              resolve();
+            }
+          }
+        }
+      }
+    });
+    sock.on('error', reject);
+  });
+
+  // 3. Forward WS client mode against loopback WS server
+  let serverConn = null;
+  let sawAccessToken = '';
+  const mockOneBotServer = await createLoopbackWsServer({
+    onUpgradeCheck: req => {
+      const u = new URL(req.url, 'http://127.0.0.1');
+      sawAccessToken = u.searchParams.get('access_token') || '';
+      return sawAccessToken === 'fwd-secret' ? null : { rejectStatus: 401 };
+    },
+    onConnection: conn => {
+      serverConn = conn;
+      conn.onText = raw => {
+        const act = JSON.parse(raw);
+        if (act.echo) conn.sendJson({ status: 'ok', retcode: 0, data: {}, echo: act.echo });
+      };
+    },
+  });
+  t.after(() => mockOneBotServer.close());
+
+  const clientAdapter = new QQOneBotAdapter({
+    config: {
+      enabled: true,
+      mode: 'client',
+      wsUrl: mockOneBotServer.url,
+      accessToken: 'fwd-secret',
+      actionTimeoutMs: 3000,
+    },
+    onMessage: async msg => {
+      await msg.reply(`client-reply:${msg.text}`);
+    },
+  });
+  t.after(() => clientAdapter.stop());
+
+  await clientAdapter.start();
+  await waitFor(() => clientAdapter.isConnected() && serverConn);
+  assert.equal(sawAccessToken, 'fwd-secret');
+
+  serverConn.sendJson({
+    post_type: 'message',
+    message_type: 'private',
+    self_id: 888,
+    user_id: 4242,
+    raw_message: '/help',
+  });
+  await waitFor(() => serverConn.messages.some(m => m.includes('client-reply:/help')));
+});
+
+test('WeComAdapter 帧构造/解析、本地 WS 长连接流式回复与 Webhook HTTP POST', async t => {
+  // 1. Pure helpers
+  assert.equal(DEFAULT_WECOM_WS_URL, 'wss://openws.work.weixin.qq.com');
+  const sub = buildSubscribeFrame({ botId: 'b1', secret: 's1', reqId: 'r1' });
+  assert.deepEqual(sub, { cmd: 'aibot_subscribe', headers: { req_id: 'r1' }, body: { bot_id: 'b1', secret: 's1' } });
+  const ping = buildPingFrame({ reqId: 'p1' });
+  assert.deepEqual(ping, { cmd: 'ping', headers: { req_id: 'p1' } });
+  const stream = buildRespondStreamFrame({ reqId: 'rq', streamId: 'st', content: 'hi', finish: false });
+  assert.equal(stream.cmd, 'aibot_respond_msg');
+  assert.equal(stream.body.stream.finish, false);
+  const send = buildSendMsgFrame({ chatId: 'group:wr123', content: 'alert' });
+  assert.equal(send.cmd, 'aibot_send_msg');
+  assert.equal(send.body.chatid, 'wr123');
+
+  const cbGroup = parseCallbackFrame({
+    cmd: 'aibot_msg_callback',
+    headers: { req_id: 'req-g1' },
+    body: {
+      msgid: 'm1',
+      chattype: 'group',
+      chatid: 'wr-room-1',
+      from: { userid: 'zhangsan', name: '张三' },
+      text: { content: '@小鑫 @claude 检查接口' },
+    },
+  }, { botName: '小鑫' });
+  assert.equal(cbGroup.chattype, 'group');
+  assert.equal(cbGroup.chatKey, 'group:wr-room-1');
+  assert.equal(cbGroup.senderId, 'zhangsan');
+  assert.equal(cbGroup.text, '@claude 检查接口');
+  assert.equal(chunkMarkdown('line\n'.repeat(5000), 16000).length, 2);
+
+  // 2. Local mock WeCom WS server + Webhook HTTP server
+  let wecomConn = null;
+  const wsFrames = [];
+  const mockWecomWs = await createLoopbackWsServer({
+    onConnection: conn => {
+      wecomConn = conn;
+      conn.onText = raw => {
+        const frame = JSON.parse(raw);
+        wsFrames.push(frame);
+        if (frame.cmd === 'aibot_subscribe') {
+          conn.sendJson({ headers: { req_id: frame.headers.req_id }, errcode: 0, errmsg: 'ok' });
+        } else if (frame.cmd === 'ping') {
+          conn.sendJson({ cmd: 'pong', headers: { req_id: frame.headers.req_id } });
+        }
+      };
+    },
+  });
+  t.after(() => mockWecomWs.close());
+
+  const webhookBodies = [];
+  let webhookFailNext = false;
+  const webhookSrv = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    webhookBodies.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+    if (webhookFailNext) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ errcode: 40001, errmsg: 'invalid webhook' }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ errcode: 0, errmsg: 'ok' }));
+  });
+  await new Promise(resolve => webhookSrv.listen(0, '127.0.0.1', resolve));
+  const webhookUrl = `http://127.0.0.1:${webhookSrv.address().port}/webhook`;
+  t.after(async () => {
+    webhookSrv.closeAllConnections?.();
+    await new Promise(resolve => webhookSrv.close(resolve));
+  });
+
+  const adapter = new WeComAdapter({
+    config: {
+      enabled: true,
+      wsUrl: mockWecomWs.url,
+      botId: 'bot-123',
+      secret: 'sec-456',
+      botName: '小鑫',
+      webhookUrl,
+      pushTargets: ['lisi', 'group:wr999'],
+      heartbeatMs: 80,
+      streamThrottleMs: 500,
+    },
+    onMessage: async msg => {
+      msg.onProgress({ text: '🔧 正在执行测试' });
+      await new Promise(r => setTimeout(r, 20));
+      await msg.reply(`完成: ${msg.text}`);
+    },
+  });
+  t.after(() => adapter.stop());
+
+  await adapter.start();
+  await waitFor(() => adapter.getStatus().subscribed === true && wsFrames.some(f => f.cmd === 'ping'));
+  assert.equal(adapter.getStatus().status, 'connected');
+  assert.equal(adapter.getStatus().state, 'connected');
+
+  const subFrame = wsFrames.find(f => f.cmd === 'aibot_subscribe');
+  assert.deepEqual(subFrame.body, { bot_id: 'bot-123', secret: 'sec-456' });
+
+  // Simulate incoming callback -> streaming progress + finish
+  wecomConn.sendJson({
+    cmd: 'aibot_msg_callback',
+    headers: { req_id: 'cb-req-1' },
+    body: {
+      msgid: 'msg-1',
+      chattype: 'single',
+      from: { userid: 'zhangsan' },
+      text: { content: '运行验证' },
+    },
+  });
+
+  await waitFor(() => wsFrames.some(f => f.cmd === 'aibot_respond_msg' && f.body?.stream?.finish === true));
+  const streamFrames = wsFrames.filter(f => f.cmd === 'aibot_respond_msg');
+  assert.ok(streamFrames.length >= 2);
+  assert.equal(streamFrames[0].headers.req_id, 'cb-req-1');
+  assert.equal(streamFrames[0].body.stream.finish, false);
+  assert.match(streamFrames[0].body.stream.content, /正在执行测试/);
+  const finalFrame = streamFrames[streamFrames.length - 1];
+  assert.equal(finalFrame.headers.req_id, 'cb-req-1');
+  assert.equal(finalFrame.body.stream.id, streamFrames[0].body.stream.id);
+  assert.equal(finalFrame.body.stream.finish, true);
+  assert.equal(finalFrame.body.stream.content, '完成: 运行验证');
+
+  // Push via aibot_send_msg + Webhook
+  const pushOk = await adapter.push('企微告警推送');
+  assert.equal(pushOk.ok, true);
+  assert.equal(pushOk.sent, 3); // 2 pushTargets + 1 webhook
+  const sentFrames = wsFrames.filter(f => f.cmd === 'aibot_send_msg');
+  assert.equal(sentFrames.length, 2);
+  assert.equal(sentFrames[0].body.chatid, 'lisi');
+  assert.equal(sentFrames[1].body.chatid, 'wr999');
+  assert.equal(webhookBodies.length, 1);
+  assert.equal(webhookBodies[0].markdown.content, '企微告警推送');
+
+  // Webhook error path
+  webhookFailNext = true;
+  const pushErr = await adapter.push('再推一次');
+  assert.equal(pushErr.ok, false);
+  assert.match(pushErr.detail, /invalid webhook/);
+});
+
+test('BotService 0600 持久化、冷启动防刷屏、实时状态推送、冷却节流、自派活去重与端到端联动', async t => {
+  const rawDir = await mkdtemp(join(tmpdir(), 'agent-pet-bot-service-'));
+  const dir = await realpath(rawDir);
+  const dataDir = join(dir, 'data');
+  const workDir = join(dir, 'work');
+  const argsLog = join(dir, 'e2e-claude-args.jsonl');
+  await mkdir(dataDir, { recursive: true });
+  await mkdir(workDir, { recursive: true });
+
+  const mockClaude = await makeMockExecutable(
+    join(dir, 'mock-claude'),
+    `
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(argsLog)}, JSON.stringify(args) + '\\n');
+const pIdx = args.indexOf('-p');
+const prompt = pIdx >= 0 ? args[pIdx + 1] : '';
+const rIdx = args.indexOf('--resume');
+const sid = rIdx >= 0 ? args[rIdx + 1] : 'ses-e2e-1';
+console.log(JSON.stringify({ type: 'system', subtype: 'init', session_id: sid }));
+console.log(JSON.stringify({ type: 'result', subtype: 'success', session_id: sid, result: 'E2E:' + prompt }));
+`,
+  );
+
+  const prevClaude = process.env.CLAUDE_BIN;
+  process.env.CLAUDE_BIN = mockClaude;
+  t.after(async () => {
+    if (prevClaude === undefined) delete process.env.CLAUDE_BIN;
+    else process.env.CLAUDE_BIN = prevClaude;
+    await rm(rawDir, { recursive: true, force: true });
+  });
+
+  // Pure helpers
+  assert.equal(generatePairingCode(6).length, 6);
+  const norm = normalizeBotConfig({ defaultEngine: 'invalid', allowedWorkspaces: [] });
+  assert.equal(norm.defaultEngine, DEFAULT_BOT_CONFIG.defaultEngine);
+  assert.deepEqual(norm.allowedWorkspaces, [os.homedir()]);
+  assert.match(formatStatusAlert({ providerLabel: 'Codex', title: 'pet · 1', detail: '等待确认', sessionId: 'codex:1' }), /\[Codex\] pet · 1/);
+
+  const svc = new BotService({
+    rootDir: ROOT_DIR,
+    dataDir,
+  });
+  t.after(() => svc.stop());
+
+  // 1. Check bot.json 0600 permissions & persistence
+  const cfgPath = join(dataDir, 'bot.json');
+  assert.equal(existsSync(cfgPath), true);
+  assert.equal((await stat(cfgPath)).mode & 0o777, 0o600);
+  const initialPairing = svc.getState().config.pairingCode;
+  assert.match(initialPairing, /^[A-Z0-9]{6}$/);
+
+  await svc.start();
+  await svc.saveConfig({
+    defaultEngine: 'claude',
+    defaultCwd: workDir,
+    allowedWorkspaces: [dir],
+    notifications: { enabled: true, onWaiting: true, onBlocked: true, onReady: true, cooldownMs: 250 },
+    qq: {
+      enabled: true,
+      mode: 'server',
+      listenHost: '127.0.0.1',
+      listenPort: 0,
+      listenPath: '/onebot/v11/ws',
+      accessToken: 'e2e-tok',
+      pushTargets: ['private:8888'],
+    },
+  });
+
+  const qqStatus = svc.getState().channels.qq;
+  assert.equal(qqStatus.status, 'listening');
+  assert.equal(qqStatus.state, 'listening');
+  const qqPort = qqStatus.port;
+
+  // Connect mock QQ OneBot client
+  const sentToQq = [];
+  const ws = new globalThis.WebSocket(`ws://127.0.0.1:${qqPort}/onebot/v11/ws?access_token=e2e-tok`);
+  t.after(() => { try { ws.close(); } catch {} });
+  await new Promise((resolve, reject) => {
+    ws.addEventListener('open', resolve, { once: true });
+    ws.addEventListener('error', reject, { once: true });
+  });
+  ws.addEventListener('message', ev => {
+    const frame = JSON.parse(String(ev.data));
+    sentToQq.push(frame);
+    if (frame.echo) {
+      ws.send(JSON.stringify({ status: 'ok', retcode: 0, echo: frame.echo }));
+    }
+  });
+  await waitFor(() => svc.qq.isConnected());
+
+  // 2. Cold boot: suppress historical ready & stale waiting (>120s)
+  const now = Date.now();
+  const coldSent = await svc.onSnapshot({
+    items: [
+      { provider: 'claude', providerLabel: 'Claude Code', sessionId: 'claude:old-ready', status: 'ready', title: 'old', detail: '已完成', updatedAt: now, lastSeq: 1 },
+      { provider: 'codex', providerLabel: 'Codex', sessionId: 'codex:stale-wait', status: 'waiting', title: 'stale', detail: '等待', updatedAt: now - 300_000, lastSeq: 1 },
+    ],
+  });
+  assert.equal(coldSent, 0);
+
+  // 3. Live status transitions + cooldown + self-dispatched dedup
+  svc.dispatcher._markDispatched('claude', 'bot-own-ses');
+  const liveSent1 = await svc.onSnapshot({
+    items: [
+      { provider: 'claude', providerLabel: 'Claude Code', sessionId: 'claude:bot-own-ses', status: 'waiting', title: 'bot', detail: '待确认', updatedAt: Date.now(), lastSeq: 1 },
+      { provider: 'codex', providerLabel: 'Codex', sessionId: 'codex:term-1', status: 'waiting', title: 'proj · term-1', detail: '需要你在 Codex 中回答', updatedAt: Date.now(), lastSeq: 2 },
+    ],
+  });
+  assert.equal(liveSent1, 1);
+  assert.ok(sentToQq.some(f => f.action === 'send_private_msg' && f.params.message.includes('[Codex] proj · term-1')));
+
+  // Immediate transition within 250ms cooldown is suppressed
+  const suppressedByCooldown = await svc.onSnapshot({
+    items: [
+      { provider: 'codex', providerLabel: 'Codex', sessionId: 'codex:term-1', status: 'ready', title: 'proj · term-1', detail: '本轮结束', updatedAt: Date.now(), lastSeq: 3 },
+    ],
+  });
+  assert.equal(suppressedByCooldown, 0);
+
+  // After cooldown expires, new status change pushes again
+  await new Promise(r => setTimeout(r, 280));
+  const afterCooldown = await svc.onSnapshot({
+    items: [
+      { provider: 'codex', providerLabel: 'Codex', sessionId: 'codex:term-1', status: 'blocked', title: 'proj · term-1', detail: '遇到问题', updatedAt: Date.now(), lastSeq: 4 },
+    ],
+  });
+  assert.equal(afterCooldown, 1);
+
+  // 4. End-to-end QQ incoming message -> unauthorized -> /pair -> /claude -> plain follow-up
+  const sendPrivateFromQq = text => {
+    ws.send(JSON.stringify({
+      post_type: 'message',
+      message_type: 'private',
+      self_id: 90001,
+      user_id: 7777,
+      raw_message: text,
+    }));
+  };
+
+  sendPrivateFromQq('/status');
+  await waitFor(() => sentToQq.some(f => f.params?.user_id === 7777 && f.params?.message.includes('未授权')));
+
+  sendPrivateFromQq(`/pair ${initialPairing}`);
+  await waitFor(() => sentToQq.some(f => f.params?.user_id === 7777 && f.params?.message.includes('配对成功')));
+
+  // Verify authorization persisted across BotService reload
+  const svcReloaded = new BotService({ rootDir: ROOT_DIR, dataDir });
+  assert.ok(svcReloaded.getState().config.authorizedUsers.qq.includes('7777'));
+
+  sendPrivateFromQq('/claude 第一步');
+  await waitFor(() => sentToQq.some(f => f.params?.user_id === 7777 && f.params?.message.includes('E2E:第一步')));
+
+  sendPrivateFromQq('第二步追问');
+  await waitFor(() => sentToQq.some(f => f.params?.user_id === 7777 && f.params?.message.includes('E2E:第二步追问')));
+
+  const e2eArgs = (await readFile(argsLog, 'utf8')).trim().split('\n').map(l => JSON.parse(l));
+  assert.equal(e2eArgs.length, 2);
+  assert.ok(e2eArgs[1].includes('--resume'));
+  assert.equal(e2eArgs[1][e2eArgs[1].indexOf('--resume') + 1], 'ses-e2e-1');
+
+  // 4b. testPush & regeneratePairingCode
+  const qqTestRes = await svc.testPush('qq');
+  assert.equal(qqTestRes.ok, true);
+  assert.equal(qqTestRes.sent, 1);
+  const wecomDisabledRes = await svc.testPush('wecom');
+  assert.equal(wecomDisabledRes.ok, false);
+  const regenerated = svc.regeneratePairingCode();
+  assert.match(regenerated.config.pairingCode, /^[A-Z0-9]{6}$/);
+  assert.equal((await stat(cfgPath)).mode & 0o777, 0o600);
+
+  // 5. Headless startBotServer smoke test
+  const srvDir = join(dir, 'headless-data');
+  const srv = await startBotServer({
+    rootDir: ROOT_DIR,
+    dataDir: srvDir,
+    pollIntervalMs: 5000,
+    attachSignals: false,
+  });
+  assert.ok(srv.botService.getState().config.pairingCode);
+  await srv.stop();
+});
+
+test('独立运行 WebM 动画资产、Manager UI DOM/CSP 契约及无 ~/.dsh 独立安装/启动检查', async t => {
+  // 1. All 5 required WebM animations exist in repo assets/webm/
+  const requiredWebms = [
+    '待机呼吸休闲.webm',
+    '工作状态-忙碌点按.webm',
+    '工作状态-原地踱步张望.webm',
+    '工作状态-垂头叹气冒汗.webm',
+    '工作状态-雀跃庆祝.webm',
+  ];
+  for (const name of requiredWebms) {
+    const info = await stat(join(ROOT_DIR, 'assets/webm', name));
+    assert.ok(info.isFile() && info.size > 1000, `missing or empty webm: ${name}`);
+  }
+
+  // 2. Manager HTML CSP & DOM ID alignment with manager.js
+  const html = await readFile(join(ROOT_DIR, 'runtime/manager.html'), 'utf8');
+  const js = await readFile(join(ROOT_DIR, 'runtime/manager.js'), 'utf8');
+  assert.match(html, /Content-Security-Policy/);
+  assert.doesNotMatch(html, /unsafe-inline/);
+  assert.doesNotMatch(html, /\son\w+=/i);
+  assert.doesNotMatch(html, /\sstyle=/i);
+
+  const htmlIds = new Set([...html.matchAll(/\bid="([^"]+)"/g)].map(m => m[1]));
+  const referencedIds = [...js.matchAll(/\$\('([^']+)'\)/g)].map(m => m[1]);
+  assert.ok(referencedIds.length >= 60);
+  for (const id of referencedIds) {
+    assert.ok(htmlIds.has(id), `manager.js references missing DOM id: ${id}`);
+  }
+
+  // 3. scripts/install.py standalone dry check in isolated temp HOME without ~/.dsh
+  const tempRoot = await mkdtemp(join(tmpdir(), 'agent-pet-standalone-'));
+  const fakeHome = join(tempRoot, 'home');
+  const fakeData = join(tempRoot, 'pet-data');
+  await mkdir(fakeHome, { recursive: true });
+  t.after(() => rm(tempRoot, { recursive: true, force: true }));
+
+  const installRes = spawnSync('python3', [join(ROOT_DIR, 'scripts/install.py')], {
+    cwd: ROOT_DIR,
+    env: {
+      ...process.env,
+      HOME: fakeHome,
+      AGENT_PET_DATA: fakeData,
+      AGENT_PET_ELECTRON: '/usr/bin/true',
+    },
+    encoding: 'utf8',
+  });
+  assert.equal(installRes.status, 0, installRes.stderr);
+  assert.match(installRes.stdout, /standalone mode/);
+  assert.equal(existsSync(join(fakeHome, '.dsh')), false);
+
+  const launcher = join(fakeHome, 'Applications/Agent Pet.app/Contents/MacOS/AgentPet');
+  assert.equal(existsSync(launcher), true);
+  assert.equal((await stat(launcher)).mode & 0o111, 0o111);
+  assert.equal(existsSync(join(fakeHome, 'Applications/Agent Pet.app/Contents/Info.plist')), true);
+  const connectorsCfg = JSON.parse(await readFile(join(fakeData, 'connectors.json'), 'utf8'));
+  assert.deepEqual(connectorsCfg.enabled, ['dsh']);
+
+  // 4. scripts/start.cjs exits cleanly when no Electron runtime is present
+  const startEnv = { ...process.env, HOME: fakeHome, PATH: '' };
+  delete startEnv.AGENT_PET_ELECTRON;
+  const startRes = spawnSync(process.execPath, [join(ROOT_DIR, 'scripts/start.cjs')], {
+    cwd: ROOT_DIR,
+    env: startEnv,
+    encoding: 'utf8',
+  });
+  assert.equal(startRes.status, 1);
+  assert.match(startRes.stderr, /无法找到 Electron 运行时/);
+});

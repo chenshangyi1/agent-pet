@@ -1,7 +1,7 @@
 'use strict';
 /** Transparent pet; only this main process holds the local DSH credential. */
-const { app, BrowserWindow, ipcMain, globalShortcut, Tray, Menu, nativeImage, shell, screen } = require('electron');
-const { readFileSync, writeFileSync, mkdirSync, renameSync } = require('node:fs');
+const { app, BrowserWindow, ipcMain, globalShortcut, Tray, Menu, nativeImage, shell, screen, dialog } = require('electron');
+const { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync } = require('node:fs');
 const path = require('node:path');
 const { homedir } = require('node:os');
 const { execFile } = require('node:child_process');
@@ -13,12 +13,22 @@ const { layoutPet } = require('./placement.cjs');
 const { ConnectorRegistry } = require('../connectors/registry.cjs');
 const { CATALOG_BY_ID } = require('../connectors/catalog.cjs');
 const { LocalSpeech } = require('./local-speech.cjs');
+const { BotService } = require('../bot/service.cjs');
 app.setName('Agent Pet');
 const dataDir = process.env.AGENT_PET_DATA || process.env.DSH_COMPANION_DATA || path.join(homedir(), '.dsh/companion');
-const petRoot = process.env.DSH_COMPANION_PET_ROOT || path.join(homedir(), '.dsh/profiles/web/node_modules/dsh-pet');
 const endpoint = process.env.DSH_COMPANION_ENDPOINT;
 const token = process.env.DSH_COMPANION_TOKEN;
 const hostPid = Number(process.env.DSH_COMPANION_HOST_PID);
+function resolveWebmDir() {
+  const candidates = [
+    path.join(__dirname, '../assets/webm'),
+    process.env.DSH_COMPANION_PET_ROOT ? path.join(process.env.DSH_COMPANION_PET_ROOT, 'assets/webm') : null,
+    path.join(homedir(), '.dsh/profiles/web/node_modules/dsh-pet/assets/webm'),
+  ].filter(Boolean);
+  return candidates.find(dir => existsSync(path.join(dir, '待机呼吸休闲.webm')))
+    || candidates.find(dir => existsSync(dir))
+    || candidates[0];
+}
 mkdirSync(dataDir, { recursive: true, mode: 0o700 });
 app.setPath('userData', path.join(dataDir, 'electron'));
 const registry = new ConnectorRegistry({ rootDir: path.dirname(__dirname), dataDir });
@@ -28,7 +38,7 @@ if (!app.requestSingleInstanceLock()) { app.quit(); } else {
 app.on('second-instance', () => { if (process.env.AGENT_PET_SHOW_ON_LAUNCH === '1') showPet(); });
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 const settingsFile = path.join(dataDir, 'desktop.json');
-let win, managerWin, tray, notch, commandServer, refreshTimer, quitting = false, dragStart, dragTimer, placement;
+let win, managerWin, tray, notch, commandServer, refreshTimer, botService, quitting = false, dragStart, dragTimer, placement;
 let settings = { hidden: false, mini: false, controlOnly: false, source: 'auto' };
 try { settings = { ...settings, ...JSON.parse(readFileSync(settingsFile, 'utf8')) }; } catch (error) {
   if (error.code !== 'ENOENT') process.stderr.write('[companion] 无法读取桌宠偏好，使用默认值\n');
@@ -99,11 +109,12 @@ function menuTemplate() {
   const followChoices = [['auto', '自动跟随'], ...enabled.map(entry => [entry.id, entry.label])];
   const openItems = enabled.map(entry => ({
     label: `打开 ${entry.label}`,
-    click: () => (entry.id === 'dsh' ? openDsh() : openBundle(entry.id)).catch(() => process.stderr.write(`[companion] 无法打开 ${entry.label}\n`)),
+    click: () => (entry.id === 'dsh' ? openDsh() : openBundle(entry.id)).catch(err => process.stderr.write(`[companion] 无法打开 ${entry.label}: ${err?.message || '未知错误'}\n`)),
   }));
   return [
     { label: '跟随工具', submenu: followChoices.map(([id, label]) => ({ label, type: 'radio', checked: settings.source === id, click: () => setSource(id) })) },
-    { label: '管理 AI Agent...', click: openManagerWindow },
+    { label: '管理 AI Agent...', click: () => openManagerWindow('connectors') },
+    { label: 'Bot 派活与通知...', click: () => openManagerWindow('bot') },
     { label: '收回刘海', click: hidePet },
     { label: '打开刘海面板', click: () => notch?.expand(true) },
     ...(openItems.length > 1 ? [{ label: '打开应用', submenu: openItems }] : openItems),
@@ -127,7 +138,17 @@ function openBundle(providerId) {
   if (!entry || !entry.bundleId) return Promise.reject(new Error('应用配置无效'));
   return new Promise((resolve, reject) => execFile('/usr/bin/open', ['-b', entry.bundleId], error => error ? reject(new Error(`无法打开 ${entry.label}`)) : resolve({ opened: true })));
 }
-async function rpc(body) { return providers.dsh(body); }
+async function rpc(body) {
+  try {
+    return await providers.dsh(body);
+  } catch (error) {
+    const msg = String(error?.message || '');
+    if (!msg || msg === 'DSH 未连接' || msg === 'DSH 暂时未连接' || /fetch failed|ECONNREFUSED|AbortError|TimeoutError/i.test(msg)) {
+      throw new Error('DSH 尚未运行');
+    }
+    throw error;
+  }
+}
 async function agentAction(body) {
   if (body.action === 'list') { await providers.refresh(); return providers.list(settings.source); }
   if (body.action === 'info') {
@@ -214,27 +235,31 @@ async function syncConnectorsAfterChange(list) {
   providers.setEnabledProviders(registry.enabledIds());
   if (!validSources().includes(settings.source)) settings.source = 'auto';
   save();
-  await providers.refresh();
+  await providers.refresh().catch(() => {});
+  try { await botService?.onSnapshot(providers.snapshot); } catch {}
   win?.webContents.send('companion:mode', mode());
   notch?.send();
   if (managerWin && !managerWin.isDestroyed()) managerWin.webContents.send('companion:connectors-updated', list);
   return list;
 }
-function openManagerWindow() {
+function openManagerWindow(initialTab = 'connectors') {
+  const tab = initialTab === 'bot' ? 'bot' : 'connectors';
   notch?.expand(false);
   if (process.platform === 'darwin') app.focus({ steal: true });
   if (managerWin && !managerWin.isDestroyed()) {
     managerWin.show();
     managerWin.focus();
     managerWin.webContents.send('companion:connectors-updated', registry.detectAll());
+    if (botService) managerWin.webContents.send('companion:bot-updated', botService.getState());
+    managerWin.webContents.send('companion:manager-tab', tab);
     return;
   }
   managerWin = new BrowserWindow({
-    width: 560,
-    height: 620,
-    minWidth: 460,
-    minHeight: 460,
-    title: '小鑫 · AI Agent 管理',
+    width: 660,
+    height: 700,
+    minWidth: 500,
+    minHeight: 500,
+    title: '小鑫 · AI Agent 与 Bot 管理',
     resizable: true,
     minimizable: true,
     maximizable: false,
@@ -250,8 +275,12 @@ function openManagerWindow() {
   managerWin.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   managerWin.webContents.on('will-navigate', event => event.preventDefault());
   managerWin.on('closed', () => { managerWin = null; });
-  managerWin.once('ready-to-show', () => { managerWin.show(); managerWin.focus(); });
-  managerWin.loadFile(path.join(__dirname, 'manager.html')).catch(() => {});
+  managerWin.once('ready-to-show', () => {
+    managerWin.show();
+    managerWin.focus();
+    managerWin.webContents.send('companion:manager-tab', tab);
+  });
+  managerWin.loadFile(path.join(__dirname, 'manager.html'), tab === 'bot' ? { hash: 'bot' } : undefined).catch(() => {});
 }
 ipcMain.handle('companion:connectors', async (event, body) => {
   trustedManager(event);
@@ -263,6 +292,25 @@ ipcMain.handle('companion:connectors', async (event, body) => {
   if (action === 'open') {
     const id = String(body.id || '');
     return id === 'dsh' ? openDsh() : openBundle(id);
+  }
+  throw new Error('不支持的操作');
+});
+ipcMain.handle('companion:bot', async (event, body) => {
+  trustedManager(event);
+  if (!botService) throw new Error('Bot 服务尚未初始化');
+  const action = body?.action;
+  if (action === 'state') return botService.getState();
+  if (action === 'save') return botService.saveConfig(body?.config || {});
+  if (action === 'pair') return botService.regeneratePairingCode();
+  if (action === 'test') return botService.testPush(String(body?.channel || ''));
+  if (action === 'stop-job') return botService.stopJob(body?.jobId);
+  if (action === 'browse-cwd') {
+    const picked = await dialog.showOpenDialog(managerWin, {
+      title: '选择默认工作目录',
+      properties: ['openDirectory', 'createDirectory'],
+    });
+    if (picked.canceled || !picked.filePaths?.length) return { canceled: true };
+    return { canceled: false, path: picked.filePaths[0] };
   }
   throw new Error('不支持的操作');
 });
@@ -287,7 +335,7 @@ ipcMain.handle('companion:window', (event, action, value) => {
   else if (action === 'drag-end') endDrag();
   else if (action === 'animation' && ['idle','running','waiting','blocked','ready'].includes(value)) {
     const names = { idle: '待机呼吸休闲', running: '工作状态-忙碌点按', waiting: '工作状态-原地踱步张望', blocked: '工作状态-垂头叹气冒汗', ready: '工作状态-雀跃庆祝' };
-    return 'data:video/webm;base64,' + readFileSync(path.join(petRoot, 'assets/webm', names[value] + '.webm')).toString('base64');
+    return 'data:video/webm;base64,' + readFileSync(path.join(resolveWebmDir(), names[value] + '.webm')).toString('base64');
   }
 });
 process.on('SIGUSR1', () => { if (win && !win.isDestroyed()) showPet(); });
@@ -317,7 +365,26 @@ app.whenReady().then(async () => {
   await win.loadFile(path.join(__dirname, 'app.html'));
   if (!settings.hidden) win.showInactive();
   await startCommands();
-  await providers.refresh();
+  botService = new BotService({
+    rootDir: path.dirname(__dirname),
+    dataDir,
+    providers,
+    desktopCommand: (command, value) => {
+      if (!win || win.isDestroyed()) throw new Error('桌宠窗口尚未就绪');
+      return applyDesktop(command, value);
+    },
+    openApp: id => (id === 'dsh' ? openDsh() : openBundle(id)),
+  });
+  botService.on('updated', state => {
+    if (managerWin && !managerWin.isDestroyed()) managerWin.webContents.send('companion:bot-updated', state);
+  });
+  try {
+    await botService.start();
+  } catch (error) {
+    process.stderr.write(`[companion] Bot 网关启动失败: ${error?.message || '未知错误'}\n`);
+  }
+  await providers.refresh().catch(() => {});
+  try { await botService.onSnapshot(providers.snapshot); } catch {}
   notch = createNotch({
     getState: () => {
       const priority = ['waiting', 'blocked', 'running', 'ready', 'unknown', 'idle'];
@@ -330,7 +397,7 @@ app.whenReady().then(async () => {
         .sort((a, b) => rankOf(a.status) - rankOf(b.status));
       const top = candidates[0];
       const activeSource = settings.source === 'auto'
-        ? (top && top.status !== 'idle' ? top.id : 'dsh')
+        ? (top && top.status !== 'idle' ? top.id : (providers.snapshot.sources.find(s => s.connected)?.id || providers.snapshot.sources[0]?.id || 'dsh'))
         : settings.source;
       return {
         visible: !settings.hidden,
@@ -345,11 +412,16 @@ app.whenReady().then(async () => {
       else if (action === 'hide') hidePet();
       else if (action === 'show') { if (typeof value === 'string' && value) setSource(value); showPet(); }
       else if (action === 'open') { if (typeof value === 'string' && value && value !== 'dsh') await openBundle(value); else await agentAction({ action: 'home' }); }
-      else if (action === 'manage') openManagerWindow();
+      else if (action === 'manage') openManagerWindow(value === 'bot' ? 'bot' : 'connectors');
       else if (action === 'reset') { resetPosition(); showPet(); }
     },
   });
-  refreshTimer = setInterval(() => providers.refresh().then(() => notch.send()).catch(() => {}), 1500);
+  refreshTimer = setInterval(() => {
+    providers.refresh().then(snapshot => {
+      notch?.send();
+      return botService?.onSnapshot(snapshot || providers.snapshot);
+    }).catch(() => {});
+  }, 1500);
   const shortcut = process.env.DSH_COMPANION_SHORTCUT || 'Alt+Space';
   const shortcutOk = globalShortcut.register(shortcut, () => showPet(!isReadOnlyConnector(settings.source)));
   writeFileSync(path.join(dataDir, 'desktop-runtime.json'), JSON.stringify({ pid: process.pid, hostPid, shortcut, shortcutRegistered: shortcutOk, ready: true, mode: 'multi-agent', project: path.dirname(__dirname) }), { mode: 0o600 });
@@ -374,7 +446,18 @@ process.on('message', message => {
     process.send?.({ type: 'companion:desktop-result', id: message.id, state: desktopState() });
   } catch { process.send?.({ type: 'companion:desktop-result', id: message.id, error: '桌宠操作失败，请重试' }); }
 });
-app.on('before-quit', () => { quitting = true; localSpeech.stopSpeaking(); clearInterval(dragTimer); clearInterval(refreshTimer); commandServer?.close(); notch?.destroy(); if (managerWin && !managerWin.isDestroyed()) managerWin.destroy(); globalShortcut.unregisterAll(); tray?.destroy(); });
+app.on('before-quit', () => {
+  quitting = true;
+  localSpeech.stopSpeaking();
+  clearInterval(dragTimer);
+  clearInterval(refreshTimer);
+  commandServer?.close();
+  notch?.destroy();
+  Promise.resolve(botService?.stop()).catch(() => {});
+  if (managerWin && !managerWin.isDestroyed()) managerWin.destroy();
+  globalShortcut.unregisterAll();
+  tray?.destroy();
+});
 app.on('window-all-closed', () => app.quit());
 
 }

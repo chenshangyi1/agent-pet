@@ -1,0 +1,1387 @@
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+const os = require('node:os');
+const { spawn, spawnSync } = require('node:child_process');
+const { randomBytes, randomUUID } = require('node:crypto');
+
+const BAD_IDS = new Set(['__proto__', 'constructor', 'prototype']);
+const ALLOWED_MIRROR_EVENTS = new Set([
+  'SessionStart',
+  'SessionEnd',
+  'UserPromptSubmit',
+  'PreToolUse',
+  'PostToolUse',
+  'PostToolUseFailure',
+  'Notification',
+  'PermissionRequest',
+  'PermissionDenied',
+  'Stop',
+  'StopFailure',
+]);
+const DISPATCH_SESSION_TTL = 24 * 60 * 60_000;
+const MAX_JOBS_HISTORY = 200;
+const DEFAULT_DSH_POLL_MS = 1200;
+const DEFAULT_DSH_TIMEOUT_MS = 120_000;
+
+function expandHome(inputPath) {
+  const raw = String(inputPath || '').trim();
+  if (!raw) return '';
+  if (raw === '~') return os.homedir();
+  if (raw.startsWith('~/') || raw.startsWith('~\\')) {
+    return path.join(os.homedir(), raw.slice(2));
+  }
+  return raw;
+}
+
+function cleanMeta(value, limit) {
+  if (typeof value !== 'string') return '';
+  return value.replace(/\s+/g, ' ').trim().slice(0, limit);
+}
+
+function isExecutableFile(filePath) {
+  if (!filePath) return false;
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) return false;
+    fs.accessSync(filePath, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function findBinary(name, explicitCandidates = []) {
+  const home = os.homedir();
+  const candidates = [];
+
+  for (const item of explicitCandidates) {
+    if (!item || typeof item !== 'string') continue;
+    const expanded = expandHome(item);
+    if (!expanded) continue;
+    if (expanded.includes(path.sep) || expanded.includes('/')) {
+      candidates.push(expanded);
+    } else {
+      const pathEntries = (process.env.PATH || '').split(path.delimiter).filter(Boolean);
+      for (const dir of pathEntries) {
+        candidates.push(path.join(dir, expanded));
+      }
+    }
+  }
+
+  candidates.push(
+    path.join(home, '.local', 'bin', name),
+    path.join('/opt/homebrew/bin', name),
+    path.join('/usr/local/bin', name),
+  );
+
+  const pathEntries = (process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  for (const dir of pathEntries) {
+    candidates.push(path.join(expandHome(dir), name));
+  }
+
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const resolved = path.resolve(candidate);
+    if (seen.has(resolved)) continue;
+    seen.add(resolved);
+    if (isExecutableFile(resolved)) return resolved;
+  }
+  return null;
+}
+
+function sanitizeWorkspace(targetDir, allowedWorkspaces) {
+  if (typeof targetDir !== 'string' || !targetDir.trim()) {
+    throw new Error('工作目录不能为空');
+  }
+  const expandedTarget = expandHome(targetDir);
+  const resolvedTarget = path.resolve(expandedTarget);
+
+  let realTarget;
+  try {
+    realTarget = fs.realpathSync(resolvedTarget);
+  } catch {
+    throw new Error(`工作目录不存在: ${targetDir}`);
+  }
+
+  let stat;
+  try {
+    stat = fs.statSync(realTarget);
+  } catch {
+    throw new Error(`无法访问工作目录: ${targetDir}`);
+  }
+  if (!stat.isDirectory()) {
+    throw new Error(`目标路径不是目录: ${targetDir}`);
+  }
+
+  const roots = Array.isArray(allowedWorkspaces) && allowedWorkspaces.length > 0
+    ? allowedWorkspaces
+    : [os.homedir()];
+
+  const realRoots = [];
+  for (const root of roots) {
+    if (typeof root !== 'string' || !root.trim()) continue;
+    try {
+      const realRoot = fs.realpathSync(path.resolve(expandHome(root)));
+      if (fs.statSync(realRoot).isDirectory()) realRoots.push(realRoot);
+    } catch {}
+  }
+
+  const allowed = realRoots.some(root => (
+    realTarget === root ||
+    realTarget.startsWith(root === path.sep ? root : root + path.sep)
+  ));
+  if (!allowed) {
+    throw new Error(`工作目录不在允许的工作区白名单内: ${targetDir}`);
+  }
+  return realTarget;
+}
+
+function mirrorInboxEvent({
+  dataDir,
+  provider,
+  sessionId,
+  event,
+  workspace,
+  tool,
+  toolId,
+  notification,
+  terminationReason,
+  hasError,
+  at,
+} = {}) {
+  if (!dataDir || typeof dataDir !== 'string') return null;
+  if (typeof provider !== 'string' || !/^[a-z0-9-]+$/.test(provider) || BAD_IDS.has(provider)) {
+    throw new Error(`无效的 provider: ${provider}`);
+  }
+  if (!ALLOWED_MIRROR_EVENTS.has(event)) {
+    throw new Error(`不支持的镜像事件类型: ${event}`);
+  }
+  const cleanSession = cleanMeta(String(sessionId || ''), 256);
+  if (!cleanSession || BAD_IDS.has(cleanSession)) {
+    throw new Error('sessionId 无效');
+  }
+
+  const eventId = randomBytes(16).toString('hex');
+  const payload = {
+    v: 1,
+    provider,
+    sessionId: cleanSession,
+    event,
+    id: eventId,
+    at: Number.isFinite(at) ? at : Date.now(),
+  };
+
+  if (typeof workspace === 'string' && workspace.trim()) {
+    const cleanWs = cleanMeta(path.basename(workspace.trim().replace(/[/\\]+$/, '')), 64);
+    if (cleanWs) payload.workspace = cleanWs;
+  }
+  if (typeof tool === 'string' && tool.trim()) {
+    const cleanTool = cleanMeta(tool, 100);
+    if (cleanTool) payload.tool = cleanTool;
+  }
+  if (typeof toolId === 'string' && toolId.trim()) {
+    const cleanToolId = cleanMeta(toolId, 256);
+    if (cleanToolId && !BAD_IDS.has(cleanToolId)) payload.toolId = cleanToolId;
+  }
+  if (typeof notification === 'string' && notification.trim()) {
+    const cleanNote = cleanMeta(notification, 64);
+    if (cleanNote) payload.notification = cleanNote;
+  }
+  if (typeof terminationReason === 'string' && terminationReason.trim()) {
+    const cleanReason = cleanMeta(terminationReason, 64);
+    if (cleanReason) payload.terminationReason = cleanReason;
+  }
+  if (hasError) payload.hasError = true;
+
+  const inboxDir = path.join(dataDir, provider, 'inbox');
+  fs.mkdirSync(inboxDir, { recursive: true, mode: 0o700 });
+  const finalPath = path.join(inboxDir, `${eventId}.json`);
+  const tmpPath = path.join(inboxDir, `.${eventId}.${process.pid}.tmp`);
+  fs.writeFileSync(tmpPath, JSON.stringify(payload), { encoding: 'utf8', mode: 0o600 });
+  fs.renameSync(tmpPath, finalPath);
+  return { path: finalPath, event: payload };
+}
+
+function parseClaudeStreamLine(line) {
+  if (typeof line !== 'string') return null;
+  const trimmed = line.trim();
+  if (!trimmed || !trimmed.startsWith('{')) return null;
+
+  let obj;
+  try {
+    obj = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  if (!obj || typeof obj !== 'object' || typeof obj.type !== 'string') return null;
+
+  const sessionId = typeof obj.session_id === 'string' && obj.session_id.trim()
+    ? obj.session_id.trim()
+    : null;
+  const tools = [];
+  const toolResults = [];
+  const textParts = [];
+
+  const content = obj.message?.content;
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (!block || typeof block !== 'object') continue;
+      if (block.type === 'tool_use' && typeof block.name === 'string' && block.name) {
+        tools.push({
+          name: block.name,
+          id: typeof block.id === 'string' ? block.id : '',
+        });
+      } else if (block.type === 'tool_result') {
+        toolResults.push({
+          id: typeof block.tool_use_id === 'string' ? block.tool_use_id : '',
+          isError: Boolean(block.is_error),
+        });
+      } else if (block.type === 'text' && typeof block.text === 'string' && block.text) {
+        textParts.push(block.text);
+      }
+    }
+  } else if (typeof obj.delta?.text === 'string' && obj.delta.text) {
+    textParts.push(obj.delta.text);
+  }
+
+  let resultText = '';
+  if (obj.type === 'result') {
+    if (typeof obj.result === 'string') {
+      resultText = obj.result;
+    } else if (Array.isArray(obj.errors)) {
+      resultText = obj.errors.filter(e => typeof e === 'string').join('\n');
+    }
+  }
+
+  const isError = Boolean(
+    obj.is_error ||
+    (obj.type === 'result' && typeof obj.subtype === 'string' && obj.subtype && obj.subtype !== 'success')
+  );
+
+  return {
+    raw: obj,
+    type: obj.type,
+    subtype: typeof obj.subtype === 'string' ? obj.subtype : '',
+    sessionId,
+    tools,
+    toolResults,
+    text: obj.type === 'result' ? resultText : textParts.join('\n'),
+    isResult: obj.type === 'result',
+    isError,
+  };
+}
+
+function parseCodexJsonLine(line) {
+  if (typeof line !== 'string') return null;
+  const trimmed = line.trim();
+  if (!trimmed || !trimmed.startsWith('{')) return null;
+
+  let obj;
+  try {
+    obj = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  if (!obj || typeof obj !== 'object' || typeof obj.type !== 'string') return null;
+
+  const type = obj.type;
+  const item = obj.item && typeof obj.item === 'object' ? obj.item : null;
+  const sessionId = typeof obj.thread_id === 'string' && obj.thread_id.trim()
+    ? obj.thread_id.trim()
+    : null;
+
+  let text = '';
+  if (item && (item.type === 'agent_message' || item.type === 'message')) {
+    if (typeof item.text === 'string') {
+      text = item.text;
+    } else if (Array.isArray(item.content)) {
+      text = item.content
+        .map(part => (typeof part?.text === 'string' ? part.text : ''))
+        .filter(Boolean)
+        .join('\n');
+    }
+  }
+
+  let tool = '';
+  let toolSummary = '';
+  const toolId = item && typeof item.id === 'string' ? item.id : '';
+  if (item && !['agent_message', 'message', 'reasoning'].includes(item.type)) {
+    if (item.type === 'command_execution') {
+      tool = 'command_execution';
+      toolSummary = typeof item.command === 'string' && item.command.trim()
+        ? `执行命令: ${item.command.trim().slice(0, 60)}`
+        : '执行命令';
+    } else if (item.type === 'file_change') {
+      tool = 'file_change';
+      const count = Array.isArray(item.changes) ? item.changes.length : 0;
+      toolSummary = count > 0 ? `修改文件 (${count} 个)` : '修改文件';
+    } else if (item.type === 'mcp_tool_call') {
+      tool = String(item.tool || item.server || 'mcp_tool_call');
+      toolSummary = `调用工具: ${tool}`;
+    } else if (item.type === 'web_search') {
+      tool = 'web_search';
+      toolSummary = '网页搜索';
+    } else if (typeof item.type === 'string' && item.type) {
+      tool = item.type;
+      toolSummary = `执行 ${item.type}`;
+    }
+  }
+
+  let errorMessage = '';
+  if (type === 'turn.failed') {
+    errorMessage = obj.error?.message || 'Codex 执行失败';
+  } else if (type === 'error') {
+    errorMessage = obj.message || obj.error?.message || 'Codex 发生错误';
+  }
+
+  return {
+    raw: obj,
+    type,
+    sessionId,
+    itemType: typeof item?.type === 'string' ? item.type : '',
+    text,
+    tool,
+    toolId,
+    toolSummary,
+    hasError: Boolean(
+      errorMessage ||
+      item?.status === 'failed' ||
+      (typeof item?.exit_code === 'number' && item.exit_code !== 0)
+    ),
+    errorMessage,
+  };
+}
+
+class TaskDispatcher {
+  constructor({
+    dataDir,
+    providers,
+    allowedWorkspaces,
+    defaultCwd,
+    sandboxMode,
+    onMirrorEvent,
+    dshPollIntervalMs,
+    dshTimeoutMs,
+  } = {}) {
+    this.dataDir = dataDir || process.env.AGENT_PET_DATA || process.env.DSH_COMPANION_DATA || path.join(os.homedir(), '.dsh', 'companion');
+    this.providers = providers || null;
+    this.onMirrorEvent = typeof onMirrorEvent === 'function' ? onMirrorEvent : null;
+    this.dshPollIntervalMs = Number.isFinite(dshPollIntervalMs) && dshPollIntervalMs > 0 ? dshPollIntervalMs : DEFAULT_DSH_POLL_MS;
+    this.dshTimeoutMs = Number.isFinite(dshTimeoutMs) && dshTimeoutMs > 0 ? dshTimeoutMs : DEFAULT_DSH_TIMEOUT_MS;
+    this.jobs = new Map();
+    this.dispatchedSessionIds = new Set();
+    this.dispatchedSessionTimestamps = new Map();
+    this._pySdkCache = null;
+
+    this.allowedWorkspaces = [os.homedir()];
+    this.defaultCwd = os.homedir();
+    this.sandboxMode = 'workspace-write';
+    this.updateOptions({ allowedWorkspaces, defaultCwd, sandboxMode });
+  }
+
+  updateOptions({ allowedWorkspaces, defaultCwd, sandboxMode } = {}) {
+    if (allowedWorkspaces !== undefined) {
+      const cleaned = Array.isArray(allowedWorkspaces)
+        ? allowedWorkspaces.map(w => String(w || '').trim()).filter(Boolean)
+        : [];
+      this.allowedWorkspaces = cleaned.length > 0 ? cleaned : [os.homedir()];
+    }
+    if (defaultCwd !== undefined) {
+      const trimmed = typeof defaultCwd === 'string' ? defaultCwd.trim() : '';
+      this.defaultCwd = trimmed ? expandHome(trimmed) : os.homedir();
+    }
+    if (sandboxMode !== undefined) {
+      const mode = String(sandboxMode || '').trim();
+      if (['workspace-write', 'auto', 'full', 'read-only'].includes(mode)) {
+        this.sandboxMode = mode;
+      }
+    }
+  }
+
+  validateWorkspace(targetDir) {
+    return sanitizeWorkspace(targetDir, this.allowedWorkspaces);
+  }
+
+  _probePythonAntigravity() {
+    const pyBin = findBinary('python3', [process.env.PYTHON3_BIN, '/opt/homebrew/bin/python3', '/usr/bin/python3']);
+    if (!pyBin) return null;
+
+    const cacheKey = `${pyBin}:${process.env.PYTHONPATH || ''}`;
+    if (this._pySdkCache && this._pySdkCache.key === cacheKey && Date.now() - this._pySdkCache.at < 15_000) {
+      return this._pySdkCache.available ? pyBin : null;
+    }
+
+    let available = false;
+    try {
+      const res = spawnSync(pyBin, ['-c', 'import google.antigravity'], {
+        timeout: 2500,
+        stdio: 'ignore',
+      });
+      available = res.status === 0;
+    } catch {
+      available = false;
+    }
+    this._pySdkCache = { key: cacheKey, available, at: Date.now() };
+    return available ? pyBin : null;
+  }
+
+  probeEngines() {
+    const claudePath = findBinary('claude', [process.env.CLAUDE_BIN]);
+    const codexPath = findBinary('codex', [process.env.CODEX_BIN]);
+    const agyPath = findBinary('agy', [process.env.AGY_BIN]);
+
+    let antigravity;
+    if (agyPath) {
+      antigravity = { available: true, mode: 'cli', path: agyPath, label: 'Antigravity' };
+    } else {
+      const pyBin = this._probePythonAntigravity();
+      if (pyBin) {
+        antigravity = { available: true, mode: 'python-sdk', path: pyBin, label: 'Antigravity' };
+      } else {
+        antigravity = {
+          available: false,
+          mode: 'gui-only',
+          path: null,
+          label: 'Antigravity',
+          note: '本机仅检测到 Antigravity 桌面端（未安装 agy CLI 或 google-antigravity SDK），支持状态通知与打开应用',
+        };
+      }
+    }
+
+    const bridgeFile = this.dataDir ? path.join(this.dataDir, 'dsh-bridge.json') : '';
+    const hasBridgeFile = Boolean(bridgeFile && fs.existsSync(bridgeFile));
+    const dshConnected = Boolean(this.providers?.snapshot?.sources?.find(s => s.id === 'dsh')?.connected);
+    const hasLegacy = Boolean(this.providers?.legacy?.endpoint && this.providers?.legacy?.token);
+    const dshAvailable = Boolean(this.providers && (hasBridgeFile || dshConnected || hasLegacy));
+
+    return {
+      claude: {
+        available: Boolean(claudePath),
+        path: claudePath,
+        label: 'Claude Code',
+      },
+      codex: {
+        available: Boolean(codexPath),
+        path: codexPath,
+        label: 'Codex',
+      },
+      antigravity,
+      dsh: {
+        available: dshAvailable,
+        path: hasBridgeFile ? bridgeFile : null,
+        label: 'DSH',
+        ...(dshAvailable ? {} : { note: '未检测到运行中的 DSH 桥接' }),
+      },
+    };
+  }
+
+  _markDispatched(provider, id) {
+    const clean = cleanMeta(String(id || ''), 256);
+    if (!clean) return;
+    const now = Date.now();
+    for (const [key, ts] of this.dispatchedSessionTimestamps.entries()) {
+      if (now - ts > DISPATCH_SESSION_TTL) {
+        this.dispatchedSessionTimestamps.delete(key);
+        this.dispatchedSessionIds.delete(key);
+      }
+    }
+    const keys = [clean, `${provider}:${clean}`];
+    for (const key of keys) {
+      this.dispatchedSessionIds.add(key);
+      this.dispatchedSessionTimestamps.set(key, now);
+    }
+  }
+
+  isDispatchedSession(sessionId) {
+    if (typeof sessionId !== 'string' || !sessionId) return false;
+    if (this.dispatchedSessionIds.has(sessionId)) return true;
+    const idx = sessionId.indexOf(':');
+    if (idx > 0 && this.dispatchedSessionIds.has(sessionId.slice(idx + 1))) return true;
+    return false;
+  }
+
+  _buildChildEnv(engine) {
+    const home = os.homedir();
+    const extraPath = [
+      path.join(home, '.local', 'bin'),
+      '/opt/homebrew/bin',
+      '/usr/local/bin',
+    ];
+    const currentPath = (process.env.PATH || '').split(path.delimiter).filter(Boolean);
+    const mergedPath = [...new Set([...extraPath, ...currentPath])].join(path.delimiter);
+    const env = {
+      ...process.env,
+      PATH: mergedPath,
+      AGENT_PET_DATA: this.dataDir,
+    };
+    if (engine === 'claude') {
+      delete env.CLAUDECODE;
+      delete env.CLAUDE_CODE_ENTRYPOINT;
+    }
+    return env;
+  }
+
+  _createMirrorSession(provider, workspace, initialSessionId) {
+    let lastAt = 0;
+    let activeSessionId = initialSessionId || null;
+
+    const nextAt = () => {
+      const now = Date.now();
+      lastAt = now > lastAt ? now : lastAt + 1;
+      return lastAt;
+    };
+
+    const emit = (targetSessionId, event, extra = {}) => {
+      if (!targetSessionId || !this.dataDir) return;
+      try {
+        const res = mirrorInboxEvent({
+          dataDir: this.dataDir,
+          provider,
+          sessionId: targetSessionId,
+          event,
+          workspace,
+          at: nextAt(),
+          ...extra,
+        });
+        if (res?.event) this.onMirrorEvent?.(res.event);
+      } catch {}
+    };
+
+    return {
+      get sessionId() {
+        return activeSessionId;
+      },
+      start(tempId) {
+        activeSessionId = activeSessionId || tempId;
+        emit(activeSessionId, 'SessionStart');
+        emit(activeSessionId, 'UserPromptSubmit');
+      },
+      adoptSessionId(realId) {
+        if (!realId || realId === activeSessionId) return;
+        const previousId = activeSessionId;
+        activeSessionId = realId;
+        if (previousId) emit(previousId, 'SessionEnd');
+        emit(activeSessionId, 'SessionStart');
+        emit(activeSessionId, 'UserPromptSubmit');
+      },
+      emit(event, extra = {}) {
+        emit(activeSessionId, event, extra);
+      },
+    };
+  }
+
+  _recordJob(job) {
+    this.jobs.set(job.jobId, job);
+    if (this.jobs.size > MAX_JOBS_HISTORY) {
+      for (const [id, entry] of this.jobs.entries()) {
+        if (this.jobs.size <= MAX_JOBS_HISTORY) break;
+        if (entry.status !== 'running') this.jobs.delete(id);
+      }
+    }
+  }
+
+  async dispatch({ engine, prompt, cwd, sessionId, onProgress } = {}) {
+    const cleanPrompt = typeof prompt === 'string' ? prompt.trim() : '';
+    if (!cleanPrompt) throw new Error('任务内容不能为空');
+
+    const normalizedEngine = String(engine || 'claude').trim().toLowerCase() === 'agy'
+      ? 'antigravity'
+      : String(engine || 'claude').trim().toLowerCase();
+    if (!['claude', 'codex', 'antigravity', 'dsh'].includes(normalizedEngine)) {
+      throw new Error(`不支持的执行引擎: ${engine}`);
+    }
+
+    const validatedCwd = this.validateWorkspace(cwd || this.defaultCwd || os.homedir());
+    const jobId = `job-${randomUUID().slice(0, 12)}`;
+    const job = {
+      jobId,
+      engine: normalizedEngine,
+      cwd: validatedCwd,
+      promptPreview: cleanPrompt.replace(/\s+/g, ' ').slice(0, 80),
+      status: 'running',
+      startedAt: Date.now(),
+      endedAt: null,
+      sessionId: typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : null,
+      error: null,
+      toolsUsed: [],
+      cancelled: false,
+      child: null,
+      abortController: new AbortController(),
+    };
+    this._recordJob(job);
+    this._markDispatched(normalizedEngine, jobId);
+    if (job.sessionId) this._markDispatched(normalizedEngine, job.sessionId);
+
+    try {
+      switch (normalizedEngine) {
+        case 'claude':
+          return await this._dispatchClaude(job, cleanPrompt, onProgress);
+        case 'codex':
+          return await this._dispatchCodex(job, cleanPrompt, onProgress);
+        case 'antigravity':
+          return await this._dispatchAntigravity(job, cleanPrompt, onProgress);
+        case 'dsh':
+          return await this._dispatchDsh(job, cleanPrompt, onProgress);
+      }
+    } catch (err) {
+      if (!job.cancelled) {
+        job.status = 'failed';
+        job.endedAt = Date.now();
+        job.error = err.message;
+      }
+      throw err;
+    }
+  }
+
+  _dispatchClaude(job, prompt, onProgress) {
+    const probes = this.probeEngines();
+    const bin = probes.claude.path;
+    if (!bin) {
+      throw new Error('未检测到 claude CLI，请先安装 Claude Code 或设置 CLAUDE_BIN');
+    }
+
+    const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose'];
+    if (job.sessionId) args.push('--resume', job.sessionId);
+    if (this.sandboxMode === 'auto') args.push('--permission-mode', 'acceptEdits');
+    else if (this.sandboxMode === 'full') args.push('--dangerously-skip-permissions');
+
+    const mirror = this._createMirrorSession('claude', job.cwd, job.sessionId);
+    mirror.start(job.jobId);
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let stdoutBuf = '';
+      let stderrBuf = '';
+      let lastAssistantText = '';
+      let finalResultText = '';
+      let resultIsError = false;
+      const toolsSet = new Set();
+
+      const child = spawn(bin, args, {
+        cwd: job.cwd,
+        env: this._buildChildEnv('claude'),
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      job.child = child;
+      child.stdin?.end();
+
+      const handleLine = line => {
+        const parsed = parseClaudeStreamLine(line);
+        if (!parsed) return;
+
+        if (parsed.sessionId && parsed.sessionId !== job.sessionId) {
+          job.sessionId = parsed.sessionId;
+          this._markDispatched('claude', parsed.sessionId);
+          mirror.adoptSessionId(parsed.sessionId);
+        }
+
+        for (const t of parsed.tools) {
+          if (!toolsSet.has(t.name)) {
+            toolsSet.add(t.name);
+            job.toolsUsed.push(t.name);
+          }
+          mirror.emit('PreToolUse', { tool: t.name, toolId: t.id || t.name });
+          try {
+            onProgress?.({ type: 'tool', tool: t.name, text: `🔧 正在使用 ${t.name}` });
+          } catch {}
+        }
+
+        for (const tr of parsed.toolResults) {
+          mirror.emit(tr.isError ? 'PostToolUseFailure' : 'PostToolUse', {
+            toolId: tr.id || 'tool',
+            hasError: tr.isError,
+          });
+        }
+
+        if (parsed.isResult) {
+          finalResultText = parsed.text || lastAssistantText;
+          resultIsError = parsed.isError;
+        } else if (parsed.text) {
+          lastAssistantText = parsed.text;
+          const preview = cleanMeta(parsed.text, 120);
+          if (preview) {
+            try {
+              onProgress?.({ type: 'text', text: `💬 ${preview}` });
+            } catch {}
+          }
+        }
+      };
+
+      child.stdout.on('data', chunk => {
+        stdoutBuf += chunk.toString('utf8');
+        const lines = stdoutBuf.split('\n');
+        stdoutBuf = lines.pop() ?? '';
+        for (const line of lines) handleLine(line);
+      });
+
+      child.stderr.on('data', chunk => {
+        if (stderrBuf.length < 16384) stderrBuf += chunk.toString('utf8');
+      });
+
+      child.on('error', err => {
+        if (settled) return;
+        settled = true;
+        job.child = null;
+        job.endedAt = Date.now();
+        if (job.cancelled) {
+          job.status = 'cancelled';
+          mirror.emit('Stop', { terminationReason: 'USER_CANCELED' });
+          resolve({
+            jobId: job.jobId,
+            engine: 'claude',
+            status: 'cancelled',
+            sessionId: job.sessionId,
+            text: lastAssistantText || '任务已取消',
+            toolsUsed: [...job.toolsUsed],
+          });
+          return;
+        }
+        job.status = 'failed';
+        job.error = err.message;
+        mirror.emit('StopFailure', { hasError: true });
+        reject(err);
+      });
+
+      child.on('close', code => {
+        if (stdoutBuf.trim()) handleLine(stdoutBuf);
+        stdoutBuf = '';
+        if (settled) return;
+        settled = true;
+        job.child = null;
+        job.endedAt = Date.now();
+
+        const outputText = (finalResultText || lastAssistantText).trim();
+        if (job.cancelled) {
+          job.status = 'cancelled';
+          mirror.emit('Stop', { terminationReason: 'USER_CANCELED' });
+          resolve({
+            jobId: job.jobId,
+            engine: 'claude',
+            status: 'cancelled',
+            sessionId: job.sessionId,
+            text: outputText || '任务已取消',
+            toolsUsed: [...job.toolsUsed],
+          });
+          return;
+        }
+
+        if (code === 0 && !resultIsError) {
+          job.status = 'completed';
+          mirror.emit('Stop');
+          resolve({
+            jobId: job.jobId,
+            engine: 'claude',
+            status: 'completed',
+            sessionId: job.sessionId,
+            text: outputText,
+            toolsUsed: [...job.toolsUsed],
+          });
+          return;
+        }
+
+        const errMsg = (resultIsError ? outputText : '') || stderrBuf.trim() || `Claude Code 退出码 ${code}`;
+        job.status = 'failed';
+        job.error = errMsg;
+        mirror.emit('StopFailure', { hasError: true });
+        resolve({
+          jobId: job.jobId,
+          engine: 'claude',
+          status: 'failed',
+          sessionId: job.sessionId,
+          text: outputText,
+          error: errMsg,
+          toolsUsed: [...job.toolsUsed],
+        });
+      });
+    });
+  }
+
+  _dispatchCodex(job, prompt, onProgress) {
+    const probes = this.probeEngines();
+    const bin = probes.codex.path;
+    if (!bin) {
+      throw new Error('未检测到 codex CLI，请先安装 Codex 或设置 CODEX_BIN');
+    }
+
+    let args;
+    if (job.sessionId) {
+      // `codex exec resume` rejects `-C` and `-s`, so use process cwd + `--full-auto`.
+      args = ['exec', 'resume', '--json', '--skip-git-repo-check'];
+      if (this.sandboxMode === 'full') args.push('--dangerously-bypass-approvals-and-sandbox');
+      else args.push('--full-auto');
+      args.push(job.sessionId, prompt);
+    } else {
+      args = ['exec', '--json', '-C', job.cwd, '--skip-git-repo-check'];
+      if (this.sandboxMode === 'full') {
+        args.push('--dangerously-bypass-approvals-and-sandbox');
+      } else if (this.sandboxMode === 'auto') {
+        args.push('--full-auto');
+      } else if (this.sandboxMode === 'read-only') {
+        args.push('-s', 'read-only');
+      } else {
+        args.push('-s', 'workspace-write', '--full-auto');
+      }
+      args.push(prompt);
+    }
+
+    const mirror = this._createMirrorSession('codex', job.cwd, job.sessionId);
+    mirror.start(job.jobId);
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let stdoutBuf = '';
+      let stderrBuf = '';
+      let lastAgentMessage = '';
+      let turnError = '';
+      const toolsSet = new Set();
+
+      const child = spawn(bin, args, {
+        cwd: job.cwd,
+        env: this._buildChildEnv('codex'),
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      job.child = child;
+      child.stdin?.end();
+
+      const handleLine = line => {
+        const parsed = parseCodexJsonLine(line);
+        if (!parsed) return;
+
+        if (parsed.type === 'thread.started' && parsed.sessionId) {
+          job.sessionId = parsed.sessionId;
+          this._markDispatched('codex', parsed.sessionId);
+          mirror.adoptSessionId(parsed.sessionId);
+          return;
+        }
+
+        if (parsed.type === 'item.started' && parsed.tool) {
+          if (!toolsSet.has(parsed.tool)) {
+            toolsSet.add(parsed.tool);
+            job.toolsUsed.push(parsed.tool);
+          }
+          mirror.emit('PreToolUse', { tool: parsed.tool, toolId: parsed.toolId || parsed.tool });
+          try {
+            onProgress?.({ type: 'tool', tool: parsed.tool, text: `🔧 ${parsed.toolSummary || parsed.tool}` });
+          } catch {}
+          return;
+        }
+
+        if (parsed.type === 'item.completed') {
+          if (parsed.itemType === 'agent_message' || parsed.itemType === 'message') {
+            if (parsed.text) {
+              lastAgentMessage = parsed.text;
+              const preview = cleanMeta(parsed.text, 120);
+              if (preview) {
+                try {
+                  onProgress?.({ type: 'text', text: `💬 ${preview}` });
+                } catch {}
+              }
+            }
+          } else if (parsed.tool) {
+            if (!toolsSet.has(parsed.tool)) {
+              toolsSet.add(parsed.tool);
+              job.toolsUsed.push(parsed.tool);
+            }
+            mirror.emit(parsed.hasError ? 'PostToolUseFailure' : 'PostToolUse', {
+              tool: parsed.tool,
+              toolId: parsed.toolId || parsed.tool,
+              hasError: parsed.hasError,
+            });
+          }
+          return;
+        }
+
+        if (parsed.type === 'turn.failed' || parsed.type === 'error') {
+          if (parsed.errorMessage) turnError = parsed.errorMessage;
+        }
+      };
+
+      child.stdout.on('data', chunk => {
+        stdoutBuf += chunk.toString('utf8');
+        const lines = stdoutBuf.split('\n');
+        stdoutBuf = lines.pop() ?? '';
+        for (const line of lines) handleLine(line);
+      });
+
+      child.stderr.on('data', chunk => {
+        if (stderrBuf.length < 16384) stderrBuf += chunk.toString('utf8');
+      });
+
+      child.on('error', err => {
+        if (settled) return;
+        settled = true;
+        job.child = null;
+        job.endedAt = Date.now();
+        if (job.cancelled) {
+          job.status = 'cancelled';
+          mirror.emit('Stop', { terminationReason: 'USER_CANCELED' });
+          resolve({
+            jobId: job.jobId,
+            engine: 'codex',
+            status: 'cancelled',
+            sessionId: job.sessionId,
+            text: lastAgentMessage || '任务已取消',
+            toolsUsed: [...job.toolsUsed],
+          });
+          return;
+        }
+        job.status = 'failed';
+        job.error = err.message;
+        mirror.emit('StopFailure', { hasError: true });
+        reject(err);
+      });
+
+      child.on('close', code => {
+        if (stdoutBuf.trim()) handleLine(stdoutBuf);
+        stdoutBuf = '';
+        if (settled) return;
+        settled = true;
+        job.child = null;
+        job.endedAt = Date.now();
+
+        const outputText = lastAgentMessage.trim();
+        if (job.cancelled) {
+          job.status = 'cancelled';
+          mirror.emit('Stop', { terminationReason: 'USER_CANCELED' });
+          resolve({
+            jobId: job.jobId,
+            engine: 'codex',
+            status: 'cancelled',
+            sessionId: job.sessionId,
+            text: outputText || '任务已取消',
+            toolsUsed: [...job.toolsUsed],
+          });
+          return;
+        }
+
+        if (code === 0 && !turnError) {
+          job.status = 'completed';
+          mirror.emit('Stop');
+          resolve({
+            jobId: job.jobId,
+            engine: 'codex',
+            status: 'completed',
+            sessionId: job.sessionId,
+            text: outputText,
+            toolsUsed: [...job.toolsUsed],
+          });
+          return;
+        }
+
+        const errMsg = turnError || stderrBuf.trim() || `Codex 退出码 ${code}`;
+        job.status = 'failed';
+        job.error = errMsg;
+        mirror.emit('StopFailure', { hasError: true });
+        resolve({
+          jobId: job.jobId,
+          engine: 'codex',
+          status: 'failed',
+          sessionId: job.sessionId,
+          text: outputText,
+          error: errMsg,
+          toolsUsed: [...job.toolsUsed],
+        });
+      });
+    });
+  }
+
+  _dispatchAntigravity(job, prompt, onProgress) {
+    const probes = this.probeEngines();
+    const info = probes.antigravity;
+    if (!info.available) {
+      throw new Error('当前未检测到 Antigravity CLI (agy) 或 Python SDK，仅支持桌面端状态监听与 /open antigravity 打开应用；直接派活请使用 @claude、@codex 或 @dsh');
+    }
+
+    const mirror = this._createMirrorSession('antigravity', job.cwd, job.sessionId);
+    mirror.start(job.jobId);
+
+    let bin;
+    let args;
+    let stdinText = null;
+
+    if (info.mode === 'cli') {
+      bin = info.path;
+      args = job.sessionId ? ['-p', prompt, '--resume', job.sessionId] : ['-p', prompt];
+    } else {
+      bin = info.path;
+      const pyScript = [
+        'import asyncio, os, sys',
+        'from google.antigravity import Agent, LocalAgentConfig, CapabilitiesConfig',
+        'async def main():',
+        '    prompt = sys.stdin.read()',
+        `    cfg = LocalAgentConfig(${this.sandboxMode === 'read-only' ? '' : 'capabilities=CapabilitiesConfig()'})`,
+        '    async with Agent(cfg) as agent:',
+        '        resp = await agent.chat(prompt)',
+        '        async for token in resp:',
+        '            sys.stdout.write(token)',
+        '            sys.stdout.flush()',
+        'asyncio.run(main())',
+      ].join('\n');
+      args = ['-c', pyScript];
+      stdinText = prompt;
+    }
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let stdoutText = '';
+      let stderrText = '';
+
+      const child = spawn(bin, args, {
+        cwd: job.cwd,
+        env: this._buildChildEnv('antigravity'),
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      job.child = child;
+      if (stdinText !== null) child.stdin?.end(stdinText);
+      else child.stdin?.end();
+
+      child.stdout.on('data', chunk => {
+        const piece = chunk.toString('utf8');
+        stdoutText += piece;
+        const preview = cleanMeta(piece, 120);
+        if (preview) {
+          try {
+            onProgress?.({ type: 'text', text: `💬 ${preview}` });
+          } catch {}
+        }
+      });
+
+      child.stderr.on('data', chunk => {
+        if (stderrText.length < 16384) stderrText += chunk.toString('utf8');
+      });
+
+      child.on('error', err => {
+        if (settled) return;
+        settled = true;
+        job.child = null;
+        job.endedAt = Date.now();
+        if (job.cancelled) {
+          job.status = 'cancelled';
+          mirror.emit('Stop', { terminationReason: 'USER_CANCELED' });
+          resolve({
+            jobId: job.jobId,
+            engine: 'antigravity',
+            status: 'cancelled',
+            sessionId: job.sessionId,
+            text: stdoutText.trim() || '任务已取消',
+            toolsUsed: [],
+          });
+          return;
+        }
+        job.status = 'failed';
+        job.error = err.message;
+        mirror.emit('StopFailure', { hasError: true });
+        reject(err);
+      });
+
+      child.on('close', code => {
+        if (settled) return;
+        settled = true;
+        job.child = null;
+        job.endedAt = Date.now();
+
+        const outputText = stdoutText.trim();
+        if (job.cancelled) {
+          job.status = 'cancelled';
+          mirror.emit('Stop', { terminationReason: 'USER_CANCELED' });
+          resolve({
+            jobId: job.jobId,
+            engine: 'antigravity',
+            status: 'cancelled',
+            sessionId: job.sessionId,
+            text: outputText || '任务已取消',
+            toolsUsed: [],
+          });
+          return;
+        }
+
+        if (code === 0) {
+          job.status = 'completed';
+          mirror.emit('Stop');
+          resolve({
+            jobId: job.jobId,
+            engine: 'antigravity',
+            status: 'completed',
+            sessionId: job.sessionId,
+            text: outputText,
+            toolsUsed: [],
+          });
+          return;
+        }
+
+        const errMsg = stderrText.trim() || `Antigravity 退出码 ${code}`;
+        job.status = 'failed';
+        job.error = errMsg;
+        mirror.emit('StopFailure', { hasError: true });
+        resolve({
+          jobId: job.jobId,
+          engine: 'antigravity',
+          status: 'failed',
+          sessionId: job.sessionId,
+          text: outputText,
+          error: errMsg,
+          toolsUsed: [],
+        });
+      });
+    });
+  }
+
+  async _dispatchDsh(job, prompt, onProgress) {
+    if (!this.providers || typeof this.providers.dsh !== 'function') {
+      throw new Error('DSH 桥接不可用，请确认 DSH 正在运行');
+    }
+
+    let activeSessionId = job.sessionId;
+    let baselineSeq = -1;
+    let baselineAssistantCount = 0;
+
+    if (activeSessionId) {
+      const baselineConv = await this.providers.dsh({ action: 'conversation', sessionId: activeSessionId }).catch(() => null);
+      if (baselineConv) {
+        if (Number.isFinite(baselineConv.lastSeq)) baselineSeq = baselineConv.lastSeq;
+        if (Array.isArray(baselineConv.messages)) {
+          baselineAssistantCount = baselineConv.messages.filter(m => m.role === 'assistant').length;
+        }
+      }
+      await this.providers.dsh({
+        action: 'prompt',
+        sessionId: activeSessionId,
+        requestId: randomUUID(),
+        content: [{ type: 'text', text: prompt }],
+        text: prompt,
+      });
+    } else {
+      const candidateId = `session-${randomUUID()}`;
+      const created = await this.providers.dsh({
+        action: 'create',
+        sessionId: candidateId,
+        text: prompt,
+        cwd: job.cwd,
+      });
+      activeSessionId = created?.sessionId || created?.id || candidateId;
+      job.sessionId = activeSessionId;
+      this._markDispatched('dsh', activeSessionId);
+
+      // Real DSH `create` yields an idle empty session and requires an explicit `prompt` RPC;
+      // a test mock that handles `text` inside `create` will already reflect non-idle or messages.
+      const probeConv = await this.providers.dsh({ action: 'conversation', sessionId: activeSessionId }).catch(() => null);
+      const alreadySubmitted = Boolean(
+        created?.promptAccepted ||
+        created?.started ||
+        (probeConv && (probeConv.status !== 'idle' || (Array.isArray(probeConv.messages) && probeConv.messages.length > 0)))
+      );
+      if (!alreadySubmitted) {
+        await this.providers.dsh({
+          action: 'prompt',
+          sessionId: activeSessionId,
+          requestId: randomUUID(),
+          content: [{ type: 'text', text: prompt }],
+          text: prompt,
+        });
+      }
+    }
+
+    job.sessionId = activeSessionId;
+    this._markDispatched('dsh', activeSessionId);
+
+    const deadline = Date.now() + this.dshTimeoutMs;
+    let lastDetail = '';
+    let sawRunning = false;
+
+    const sleepAbortable = ms => new Promise(resolve => {
+      if (job.cancelled || job.abortController.signal.aborted) {
+        resolve();
+        return;
+      }
+      const timer = setTimeout(() => {
+        job.abortController.signal.removeEventListener('abort', onAbort);
+        resolve();
+      }, ms);
+      const onAbort = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      job.abortController.signal.addEventListener('abort', onAbort, { once: true });
+    });
+
+    while (Date.now() < deadline) {
+      if (job.cancelled) {
+        job.status = 'cancelled';
+        job.endedAt = Date.now();
+        return {
+          jobId: job.jobId,
+          engine: 'dsh',
+          status: 'cancelled',
+          sessionId: activeSessionId,
+          text: '任务已取消',
+          toolsUsed: [],
+        };
+      }
+
+      const [listRes, conv] = await Promise.all([
+        this.providers.dsh({ action: 'list' }).catch(() => null),
+        this.providers.dsh({ action: 'conversation', sessionId: activeSessionId }).catch(() => null),
+      ]);
+
+      if (job.cancelled) continue;
+
+      const listItem = Array.isArray(listRes?.items)
+        ? listRes.items.find(row => row.sessionId === activeSessionId || row.sessionId === `dsh:${activeSessionId}`)
+        : null;
+
+      const status = conv?.status || listItem?.status || '';
+      const detail = conv?.detail || listItem?.detail || '';
+      if (status === 'running') sawRunning = true;
+
+      if (detail && detail !== lastDetail && ['running', 'waiting'].includes(status)) {
+        lastDetail = detail;
+        try {
+          onProgress?.({ type: 'status', text: status === 'waiting' ? `⏳ ${detail}` : detail });
+        } catch {}
+      }
+
+      const assistantMsgs = Array.isArray(conv?.messages)
+        ? conv.messages.filter(m => m.role === 'assistant' && typeof m.text === 'string' && m.text.trim())
+        : [];
+      const hasNewReply = assistantMsgs.length > baselineAssistantCount ||
+        (Number.isFinite(conv?.lastSeq) && conv.lastSeq > baselineSeq && assistantMsgs.length > 0);
+
+      if (status === 'ready' || status === 'completed' || (!status && hasNewReply)) {
+        if (hasNewReply || sawRunning || baselineSeq < 0) {
+          const replyText = assistantMsgs.length
+            ? assistantMsgs[assistantMsgs.length - 1].text
+            : (typeof conv?.text === 'string' ? conv.text : (typeof conv?.reply === 'string' ? conv.reply : ''));
+          job.status = 'completed';
+          job.endedAt = Date.now();
+          return {
+            jobId: job.jobId,
+            engine: 'dsh',
+            status: 'completed',
+            sessionId: activeSessionId,
+            text: (replyText || detail || '本轮已完成').trim(),
+            toolsUsed: [],
+          };
+        }
+      }
+
+      if (status === 'blocked' || status === 'failed') {
+        const errMsg = detail || 'DSH 执行受阻';
+        job.status = 'failed';
+        job.endedAt = Date.now();
+        job.error = errMsg;
+        return {
+          jobId: job.jobId,
+          engine: 'dsh',
+          status: 'failed',
+          sessionId: activeSessionId,
+          text: '',
+          error: errMsg,
+          toolsUsed: [],
+        };
+      }
+
+      if (status === 'cancelled' || status === 'aborted') {
+        job.status = 'cancelled';
+        job.endedAt = Date.now();
+        return {
+          jobId: job.jobId,
+          engine: 'dsh',
+          status: 'cancelled',
+          sessionId: activeSessionId,
+          text: '任务已取消',
+          toolsUsed: [],
+        };
+      }
+
+      await sleepAbortable(this.dshPollIntervalMs);
+    }
+
+    job.status = 'failed';
+    job.endedAt = Date.now();
+    job.error = '等待 DSH 回复超时';
+    return {
+      jobId: job.jobId,
+      engine: 'dsh',
+      status: 'failed',
+      sessionId: activeSessionId,
+      text: '',
+      error: '等待 DSH 回复超时，请在桌面端查看该会话',
+      toolsUsed: [],
+    };
+  }
+
+  async stopJob(jobId) {
+    let target = null;
+    if (jobId) {
+      const candidate = this.jobs.get(jobId);
+      if (!candidate || candidate.status !== 'running') {
+        return { stopped: false, reason: '未找到运行中的任务', jobId };
+      }
+      target = candidate;
+    } else {
+      const reversed = [...this.jobs.values()].reverse();
+      target = reversed.find(j => j.status === 'running') || null;
+      if (!target) {
+        return { stopped: false, reason: '当前没有运行中的任务' };
+      }
+    }
+
+    target.cancelled = true;
+    target.status = 'cancelled';
+    target.endedAt = Date.now();
+    target.abortController?.abort();
+
+    if (target.child) {
+      const child = target.child;
+      try { child.kill('SIGTERM'); } catch {}
+      const killTimer = setTimeout(() => {
+        try {
+          if (child.exitCode === null && child.signalCode === null) {
+            child.kill('SIGKILL');
+          }
+        } catch {}
+      }, 3000);
+      killTimer.unref?.();
+    }
+
+    if (target.engine === 'dsh' && target.sessionId && this.providers) {
+      await this.providers.dsh({ action: 'cancel', sessionId: target.sessionId }).catch(() => {});
+    }
+
+    return {
+      stopped: true,
+      jobId: target.jobId,
+      engine: target.engine,
+      sessionId: target.sessionId || null,
+    };
+  }
+
+  listJobs(limit = 20) {
+    const max = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 20;
+    return [...this.jobs.values()]
+      .reverse()
+      .slice(0, max)
+      .map(job => ({
+        jobId: job.jobId,
+        engine: job.engine,
+        cwd: job.cwd,
+        promptPreview: job.promptPreview,
+        status: job.status,
+        startedAt: job.startedAt,
+        endedAt: job.endedAt || null,
+        sessionId: job.sessionId || null,
+        error: job.error || null,
+        toolsUsed: Array.isArray(job.toolsUsed) ? [...job.toolsUsed] : [],
+      }));
+  }
+}
+
+module.exports = {
+  TaskDispatcher,
+  parseClaudeStreamLine,
+  parseCodexJsonLine,
+  sanitizeWorkspace,
+  mirrorInboxEvent,
+};

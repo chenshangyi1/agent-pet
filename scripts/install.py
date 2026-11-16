@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install Agent Pet app and default DSH connector without touching other agents unless requested."""
+"""Install Agent Pet app cleanly in standalone mode (and optional DSH bridge when present)."""
 import argparse
 from pathlib import Path
 import datetime
@@ -9,13 +9,12 @@ import plistlib
 import shlex
 import shutil
 import subprocess
-import sys
 
 root = Path(__file__).resolve().parent.parent
 user = Path.home()
-data = Path(os.environ.get('AGENT_PET_DATA') or (user / '.dsh/companion'))
+data = Path(os.environ.get('AGENT_PET_DATA') or os.environ.get('DSH_COMPANION_DATA') or (user / '.dsh/companion'))
 backup = data / 'backups' / ('agent-pet-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S'))
-backup.mkdir(parents=True, mode=0o700)
+backup.mkdir(parents=True, mode=0o700, exist_ok=True)
 
 
 def save_json(target, value):
@@ -24,6 +23,30 @@ def save_json(target, value):
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + '\n')
     temporary.chmod(0o600)
     os.replace(temporary, target)
+
+
+def resolve_electron():
+    override = os.environ.get('AGENT_PET_ELECTRON', '').strip()
+    if override:
+        override_path = Path(override).expanduser()
+        if override_path.is_file():
+            return override_path
+        found = shutil.which(override)
+        if found:
+            return Path(found)
+
+    which_electron = shutil.which('electron')
+    candidates = [
+        root / 'node_modules/.bin/electron',
+        root / 'node_modules/electron/dist/Electron.app/Contents/MacOS/Electron',
+        Path('/Applications/Electron.app/Contents/MacOS/Electron'),
+        Path(which_electron) if which_electron else None,
+        user / '.dsh/electron/Electron.app/Contents/MacOS/Electron',
+    ]
+    for candidate in candidates:
+        if candidate and candidate.is_file():
+            return candidate
+    return None
 
 
 def install_dsh_profile():
@@ -51,16 +74,38 @@ def install_dsh_profile():
 def install_app():
     app = user / 'Applications/Agent Pet.app'
     if app.exists():
-        shutil.copytree(app, backup / 'Agent Pet.app')
+        shutil.copytree(app, backup / 'Agent Pet.app', symlinks=True)
     macos = app / 'Contents/MacOS'
     macos.mkdir(parents=True, exist_ok=True)
-    electron = user / '.dsh/electron/Electron.app/Contents/MacOS/Electron'
-    if not electron.exists():
-        alt = root / 'node_modules/electron/dist/Electron.app/Contents/MacOS/Electron'
-        if alt.exists():
-            electron = alt
+    electron = resolve_electron()
     launcher = macos / 'AgentPet'
-    launcher.write_text('#!/bin/sh\nunset ELECTRON_RUN_AS_NODE\nexec ' + shlex.quote(str(electron)) + ' ' + shlex.quote(str(root / 'runtime/main.cjs')) + '\n')
+    main_script = shlex.quote(str(root / 'runtime/main.cjs'))
+    if electron is not None:
+        launcher.write_text(
+            '#!/bin/sh\n'
+            'unset ELECTRON_RUN_AS_NODE\n'
+            f'exec {shlex.quote(str(electron))} {main_script}\n'
+        )
+    else:
+        fallback_lines = [
+            '#!/bin/sh',
+            'unset ELECTRON_RUN_AS_NODE',
+            'for bin in \\',
+            '  "$AGENT_PET_ELECTRON" \\',
+            f'  {shlex.quote(str(root / "node_modules/.bin/electron"))} \\',
+            f'  {shlex.quote(str(root / "node_modules/electron/dist/Electron.app/Contents/MacOS/Electron"))} \\',
+            '  "/Applications/Electron.app/Contents/MacOS/Electron" \\',
+            '  "$(command -v electron 2>/dev/null)" \\',
+            '  "$HOME/.dsh/electron/Electron.app/Contents/MacOS/Electron"; do',
+            '  if [ -n "$bin" ] && [ -x "$bin" ]; then',
+            f'    exec "$bin" {main_script}',
+            '  fi',
+            'done',
+            'echo "Agent Pet: Electron runtime not found. Set AGENT_PET_ELECTRON or install Electron." >&2',
+            'exit 1',
+            '',
+        ]
+        launcher.write_text('\n'.join(fallback_lines))
     launcher.chmod(0o755)
     with (app / 'Contents/Info.plist').open('wb') as stream:
         plistlib.dump({
@@ -74,6 +119,7 @@ def install_app():
             'NSMicrophoneUsageDescription': '用于桌宠小鑫的语音输入',
             'NSSpeechRecognitionUsageDescription': '用于桌宠小鑫识别你的语音并与 AI 对话',
         }, stream)
+    return electron
 
 
 def enable_connectors(targets):
@@ -105,7 +151,7 @@ def main():
     if not connectors_file.exists():
         save_json(connectors_file, {'v': 1, 'enabled': ['dsh']})
 
-    install_app()
+    electron = install_app()
 
     extra = []
     if args.all:
@@ -113,9 +159,13 @@ def main():
     elif args.enable.strip():
         extra = enable_connectors([part.strip() for part in args.enable.split(',') if part.strip()])
 
-    print('Installed Agent Pet.app' + (' + DSH bridge' if dsh_ok else ''))
-    print('Default enabled connectors: dsh' + (f", {', '.join(extra)}" if extra else ''))
-    print('Open the Manager (+ button in NotchPanel or tray -> 管理 AI Agent...) to connect other local AI Agents.')
+    if dsh_ok:
+        print('Installed Agent Pet.app + DSH bridge')
+    else:
+        print('Installed Agent Pet.app (standalone mode — DSH not detected, running independently)')
+    print('Electron runtime:', str(electron) if electron else 'not found at install time (launcher will search at runtime; set AGENT_PET_ELECTRON or install Electron)')
+    print('Enabled connectors: dsh' + (f", {', '.join(extra)}" if extra else ''))
+    print('Open Manager (+ in NotchPanel or tray -> 管理 AI Agent... / Bot 派活与通知...) or run `npm run bot` for headless gateway.')
     print('Backup:', backup)
 
 
