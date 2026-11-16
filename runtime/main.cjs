@@ -7,12 +7,13 @@ const { homedir } = require('node:os');
 const { execFile } = require('node:child_process');
 const { createServer } = require('node:http');
 const { randomBytes, timingSafeEqual } = require('node:crypto');
-const { Providers } = require('./providers.cjs');
+const { Providers, sortRows } = require('./providers.cjs');
 const { createNotch } = require('./notch.cjs');
 const { layoutPet } = require('./placement.cjs');
 const { ConnectorRegistry } = require('../connectors/registry.cjs');
 const { CATALOG_BY_ID } = require('../connectors/catalog.cjs');
 const { LocalSpeech } = require('./local-speech.cjs');
+const { AutoStartManager } = require('./autostart.cjs');
 const { BotService } = require('../bot/service.cjs');
 app.setName('Agent Pet');
 const dataDir = process.env.AGENT_PET_DATA || process.env.DSH_COMPANION_DATA || path.join(homedir(), '.dsh/companion');
@@ -33,6 +34,7 @@ mkdirSync(dataDir, { recursive: true, mode: 0o700 });
 app.setPath('userData', path.join(dataDir, 'electron'));
 const registry = new ConnectorRegistry({ rootDir: path.dirname(__dirname), dataDir });
 const localSpeech = new LocalSpeech({ rootDir: path.dirname(__dirname) });
+const autoStart = new AutoStartManager({ rootDir: path.dirname(__dirname) });
 const providers = new Providers(dataDir, { endpoint, token }, { enabledProviders: registry.enabledIds() });
 if (!app.requestSingleInstanceLock()) { app.quit(); } else {
 app.on('second-instance', () => { if (process.env.AGENT_PET_SHOW_ON_LAUNCH === '1') showPet(); });
@@ -125,6 +127,17 @@ function menuTemplate() {
     { label: '仅显示控制条', type: 'checkbox', checked: Boolean(settings.controlOnly), click: () => setControlOnly(!settings.controlOnly) },
     { label: '重置位置', click: resetPosition },
     { label: '隐藏小鑫', click: hidePet },
+    {
+      label: '开机自动启动',
+      type: 'checkbox',
+      checked: autoStart.isEnabled(),
+      click: () => {
+        autoStart.setEnabled(!autoStart.isEnabled());
+        if (managerWin && !managerWin.isDestroyed() && botService) {
+          managerWin.webContents.send('companion:bot-updated', { ...botService.getState(), autoStart: autoStart.isEnabled() });
+        }
+      },
+    },
     { type: 'separator' },
     { label: '退出小鑫', click: () => app.quit() },
   ];
@@ -149,15 +162,51 @@ async function rpc(body) {
     throw error;
   }
 }
+const INTERACTIVE_ACTIONS = new Set(['create', 'prompt', 'conversation', 'cancel', 'models', 'selectModel', 'skills', 'files']);
+const DIRECT_CHAT_SOURCES = new Set(['auto', 'dsh', 'claude', 'codex']);
+
 async function agentAction(body) {
-  if (body.action === 'list') { await providers.refresh(); return providers.list(settings.source); }
-  if (body.action === 'info') {
-    try {
-      const info = await rpc(body);
-      return { ...info, speechAvailable: Boolean(info.speechAvailable || localSpeech.hasRecognizer()), source: settings.source };
-    } catch {
-      return { connected: false, speechAvailable: localSpeech.hasRecognizer(), source: settings.source };
+  if (body.action === 'list') {
+    await providers.refresh();
+    const base = providers.list(settings.source);
+    const localItems = botService?.localChat ? botService.localChat.listSessions(settings.source) : [];
+    if (!localItems.length) return base;
+    const mergedMap = new Map();
+    for (const item of base.items || []) {
+      if (item?.sessionId) mergedMap.set(item.sessionId, item);
     }
+    for (const item of localItems) {
+      if (!item?.sessionId) continue;
+      const prev = mergedMap.get(item.sessionId);
+      if (!prev || Number(item.updatedAt || 0) >= Number(prev.updatedAt || 0)) {
+        mergedMap.set(item.sessionId, item);
+      }
+    }
+    return { ...base, items: sortRows([...mergedMap.values()]) };
+  }
+  if (body.action === 'info') {
+    const localEngine = botService?.localChat?.resolveEngine(settings.source)
+      || (settings.source === 'codex' ? 'codex' : 'claude');
+    if (['dsh', 'auto'].includes(settings.source)) {
+      try {
+        const info = await rpc(body);
+        return {
+          ...info,
+          connected: true,
+          dshConnected: true,
+          localEngine,
+          speechAvailable: Boolean(info.speechAvailable || localSpeech.hasRecognizer()),
+          source: settings.source,
+        };
+      } catch {}
+    }
+    return {
+      connected: true,
+      dshConnected: false,
+      localEngine,
+      speechAvailable: localSpeech.hasRecognizer(),
+      source: settings.source,
+    };
   }
   if (body.action === 'speak') return localSpeech.speak(body.text);
   if (body.action === 'speak-stop') { localSpeech.stopSpeaking(); return { stopped: true }; }
@@ -169,19 +218,52 @@ async function agentAction(body) {
     return localSpeech.transcribeWave(body.audio, typeof body.locale === 'string' ? body.locale : 'zh-CN');
   }
   const sessionId = String(body.sessionId || '');
+  const isLocalSession = Boolean(botService?.localChat?.isLocalSessionId(sessionId));
+  if (isLocalSession) {
+    if (['focus', 'home'].includes(body.action)) {
+      const localRow = botService.localChat.listSessions(settings.source).find(row => row.sessionId === sessionId);
+      const localProvider = localRow?.provider;
+      if (localProvider && CATALOG_BY_ID[localProvider]?.bundleId) {
+        return openBundle(localProvider).catch(() => ({ opened: true }));
+      }
+      return { opened: true };
+    }
+    if (INTERACTIVE_ACTIONS.has(body.action)) {
+      return botService.localChat.handleAction(body, settings.source);
+    }
+  }
   const prefixIdx = sessionId.indexOf(':');
   const sessionProvider = prefixIdx > 0 ? sessionId.slice(0, prefixIdx) : '';
   const targetProvider = isReadOnlyConnector(sessionProvider)
     ? sessionProvider
-    : (body.action === 'home' && isReadOnlyConnector(settings.source) ? settings.source : null);
+    : (['focus', 'home'].includes(body.action) && isReadOnlyConnector(settings.source) ? settings.source : null);
   if (targetProvider) {
     if (['focus', 'home'].includes(body.action)) return openBundle(targetProvider);
     throw new Error(`请在 ${CATALOG_BY_ID[targetProvider].label} 中继续此任务`);
   }
+  if (INTERACTIVE_ACTIONS.has(body.action)) {
+    if (['claude', 'codex'].includes(settings.source)) {
+      if (!botService?.localChat) throw new Error('本地对话服务尚未就绪');
+      return botService.localChat.handleAction(body, settings.source);
+    }
+    if (['auto', 'dsh'].includes(settings.source)) {
+      const dshOnline = Boolean(providers.snapshot?.sources?.find(row => row.id === 'dsh')?.connected);
+      if (dshOnline) {
+        try {
+          return await rpc(body);
+        } catch (error) {
+          if (error?.message !== 'DSH 尚未运行' || !botService?.localChat) throw error;
+          return botService.localChat.handleAction(body, settings.source);
+        }
+      }
+      if (!botService?.localChat) throw new Error('DSH 尚未运行');
+      return botService.localChat.handleAction(body, settings.source);
+    }
+  }
   if (isReadOnlyConnector(settings.source) && !body.sessionId && !['list', 'info'].includes(body.action)) {
     throw new Error(`请在 ${CATALOG_BY_ID[settings.source].label} 中新建任务`);
   }
-  return ['focus','home'].includes(body.action) ? openDsh(body) : rpc(body);
+  return ['focus', 'home'].includes(body.action) ? openDsh(body) : rpc(body);
 }
 function applyDesktop(command, value) {
   switch (command) {
@@ -250,7 +332,7 @@ function openManagerWindow(initialTab = 'connectors') {
     managerWin.show();
     managerWin.focus();
     managerWin.webContents.send('companion:connectors-updated', registry.detectAll());
-    if (botService) managerWin.webContents.send('companion:bot-updated', botService.getState());
+    if (botService) managerWin.webContents.send('companion:bot-updated', { ...botService.getState(), autoStart: autoStart.isEnabled() });
     managerWin.webContents.send('companion:manager-tab', tab);
     return;
   }
@@ -299,9 +381,15 @@ ipcMain.handle('companion:bot', async (event, body) => {
   trustedManager(event);
   if (!botService) throw new Error('Bot 服务尚未初始化');
   const action = body?.action;
-  if (action === 'state') return botService.getState();
-  if (action === 'save') return botService.saveConfig(body?.config || {});
-  if (action === 'pair') return botService.regeneratePairingCode();
+  if (action === 'state') return { ...botService.getState(), autoStart: autoStart.isEnabled() };
+  if (action === 'autostart') {
+    const res = await autoStart.setEnabled(Boolean(body?.enabled));
+    const next = { ...botService.getState(), ...res, autoStart: autoStart.isEnabled() };
+    if (managerWin && !managerWin.isDestroyed()) managerWin.webContents.send('companion:bot-updated', next);
+    return next;
+  }
+  if (action === 'save') return { ...(await botService.saveConfig(body?.config || {})), autoStart: autoStart.isEnabled() };
+  if (action === 'pair') return { ...botService.regeneratePairingCode(), autoStart: autoStart.isEnabled() };
   if (action === 'test') return botService.testPush(String(body?.channel || ''));
   if (action === 'stop-job') return botService.stopJob(body?.jobId);
   if (action === 'browse-cwd') {
@@ -376,7 +464,7 @@ app.whenReady().then(async () => {
     openApp: id => (id === 'dsh' ? openDsh() : openBundle(id)),
   });
   botService.on('updated', state => {
-    if (managerWin && !managerWin.isDestroyed()) managerWin.webContents.send('companion:bot-updated', state);
+    if (managerWin && !managerWin.isDestroyed()) managerWin.webContents.send('companion:bot-updated', { ...state, autoStart: autoStart.isEnabled() });
   });
   try {
     await botService.start();
@@ -423,7 +511,7 @@ app.whenReady().then(async () => {
     }).catch(() => {});
   }, 1500);
   const shortcut = process.env.DSH_COMPANION_SHORTCUT || 'Alt+Space';
-  const shortcutOk = globalShortcut.register(shortcut, () => showPet(!isReadOnlyConnector(settings.source)));
+  const shortcutOk = globalShortcut.register(shortcut, () => showPet(DIRECT_CHAT_SOURCES.has(settings.source)));
   writeFileSync(path.join(dataDir, 'desktop-runtime.json'), JSON.stringify({ pid: process.pid, hostPid, shortcut, shortcutRegistered: shortcutOk, ready: true, mode: 'multi-agent', project: path.dirname(__dirname) }), { mode: 0o600 });
   process.stdout.write('[companion] pet ready\n');
   // A photographic character is illegible at menu-bar size, so the tray uses a

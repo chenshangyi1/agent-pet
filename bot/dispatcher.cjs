@@ -3,7 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const { spawn, spawnSync } = require('node:child_process');
+const { execFile, spawn, spawnSync } = require('node:child_process');
 const { randomBytes, randomUUID } = require('node:crypto');
 
 const BAD_IDS = new Set(['__proto__', 'constructor', 'prototype']);
@@ -38,6 +38,24 @@ function expandHome(inputPath) {
 function cleanMeta(value, limit) {
   if (typeof value !== 'string') return '';
   return value.replace(/\s+/g, ' ').trim().slice(0, limit);
+}
+
+function normalizeImages(images) {
+  if (!Array.isArray(images)) return [];
+  const valid = [];
+  const seen = new Set();
+  for (const raw of images) {
+    if (typeof raw !== 'string' || !raw.trim()) continue;
+    const resolved = path.resolve(expandHome(raw));
+    if (seen.has(resolved)) continue;
+    try {
+      if (fs.statSync(resolved).isFile()) {
+        seen.add(resolved);
+        valid.push(resolved);
+      }
+    } catch {}
+  }
+  return valid;
 }
 
 function isExecutableFile(filePath) {
@@ -582,7 +600,7 @@ class TaskDispatcher {
     }
   }
 
-  async dispatch({ engine, prompt, cwd, sessionId, onProgress } = {}) {
+  async dispatch({ engine, prompt, cwd, sessionId, images, onProgress } = {}) {
     const cleanPrompt = typeof prompt === 'string' ? prompt.trim() : '';
     if (!cleanPrompt) throw new Error('任务内容不能为空');
 
@@ -594,6 +612,7 @@ class TaskDispatcher {
     }
 
     const validatedCwd = this.validateWorkspace(cwd || this.defaultCwd || os.homedir());
+    const validImages = normalizeImages(images);
     const jobId = `job-${randomUUID().slice(0, 12)}`;
     const job = {
       jobId,
@@ -604,6 +623,7 @@ class TaskDispatcher {
       startedAt: Date.now(),
       endedAt: null,
       sessionId: typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : null,
+      images: validImages,
       error: null,
       toolsUsed: [],
       cancelled: false,
@@ -642,8 +662,20 @@ class TaskDispatcher {
       throw new Error('未检测到 claude CLI，请先安装 Claude Code 或设置 CLAUDE_BIN');
     }
 
-    const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose'];
+    const images = Array.isArray(job.images) ? job.images : [];
+    const effectivePrompt = images.length > 0
+      ? `[附加图片路径: ${images.join(', ')} — 请先读取查看图片内容]\n${prompt}`
+      : prompt;
+    const args = ['-p', effectivePrompt, '--output-format', 'stream-json', '--verbose'];
     if (job.sessionId) args.push('--resume', job.sessionId);
+    const addedDirs = new Set();
+    for (const imgPath of images) {
+      const dir = path.dirname(imgPath);
+      if (!addedDirs.has(dir)) {
+        addedDirs.add(dir);
+        args.push('--add-dir', dir);
+      }
+    }
     if (this.sandboxMode === 'auto') args.push('--permission-mode', 'acceptEdits');
     else if (this.sandboxMode === 'full') args.push('--dangerously-skip-permissions');
 
@@ -805,12 +837,16 @@ class TaskDispatcher {
       throw new Error('未检测到 codex CLI，请先安装 Codex 或设置 CODEX_BIN');
     }
 
+    const images = Array.isArray(job.images) ? job.images : [];
     let args;
     if (job.sessionId) {
       // `codex exec resume` rejects `-C` and `-s`, so use process cwd + `--full-auto`.
       args = ['exec', 'resume', '--json', '--skip-git-repo-check'];
       if (this.sandboxMode === 'full') args.push('--dangerously-bypass-approvals-and-sandbox');
       else args.push('--full-auto');
+      for (const imgPath of images) {
+        args.push('-i', imgPath);
+      }
       args.push(job.sessionId, prompt);
     } else {
       args = ['exec', '--json', '-C', job.cwd, '--skip-git-repo-check'];
@@ -822,6 +858,9 @@ class TaskDispatcher {
         args.push('-s', 'read-only');
       } else {
         args.push('-s', 'workspace-write', '--full-auto');
+      }
+      for (const imgPath of images) {
+        args.push('-i', imgPath);
       }
       args.push(prompt);
     }
@@ -1001,9 +1040,14 @@ class TaskDispatcher {
     let args;
     let stdinText = null;
 
+    const images = Array.isArray(job.images) ? job.images : [];
+    const effectivePrompt = images.length > 0
+      ? `[附加图片路径: ${images.join(', ')}]\n${prompt}`
+      : prompt;
+
     if (info.mode === 'cli') {
       bin = info.path;
-      args = job.sessionId ? ['-p', prompt, '--resume', job.sessionId] : ['-p', prompt];
+      args = job.sessionId ? ['-p', effectivePrompt, '--resume', job.sessionId] : ['-p', effectivePrompt];
     } else {
       bin = info.path;
       const pyScript = [
@@ -1020,7 +1064,7 @@ class TaskDispatcher {
         'asyncio.run(main())',
       ].join('\n');
       args = ['-c', pyScript];
-      stdinText = prompt;
+      stdinText = effectivePrompt;
     }
 
     return new Promise((resolve, reject) => {
@@ -1356,6 +1400,146 @@ class TaskDispatcher {
       engine: target.engine,
       sessionId: target.sessionId || null,
     };
+  }
+
+  _runGit(validatedCwd, args, { allowFail = false, timeoutMs = 10_000 } = {}) {
+    return new Promise((resolve, reject) => {
+      execFile(
+        'git',
+        args,
+        {
+          cwd: validatedCwd,
+          env: this._buildChildEnv('git'),
+          timeout: timeoutMs,
+          maxBuffer: 2 * 1024 * 1024,
+        },
+        (err, stdout = '', stderr = '') => {
+          if (err) {
+            const msg = String(stderr || err.message || '').trim();
+            if (allowFail) {
+              resolve({ ok: false, stdout: String(stdout), stderr: msg });
+              return;
+            }
+            if (/not a git repository/i.test(msg)) {
+              reject(new Error(`当前目录不是 Git 仓库: ${validatedCwd}`));
+              return;
+            }
+            reject(new Error(msg || `git ${args[0]} 执行失败`));
+            return;
+          }
+          resolve({ ok: true, stdout: String(stdout), stderr: String(stderr) });
+        }
+      );
+    });
+  }
+
+  async gitDiff(cwd, subpath = '') {
+    const validatedCwd = this.validateWorkspace(cwd || this.defaultCwd || os.homedir());
+    const cleanSubpath = typeof subpath === 'string' ? subpath.trim() : '';
+    const pathArgs = cleanSubpath ? ['--', cleanSubpath] : [];
+
+    const [statusRes, porcelainRes, headRes] = await Promise.all([
+      this._runGit(validatedCwd, ['status', '-sb', ...pathArgs]),
+      this._runGit(validatedCwd, ['status', '--porcelain', ...pathArgs]),
+      this._runGit(validatedCwd, ['rev-parse', '--verify', 'HEAD'], { allowFail: true }),
+    ]);
+
+    const diffBaseArgs = headRes.ok ? ['HEAD'] : [];
+    const [statRes, diffRes] = await Promise.all([
+      this._runGit(validatedCwd, ['diff', '--stat', ...diffBaseArgs, ...pathArgs]),
+      this._runGit(validatedCwd, ['diff', ...diffBaseArgs, ...pathArgs]),
+    ]);
+
+    const porcelain = porcelainRes.stdout.trim();
+    const statText = statRes.stdout.trim();
+    const diffText = diffRes.stdout.trim();
+    if (!porcelain && !statText && !diffText) {
+      return `✨ 工作区干净，暂无未提交改动 (${validatedCwd})`;
+    }
+
+    const sections = [`📁 ${validatedCwd}`];
+    const statusText = statusRes.stdout.trim();
+    if (statusText) sections.push(`📌 状态：\n${statusText}`);
+    if (statText) sections.push(`📊 统计：\n${statText}`);
+    if (diffText) {
+      const prefix = sections.join('\n\n');
+      const budget = Math.max(300, 3000 - prefix.length - 40);
+      const clipped = diffText.length > budget
+        ? `${diffText.slice(0, budget).trimEnd()}\n…(diff 已截断)`
+        : diffText;
+      sections.push(`📝 改动详情：\n${clipped}`);
+    }
+
+    const result = sections.join('\n\n');
+    return result.length > 3000 ? `${result.slice(0, 2985).trimEnd()}\n…(已截断)` : result;
+  }
+
+  async gitLog(cwd, count = 5) {
+    const validatedCwd = this.validateWorkspace(cwd || this.defaultCwd || os.homedir());
+    const parsed = Number(count);
+    const n = Math.max(1, Math.min(20, Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 5));
+    const res = await this._runGit(validatedCwd, ['log', '-n', String(n), '--oneline', '--decorate'], { allowFail: true });
+    if (!res.ok) {
+      if (/does not have any commits yet|your current branch .* does not have any commits/i.test(res.stderr)) {
+        return `📜 当前仓库尚无提交记录 (${validatedCwd})`;
+      }
+      if (/not a git repository/i.test(res.stderr)) {
+        throw new Error(`当前目录不是 Git 仓库: ${validatedCwd}`);
+      }
+      throw new Error(res.stderr || 'git log 执行失败');
+    }
+    const text = res.stdout.trim();
+    if (!text) return `📜 当前仓库尚无提交记录 (${validatedCwd})`;
+    return `📜 最近 ${n} 条提交记录 (${validatedCwd})：\n${text}`;
+  }
+
+  async gitCommit(cwd, message) {
+    const validatedCwd = this.validateWorkspace(cwd || this.defaultCwd || os.homedir());
+    const cleanMsg = typeof message === 'string' ? message.trim() : '';
+    if (!cleanMsg) {
+      throw new Error('提交说明不能为空');
+    }
+
+    await this._runGit(validatedCwd, ['add', '-A']);
+    const porcelainRes = await this._runGit(validatedCwd, ['status', '--porcelain']);
+    if (!porcelainRes.stdout.trim()) {
+      return `✨ 工作区干净，没有需要提交的改动 (${validatedCwd})`;
+    }
+
+    const commitRes = await this._runGit(validatedCwd, ['commit', '-m', cleanMsg]);
+    const output = (commitRes.stdout || commitRes.stderr || '').trim();
+    return `✅ 提交成功 (${validatedCwd})：\n${output}`;
+  }
+
+  async gitRevert(cwd, confirmed = false) {
+    const validatedCwd = this.validateWorkspace(cwd || this.defaultCwd || os.homedir());
+    const [statusRes, porcelainRes] = await Promise.all([
+      this._runGit(validatedCwd, ['status', '-sb']),
+      this._runGit(validatedCwd, ['status', '--porcelain']),
+    ]);
+
+    if (!porcelainRes.stdout.trim()) {
+      return `✨ 工作区干净，没有可撤销的未提交改动 (${validatedCwd})`;
+    }
+
+    if (confirmed !== true) {
+      return [
+        `⚠️ 以下未提交改动将被丢弃 (${validatedCwd})：`,
+        statusRes.stdout.trim(),
+        '',
+        '如确认丢弃所有未提交修改并清理未跟踪文件，请发送：/revert confirm',
+      ].join('\n');
+    }
+
+    const headRes = await this._runGit(validatedCwd, ['rev-parse', '--verify', 'HEAD'], { allowFail: true });
+    if (headRes.ok) {
+      await this._runGit(validatedCwd, ['checkout', '--', '.']);
+    } else {
+      await this._runGit(validatedCwd, ['rm', '-rf', '--cached', '.'], { allowFail: true });
+    }
+    const cleanRes = await this._runGit(validatedCwd, ['clean', '-fd']);
+    const extra = cleanRes.stdout.trim();
+    return `↩️ 已撤销工作区未提交改动并清理未跟踪文件 (${validatedCwd})${extra ? `\n${extra}` : ''}`;
   }
 
   listJobs(limit = 20) {

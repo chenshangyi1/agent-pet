@@ -1,7 +1,9 @@
 'use strict';
 
 const crypto = require('node:crypto');
+const fs = require('node:fs');
 const { EventEmitter } = require('node:events');
+const { downloadTempImage } = require('./qq-onebot.cjs');
 
 const DEFAULT_WECOM_WS_URL = 'wss://openws.work.weixin.qq.com';
 const INITIAL_BACKOFF_MS = 2000;
@@ -125,6 +127,22 @@ function parseCallbackFrame(frame, options = {}) {
     text = text.replace(/^@(?!(?:claude|codex|antigravity|agy|dsh)\b)[^\s@]+\s+/i, '').trim();
   }
 
+  const imageUrls = [];
+  const addImageUrl = rawUrl => {
+    const u = typeof rawUrl === 'string' ? rawUrl.trim() : '';
+    if (/^https?:\/\//i.test(u) && !imageUrls.includes(u)) {
+      imageUrls.push(u);
+    }
+  };
+  if (body.image?.url) addImageUrl(body.image.url);
+  if (Array.isArray(body.mixed?.msg_item)) {
+    for (const item of body.mixed.msg_item) {
+      if (item?.msgtype === 'image' && item.image?.url) {
+        addImageUrl(item.image.url);
+      }
+    }
+  }
+
   return {
     reqId,
     msgId: String(body.msgid || body.msg_id || ''),
@@ -135,6 +153,7 @@ function parseCallbackFrame(frame, options = {}) {
     senderId,
     senderName,
     text,
+    imageUrls,
     raw: obj,
   };
 }
@@ -428,7 +447,24 @@ class WeComAdapter extends EventEmitter {
     if (frame.cmd === 'pong') return;
 
     const parsed = parseCallbackFrame(frame, { botName: this.config.botName });
-    if (!parsed || !parsed.text) return;
+    const imageUrls = Array.isArray(parsed?.imageUrls) ? parsed.imageUrls : [];
+    if (!parsed || (!parsed.text && imageUrls.length === 0)) return;
+
+    void this.#dispatchIncomingCallback(frame, parsed, imageUrls);
+  }
+
+  async #dispatchIncomingCallback(frame, parsed, imageUrls) {
+    const downloadedImages = [];
+    if (imageUrls.length > 0) {
+      const settled = await Promise.allSettled(
+        imageUrls.map(url => downloadTempImage(url, { fetchImpl: this.fetchImpl })),
+      );
+      for (const res of settled) {
+        if (res.status === 'fulfilled' && res.value) {
+          downloadedImages.push(res.value);
+        }
+      }
+    }
 
     const streamId = genReqId('stream');
     let streamFinished = false;
@@ -506,16 +542,31 @@ class WeComAdapter extends EventEmitter {
       senderId: parsed.senderId,
       senderName: parsed.senderName,
       text: parsed.text,
+      imageUrls,
+      images: downloadedImages,
       raw: frame,
       reply,
       onProgress,
     };
 
-    this.emit('message', msg);
-    if (this.onMessage) {
-      Promise.resolve(this.onMessage(msg)).catch(err => {
-        if (this.listenerCount('error') > 0) this.emit('error', err);
-      });
+    try {
+      this.emit('message', msg);
+      if (this.onMessage) {
+        await this.onMessage(msg);
+      }
+    } catch (err) {
+      if (this.listenerCount('error') > 0) this.emit('error', err);
+    } finally {
+      if (downloadedImages.length > 0) {
+        if (this.onMessage) {
+          await Promise.all(downloadedImages.map(p => fs.promises.unlink(p).catch(() => {})));
+        } else {
+          const timer = setTimeout(() => {
+            for (const p of downloadedImages) fs.promises.unlink(p).catch(() => {});
+          }, 30_000);
+          timer.unref?.();
+        }
+      }
     }
   }
 
@@ -617,4 +668,5 @@ module.exports = {
   buildSendMsgFrame,
   parseCallbackFrame,
   chunkMarkdown,
+  downloadTempImage,
 };

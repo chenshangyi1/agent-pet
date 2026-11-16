@@ -115,6 +115,10 @@
             <span class="field-label">允许的工作区根目录（每行一个，支持 ~，留空默认用户主目录）</span>
             <textarea id="bot-allowed-workspaces" class="input textarea" rows="2" placeholder="~/Projects&#10;~/AI"></textarea>
           </label>
+          <label class="switch-item span-2">
+            <input id="bot-autostart" type="checkbox" />
+            <span>开机自动启动（登录 macOS 时自动启动小鑫与 Bot 网关）</span>
+          </label>
         </div>
       </section>
 
@@ -309,7 +313,8 @@
           <button id="bot-jobs-refresh-btn" class="ghost-btn" type="button">刷新</button>
         </div>
         <div id="bot-jobs-list" class="card-list"></div>
-        <div id="bot-jobs-empty" class="empty-note">暂无远程派活任务；在 QQ / 企业微信发送 <code>/claude 任务</code> 或 <code>/codex 任务</code> 即可触发。</div>
+        <div id="bot-jobs-empty" class="empty-note">暂无远程派活任务；在 QQ / 企业微信发送 <code>/claude 任务</code> 或 <code>/codex 任务</code> 即可触发，支持 <code>/diff</code>、<code>/log</code>、<code>/commit</code>、<code>/revert</code> 与直接发送截图/图片调试。</div>
+        <p class="toolbar-note">常用远程指令：<code>/claude</code>、<code>/codex</code>、<code>/diff</code>、<code>/log</code>、<code>/commit</code>、<code>/revert</code>，支持直接发送截图/图片给 AI 调试。</p>
       </section>
 
       <footer class="footnote">

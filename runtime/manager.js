@@ -24,6 +24,7 @@ const botSandboxMode = $('bot-sandbox-mode');
 const botDefaultCwd = $('bot-default-cwd');
 const botBrowseCwdBtn = $('bot-browse-cwd-btn');
 const botAllowedWorkspaces = $('bot-allowed-workspaces');
+const botAutoStart = $('bot-autostart');
 
 const botPairingCode = $('bot-pairing-code');
 const botCopyPairBtn = $('bot-copy-pair-btn');
@@ -544,6 +545,9 @@ function collectBotConfig() {
 function renderBotState(state, { preserveForm = false } = {}) {
   if (!state) return;
   botState = state;
+  if (botAutoStart && typeof state.autoStart === 'boolean') {
+    botAutoStart.checked = state.autoStart;
+  }
   renderEngines(state.engines || {});
   renderChannelStatus(qqStatusPill, qqStatusDetail, state.channels?.qq, '兼容 NapCat / Lagrange / go-cqhttp 正向或反向 WebSocket。');
   renderChannelStatus(wecomStatusPill, wecomStatusDetail, state.channels?.wecom, '默认通过企业微信智能机器人长连接实时收发消息。');
@@ -643,9 +647,27 @@ function addAuthorizedEntry() {
 }
 
 for (const input of panelBot.querySelectorAll('input, select, textarea')) {
-  if (input === botAuthChannel || input === botAuthIdInput) continue;
+  if (input === botAuthChannel || input === botAuthIdInput || input === botAutoStart) continue;
   input.addEventListener('change', () => { botDirty = true; });
   input.addEventListener('input', () => { botDirty = true; });
+}
+
+if (botAutoStart) {
+  botAutoStart.addEventListener('change', async () => {
+    if (!api.bot?.setAutoStart) return;
+    const target = botAutoStart.checked;
+    botAutoStart.disabled = true;
+    try {
+      const next = await api.bot.setAutoStart(target);
+      if (next) renderBotState(next, { preserveForm: true });
+      showBanner(next?.autoStart ? '已开启登录 macOS 自动启动' : '已关闭开机自动启动');
+    } catch (err) {
+      botAutoStart.checked = !target;
+      showBanner(cleanErrorMessage(err, '设置开机自动启动失败'), true);
+    } finally {
+      botAutoStart.disabled = false;
+    }
+  });
 }
 
 qqMode.addEventListener('change', updateQqModeVisibility);

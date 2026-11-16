@@ -127,10 +127,14 @@ class CommandRouter {
       '• /new — 开启新会话（清空当前上下文）',
       '• /jobs — 查看最近派活任务',
       '• /stop [jobId] — 停止运行中的任务',
+      '• /diff [路径] (或 查看改动) — 查看工作区 Git 改动',
+      '• /log [n] (或 提交记录) — 查看最近 Git 提交记录',
+      '• /commit <说明> — 暂存并提交当前工作区改动',
+      '• /revert [confirm] — 预览或确认撤销未提交改动',
       '• /pet <show|hide|reset> — 控制桌面小鑫显示/隐藏/归位',
       '• /open <agentId> — 打开桌面端应用',
       `当前默认：引擎 ${engine} · 目录 ${cwd}`,
-      '💡 直接发普通消息会沿用当前引擎与会话继续追问。',
+      '💡 直接发普通消息或发送截图/图片，会沿用当前引擎与会话分析处理。',
     ].join('\n');
   }
 
@@ -225,7 +229,7 @@ class CommandRouter {
     return lines.join('\n');
   }
 
-  async _dispatchTask({ ctx, engine, prompt, reply, onProgress }) {
+  async _dispatchTask({ ctx, engine, prompt, images, reply, onProgress }) {
     if (!this.dispatcher || typeof this.dispatcher.dispatch !== 'function') {
       return this._sendReply(reply, '❌ 任务调度器未初始化', { handled: true, engine });
     }
@@ -247,6 +251,7 @@ class CommandRouter {
         prompt,
         cwd,
         sessionId: resumeSessionId,
+        images,
         onProgress: forwardProgress,
       });
     } catch (err) {
@@ -295,12 +300,16 @@ class CommandRouter {
     senderId,
     senderName,
     text,
+    images,
     isAuthorized,
     pairingCode,
     reply,
     onProgress,
   } = {}) {
     const raw = typeof text === 'string' ? text.trim() : '';
+    const validImages = Array.isArray(images)
+      ? images.filter(p => typeof p === 'string' && p.trim())
+      : [];
 
     // 1. Pairing must be processed before authorization check.
     if (/^\/pair(?:\s|$)/i.test(raw)) {
@@ -327,7 +336,7 @@ class CommandRouter {
       );
     }
 
-    if (!raw) {
+    if (!raw && validImages.length === 0) {
       return { handled: false, text: '' };
     }
 
@@ -409,6 +418,54 @@ class CommandRouter {
       return this._sendReply(reply, msg, { handled: true });
     }
 
+    const diffMatch = raw.match(/^(?:\/diff|查看改动)(?:\s+([\s\S]+))?$/i);
+    if (diffMatch) {
+      try {
+        const out = await this.dispatcher.gitDiff(this._effectiveCwd(ctx), (diffMatch[1] || '').trim());
+        return this._sendReply(reply, truncateText(out), { handled: true });
+      } catch (err) {
+        return this._sendReply(reply, `❌ 查看改动失败：${err.message}`, { handled: true });
+      }
+    }
+
+    const logMatch = raw.match(/^(?:\/log|提交记录)(?:\s+(\S+))?$/i);
+    if (logMatch) {
+      try {
+        const out = await this.dispatcher.gitLog(this._effectiveCwd(ctx), Number(logMatch[1]) || 5);
+        return this._sendReply(reply, truncateText(out), { handled: true });
+      } catch (err) {
+        return this._sendReply(reply, `❌ 查看提交记录失败：${err.message}`, { handled: true });
+      }
+    }
+
+    const commitMatch = raw.match(/^\/commit(?:\s+([\s\S]+))?$/i);
+    if (commitMatch) {
+      const commitMsg = (commitMatch[1] || '').trim();
+      if (!commitMsg) {
+        return this._sendReply(reply, '用法：/commit <提交说明>', { handled: true });
+      }
+      try {
+        const out = await this.dispatcher.gitCommit(this._effectiveCwd(ctx), commitMsg);
+        return this._sendReply(reply, truncateText(out), { handled: true });
+      } catch (err) {
+        return this._sendReply(reply, `❌ 提交失败：${err.message}`, { handled: true });
+      }
+    }
+
+    const revertMatch = raw.match(/^\/revert(?:\s+([\s\S]+))?$/i);
+    if (revertMatch) {
+      const arg = (revertMatch[1] || '').trim().toLowerCase();
+      if (arg && arg !== 'confirm') {
+        return this._sendReply(reply, '用法：/revert 查看将丢弃的改动，确认后发送 /revert confirm', { handled: true });
+      }
+      try {
+        const out = await this.dispatcher.gitRevert(this._effectiveCwd(ctx), arg === 'confirm');
+        return this._sendReply(reply, truncateText(out), { handled: true });
+      } catch (err) {
+        return this._sendReply(reply, `❌ 撤销失败：${err.message}`, { handled: true });
+      }
+    }
+
     const petMatch = raw.match(/^\/pet(?:\s+(\S+))?$/i);
     if (petMatch) {
       const subcmd = (petMatch[1] || '').trim().toLowerCase();
@@ -448,7 +505,8 @@ class CommandRouter {
     const engineCmdMatch = raw.match(/^(?:\/|@)(claude|codex|antigravity|agy|dsh|run)(?:(?:\s+|[:：]\s*)([\s\S]*))?$/i);
     if (engineCmdMatch) {
       const rawCmd = engineCmdMatch[1].toLowerCase();
-      const prompt = (engineCmdMatch[2] || '').trim();
+      const prompt = (engineCmdMatch[2] || '').trim()
+        || (validImages.length > 0 ? '请分析这张图片中的问题并给出解决方案' : '');
       const targetEngine = rawCmd === 'run'
         ? this._effectiveEngine(ctx)
         : normalizeEngine(rawCmd);
@@ -456,7 +514,7 @@ class CommandRouter {
       if (!prompt) {
         return this._sendReply(reply, `请在指令后输入任务内容，例如：/${rawCmd} 检查当前目录状态`, { handled: true });
       }
-      return this._dispatchTask({ ctx, engine: targetEngine, prompt, reply, onProgress });
+      return this._dispatchTask({ ctx, engine: targetEngine, prompt, images: validImages, reply, onProgress });
     }
 
     // Reject unknown slash commands cleanly rather than forwarding them as prompts.
@@ -465,9 +523,10 @@ class CommandRouter {
       return this._sendReply(reply, `❓ 未知指令 "${unknownCmd}"，发送 /help 查看全部可用指令。`, { handled: true });
     }
 
-    // 5. Plain text message -> follow up with chat's bound engine & sessionId.
+    // 5. Plain text (or image-only) message -> follow up with chat's bound engine & sessionId.
     const defaultEngine = this._effectiveEngine(ctx);
-    return this._dispatchTask({ ctx, engine: defaultEngine, prompt: raw, reply, onProgress });
+    const effectivePrompt = raw || '请分析这张图片中的问题并给出解决方案';
+    return this._dispatchTask({ ctx, engine: defaultEngine, prompt: effectivePrompt, images: validImages, reply, onProgress });
   }
 }
 

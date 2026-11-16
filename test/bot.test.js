@@ -40,6 +40,7 @@ const {
   extractOneBotText,
   chunkText,
   parseOneBotTarget,
+  downloadTempImage,
 } = require('../bot/channels/qq-onebot.cjs');
 const {
   WeComAdapter,
@@ -50,7 +51,9 @@ const {
   buildSendMsgFrame,
   parseCallbackFrame,
   chunkMarkdown,
+  downloadTempImage: downloadWeComTempImage,
 } = require('../bot/channels/wecom.cjs');
+const { LocalChatBridge } = require('../bot/local-chat.cjs');
 const {
   BotService,
   DEFAULT_BOT_CONFIG,
@@ -60,6 +63,7 @@ const {
 } = require('../bot/service.cjs');
 const { startBotServer } = require('../bot/server.cjs');
 const { Providers } = require('../runtime/providers.cjs');
+const { AutoStartManager, LAUNCH_AGENT_LABEL } = require('../runtime/autostart.cjs');
 
 async function makeMockExecutable(filePath, jsSource) {
   await mkdir(dirname(filePath), { recursive: true });
@@ -1464,4 +1468,617 @@ test('独立运行 WebM 动画资产、Manager UI DOM/CSP 契约及无 ~/.dsh �
   });
   assert.equal(startRes.status, 1);
   assert.match(startRes.stderr, /无法找到 Electron 运行时/);
+});
+
+test('LocalChatBridge 会话创建、图片 base64 落盘与清理、多轮 --resume、列表/详情与取消', async t => {
+  const rawDir = await mkdtemp(join(tmpdir(), 'agent-pet-local-chat-'));
+  const dir = await realpath(rawDir);
+  const workDir = join(dir, 'work');
+  const dataDir = join(dir, 'data');
+  const claudeArgsLog = join(dir, 'local-claude-args.jsonl');
+  const codexArgsLog = join(dir, 'local-codex-args.jsonl');
+  await mkdir(join(workDir, 'src'), { recursive: true });
+  await mkdir(join(workDir, 'node_modules/ignored'), { recursive: true });
+  await mkdir(join(workDir, '.git'), { recursive: true });
+  await writeFile(join(workDir, 'src/app.js'), 'console.log("ok");\n', 'utf8');
+  await writeFile(join(workDir, 'README.md'), '# demo\n', 'utf8');
+  await writeFile(join(workDir, 'node_modules/ignored/pkg.js'), 'x\n', 'utf8');
+  await mkdir(dataDir, { recursive: true });
+
+  const mockClaude = await makeMockExecutable(
+    join(dir, 'mock-claude'),
+    `
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+const pIdx = args.indexOf('-p');
+const prompt = pIdx >= 0 ? args[pIdx + 1] : '';
+const rIdx = args.indexOf('--resume');
+const resumed = rIdx >= 0 ? args[rIdx + 1] : null;
+const sid = resumed || 'cli-claude-ses-1';
+const addDirs = [];
+for (let i = 0; i < args.length; i++) {
+  if (args[i] === '--add-dir' && args[i + 1]) addDirs.push(args[i + 1]);
+}
+const imgMatch = prompt.match(/\\[附加图片路径: ([^\\]]+) —/);
+const imgPaths = imgMatch ? imgMatch[1].split(', ').map(s => s.trim()) : [];
+const imgExisted = imgPaths.map(p => fs.existsSync(p));
+fs.appendFileSync(${JSON.stringify(claudeArgsLog)}, JSON.stringify({ args, prompt, resumed, addDirs, imgPaths, imgExisted }) + '\\n');
+
+if (prompt.includes('SLOW_LOCAL_CANCEL')) {
+  console.log(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'cli-claude-slow' }));
+  process.on('SIGTERM', () => process.exit(0));
+  setTimeout(() => process.exit(0), 10000);
+} else {
+  console.log(JSON.stringify({ type: 'system', subtype: 'init', session_id: sid }));
+  console.log(JSON.stringify({
+    type: 'assistant',
+    session_id: sid,
+    message: { content: [{ type: 'tool_use', id: 'tu-1', name: 'Read' }] },
+  }));
+  setTimeout(() => {
+    console.log(JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      session_id: sid,
+      result: (resumed ? 'Claude续接:' : 'Claude首轮:') + prompt.split('\\n').pop(),
+    }));
+  }, 40);
+}
+`,
+  );
+
+  const mockCodex = await makeMockExecutable(
+    join(dir, 'mock-codex'),
+    `
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+const isResume = args[0] === 'exec' && args[1] === 'resume';
+const prompt = args[args.length - 1];
+const tid = isResume ? args[args.length - 2] : 'thread-local-codex-1';
+const iPaths = [];
+for (let i = 0; i < args.length; i++) {
+  if (args[i] === '-i' && args[i + 1]) iPaths.push(args[i + 1]);
+}
+fs.appendFileSync(${JSON.stringify(codexArgsLog)}, JSON.stringify({ args, isResume, tid, prompt, iPaths }) + '\\n');
+console.log(JSON.stringify({ type: 'thread.started', thread_id: tid }));
+console.log(JSON.stringify({ type: 'item.completed', item: { id: 'm1', type: 'agent_message', text: (isResume ? 'Codex续接:' : 'Codex首轮:') + prompt } }));
+console.log(JSON.stringify({ type: 'turn.completed' }));
+`,
+  );
+
+  const prevClaude = process.env.CLAUDE_BIN;
+  const prevCodex = process.env.CODEX_BIN;
+  process.env.CLAUDE_BIN = mockClaude;
+  process.env.CODEX_BIN = mockCodex;
+  t.after(async () => {
+    if (prevClaude === undefined) delete process.env.CLAUDE_BIN;
+    else process.env.CLAUDE_BIN = prevClaude;
+    if (prevCodex === undefined) delete process.env.CODEX_BIN;
+    else process.env.CODEX_BIN = prevCodex;
+    await rm(rawDir, { recursive: true, force: true });
+  });
+
+  const dispatcher = new TaskDispatcher({
+    dataDir,
+    allowedWorkspaces: [dir],
+    defaultCwd: workDir,
+    sandboxMode: 'auto',
+  });
+  const cfg = { defaultEngine: 'claude', defaultCwd: workDir };
+  const bridge = new LocalChatBridge({ dispatcher, getConfig: () => cfg });
+
+  assert.equal(bridge.isLocalSessionId('local:claude:123'), true);
+  assert.equal(bridge.isLocalSessionId('session-123'), false);
+  assert.equal(bridge.resolveEngine('codex'), 'codex');
+  assert.equal(bridge.resolveEngine('auto'), 'claude');
+
+  const infoRes = await bridge.handleAction({ action: 'info' }, 'auto');
+  assert.equal(infoRes.connected, true);
+  assert.equal(infoRes.speechAvailable, true);
+  assert.equal(infoRes.model, 'claude');
+  assert.deepEqual(infoRes.models, ['claude', 'codex']);
+
+  const modelsRes = await bridge.handleAction({ action: 'models' }, 'auto');
+  assert.equal(modelsRes.current, 'claude');
+  assert.equal(modelsRes.groups[0].models.length, 2);
+
+  const skillsRes = await bridge.handleAction({ action: 'skills' }, 'auto');
+  assert.ok(skillsRes.skills.some(s => s.name === 'diff'));
+
+  const filesRes = await bridge.handleAction({ action: 'files', query: 'app' }, 'auto');
+  assert.ok(filesRes.candidates.some(f => f.path === 'src/app.js'));
+  assert.ok(!filesRes.candidates.some(f => f.path.includes('node_modules')));
+
+  // 1. Create + ui.js style base64 image + data URL image prompt
+  const created = await bridge.handleAction({ action: 'create', sessionId: 'session-ui-alias-1' }, 'claude');
+  assert.match(created.sessionId, /^local:claude:/);
+  assert.equal(created.status, 'idle');
+
+  const pngBase64 = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex').toString('base64');
+  const promptRes = await bridge.handleAction({
+    action: 'prompt',
+    sessionId: created.sessionId,
+    content: [
+      { type: 'text', text: '分析截图报错' },
+      { type: 'image', mediaType: 'image/png', data: pngBase64 },
+    ],
+    images: [`data:image/jpeg;base64,${Buffer.from('ffd8ffe0', 'hex').toString('base64')}`],
+  }, 'claude');
+  assert.equal(promptRes.status, 'running');
+
+  const listWhileRunning = bridge.listSessions('claude');
+  assert.equal(listWhileRunning.length, 1);
+  assert.equal(listWhileRunning[0].status, 'running');
+  assert.deepEqual(listWhileRunning[0].capabilities, { reply: true, cancel: true, open: true });
+
+  await waitFor(async () => {
+    const conv = await bridge.handleAction({ action: 'conversation', sessionId: created.sessionId }, 'claude');
+    return conv.status === 'ready' ? conv : null;
+  });
+
+  // Lookup via original explicit alias works too, and conversation marks unread=false
+  const convAlias = await bridge.handleAction({ action: 'conversation', sessionId: 'session-ui-alias-1' }, 'claude');
+  assert.equal(convAlias.sessionId, created.sessionId);
+  assert.equal(convAlias.messages.length, 2);
+  assert.equal(convAlias.messages[0].role, 'user');
+  assert.equal(convAlias.messages[0].seq, 1);
+  assert.equal(convAlias.messages[1].role, 'assistant');
+  assert.ok(convAlias.messages[1].seq > convAlias.messages[0].seq);
+  assert.match(convAlias.messages[1].text, /Claude首轮:分析截图报错/);
+  assert.equal(bridge.listSessions('claude')[0].unread, false);
+
+  // Follow-up turn uses --resume with captured cliSessionId
+  await bridge.handleAction({
+    action: 'prompt',
+    sessionId: created.sessionId,
+    text: '继续修复',
+  }, 'claude');
+  await waitFor(async () => {
+    const conv = await bridge.handleAction({ action: 'conversation', sessionId: created.sessionId }, 'claude');
+    return conv.status === 'ready' && conv.messages.length === 4 ? conv : null;
+  });
+  const conv2 = await bridge.handleAction({ action: 'conversation', sessionId: created.sessionId }, 'claude');
+  assert.match(conv2.messages[3].text, /Claude续接:继续修复/);
+
+  const claudeCalls = (await readFile(claudeArgsLog, 'utf8')).trim().split('\n').map(l => JSON.parse(l));
+  assert.equal(claudeCalls.length, 2);
+  assert.equal(claudeCalls[0].imgPaths.length, 2);
+  assert.deepEqual(claudeCalls[0].imgExisted, [true, true]);
+  assert.ok(claudeCalls[0].addDirs.includes(dirname(claudeCalls[0].imgPaths[0])));
+  assert.equal(claudeCalls[1].resumed, 'cli-claude-ses-1');
+  // Temp base64 image files must be cleaned up after completion
+  for (const tmpImg of claudeCalls[0].imgPaths) {
+    assert.equal(existsSync(tmpImg), false);
+  }
+
+  // 2. selectModel('codex') + multi-turn codex exec resume + listSessions filter
+  const codexSess = await bridge.handleAction({ action: 'create' }, 'auto');
+  assert.match(codexSess.sessionId, /^local:claude:/);
+  await bridge.handleAction({
+    action: 'selectModel',
+    sessionId: codexSess.sessionId,
+    model: { provider: 'local', model: 'codex' },
+  }, 'auto');
+  assert.equal(bridge.resolveEngine('auto'), 'codex');
+
+  await bridge.handleAction({ action: 'prompt', sessionId: codexSess.sessionId, text: '第一轮codex' }, 'auto');
+  await waitFor(async () => {
+    const c = await bridge.handleAction({ action: 'conversation', sessionId: codexSess.sessionId }, 'auto');
+    return c.status === 'ready' ? c : null;
+  });
+  await bridge.handleAction({ action: 'prompt', sessionId: codexSess.sessionId, text: '第二轮codex' }, 'auto');
+  await waitFor(async () => {
+    const c = await bridge.handleAction({ action: 'conversation', sessionId: codexSess.sessionId }, 'auto');
+    return c.status === 'ready' && c.messages.length === 4 ? c : null;
+  });
+  const codexCalls = (await readFile(codexArgsLog, 'utf8')).trim().split('\n').map(l => JSON.parse(l));
+  assert.equal(codexCalls.length, 2);
+  assert.equal(codexCalls[0].isResume, false);
+  assert.equal(codexCalls[1].isResume, true);
+  assert.equal(codexCalls[1].tid, 'thread-local-codex-1');
+  assert.equal(bridge.listSessions('codex').length, 1);
+  assert.equal(bridge.listSessions('claude').length, 1);
+  assert.equal(bridge.listSessions('auto').length, 2);
+
+  // 3. Cancel active local job + error validation
+  const slowSess = await bridge.handleAction({ action: 'create' }, 'claude');
+  await bridge.handleAction({ action: 'prompt', sessionId: slowSess.sessionId, text: 'SLOW_LOCAL_CANCEL' }, 'claude');
+  await waitFor(() => dispatcher.listJobs(5).find(j => j.status === 'running'));
+  const cancelRes = await bridge.handleAction({ action: 'cancel', sessionId: slowSess.sessionId }, 'claude');
+  assert.equal(cancelRes.cancelled, true);
+  const slowConv = await bridge.handleAction({ action: 'conversation', sessionId: slowSess.sessionId }, 'claude');
+  assert.equal(slowConv.status, 'cancelled');
+
+  await assert.rejects(() => bridge.handleAction({ action: 'conversation', sessionId: 'local:claude:missing' }, 'claude'), /未找到/);
+  await assert.rejects(() => bridge.handleAction({ action: 'prompt', sessionId: slowSess.sessionId, text: '   ' }, 'claude'), /不能为空/);
+  await assert.rejects(() => bridge.handleAction({ action: 'unknownOp' }, 'claude'), /不支持/);
+});
+
+test('Git 工程化指令 (/diff, /log, /commit, /revert 预览与 confirm) 与非 Git 目录保护', async t => {
+  const rawDir = await mkdtemp(join(tmpdir(), 'agent-pet-bot-git-'));
+  const dir = await realpath(rawDir);
+  const repoDir = join(dir, 'repo');
+  const plainDir = join(dir, 'non-git');
+  await mkdir(repoDir, { recursive: true });
+  await mkdir(plainDir, { recursive: true });
+  t.after(() => rm(rawDir, { recursive: true, force: true }));
+
+  const runGit = args => {
+    const res = spawnSync('git', args, { cwd: repoDir, encoding: 'utf8' });
+    assert.equal(res.status, 0, res.stderr || res.stdout);
+    return res.stdout.trim();
+  };
+
+  runGit(['init']);
+  runGit(['config', 'user.name', 'Test Bot']);
+  runGit(['config', 'user.email', 'test-bot@example.com']);
+  await writeFile(join(repoDir, 'tracked.txt'), 'line 1\n', 'utf8');
+  await mkdir(join(repoDir, 'sub'), { recursive: true });
+  await writeFile(join(repoDir, 'sub/module.js'), 'export const v = 1;\n', 'utf8');
+  runGit(['add', '-A']);
+  runGit(['commit', '-m', 'chore: initial commit']);
+
+  const dispatcher = new TaskDispatcher({
+    dataDir: join(dir, 'data'),
+    allowedWorkspaces: [dir],
+    defaultCwd: repoDir,
+  });
+  const router = new CommandRouter({
+    dispatcher,
+    getConfig: () => ({ defaultEngine: 'claude', defaultCwd: repoDir }),
+  });
+
+  const send = text => router.handleMessage({
+    channel: 'qq',
+    chatKey: 'private:2002',
+    senderId: '2002',
+    text,
+    isAuthorized: true,
+    pairingCode: 'XYZ123',
+  });
+
+  // Clean state checks
+  assert.match((await send('/diff')).text, /工作区干净/);
+  assert.match((await send('查看改动')).text, /工作区干净/);
+  assert.match((await send('/revert')).text, /没有可撤销/);
+  assert.match((await send('/commit')).text, /用法：\/commit/);
+  assert.match((await send('/commit nothing here')).text, /工作区干净/);
+  assert.match((await send('/log')).text, /chore: initial commit/);
+
+  // Modify tracked file + add untracked file -> /diff & subpath filter & /revert preview
+  await writeFile(join(repoDir, 'tracked.txt'), 'line 1\nline 2 added\n', 'utf8');
+  await writeFile(join(repoDir, 'sub/module.js'), 'export const v = 2;\n', 'utf8');
+  await writeFile(join(repoDir, 'new-file.txt'), 'untracked content\n', 'utf8');
+
+  const diffAll = await send('/diff');
+  assert.match(diffAll.text, /tracked\.txt/);
+  assert.match(diffAll.text, /new-file\.txt/);
+  assert.match(diffAll.text, /\+line 2 added/);
+
+  const diffSub = await send('/diff sub/module.js');
+  assert.match(diffSub.text, /sub\/module\.js/);
+  assert.doesNotMatch(diffSub.text, /line 2 added/);
+
+  // Preview /revert must NOT discard files
+  const revertPreview = await send('/revert');
+  assert.match(revertPreview.text, /将被丢弃/);
+  assert.match(revertPreview.text, /\/revert confirm/);
+  assert.equal(existsSync(join(repoDir, 'new-file.txt')), true);
+  assert.match(await readFile(join(repoDir, 'tracked.txt'), 'utf8'), /line 2 added/);
+
+  const revertBad = await send('/revert nope');
+  assert.match(revertBad.text, /用法：\/revert/);
+  assert.equal(existsSync(join(repoDir, 'new-file.txt')), true);
+
+  // /commit + /log
+  const commitRes = await send('/commit feat: update tracked and add new file');
+  assert.match(commitRes.text, /提交成功/);
+  assert.match((await send('/diff')).text, /工作区干净/);
+
+  const logRes = await send('提交记录 2');
+  assert.match(logRes.text, /feat: update tracked and add new file/);
+  assert.match(logRes.text, /chore: initial commit/);
+
+  // Long diff truncation check (<= 3000 chars)
+  await writeFile(join(repoDir, 'tracked.txt'), 'x'.repeat(5000) + '\n', 'utf8');
+  const clippedDiff = await dispatcher.gitDiff(repoDir);
+  assert.ok(clippedDiff.length <= 3000);
+  assert.match(clippedDiff, /截断/);
+
+  // /revert confirm restores tracked file & removes untracked file
+  await writeFile(join(repoDir, 'temp-untracked.txt'), 'should vanish\n', 'utf8');
+  const revertConfirm = await send('/revert confirm');
+  assert.match(revertConfirm.text, /已撤销工作区未提交改动并清理未跟踪文件/);
+  assert.equal(existsSync(join(repoDir, 'temp-untracked.txt')), false);
+  assert.equal(await readFile(join(repoDir, 'tracked.txt'), 'utf8'), 'line 1\nline 2 added\n');
+
+  // Non-git directory protection
+  await send(`/cd ${plainDir}`);
+  assert.match((await send('/diff')).text, /不是 Git 仓库/);
+  assert.match((await send('/log')).text, /不是 Git 仓库/);
+});
+
+test('图片附件下载 (downloadTempImage)、TaskDispatcher 引擎透传与 QQ/企微渠道临时文件清理', async t => {
+  const rawDir = await mkdtemp(join(tmpdir(), 'agent-pet-bot-img-'));
+  const dir = await realpath(rawDir);
+  const workDir = join(dir, 'work');
+  const dataDir = join(dir, 'data');
+  const imgDirA = join(dir, 'imgs-a');
+  const imgDirB = join(dir, 'imgs-b');
+  const claudeArgsLog = join(dir, 'img-claude-args.jsonl');
+  const codexArgsLog = join(dir, 'img-codex-args.jsonl');
+  await mkdir(workDir, { recursive: true });
+  await mkdir(dataDir, { recursive: true });
+  await mkdir(imgDirA, { recursive: true });
+  await mkdir(imgDirB, { recursive: true });
+
+  const pngBytes = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
+  const jpgBytes = Buffer.from('ffd8ffe000104a464946', 'hex');
+  const webpBytes = Buffer.from('524946460000000057454250', 'hex');
+
+  const imgServer = createServer((req, res) => {
+    if (req.url === '/ok.png') {
+      res.writeHead(200, { 'content-type': 'image/png', 'content-length': String(pngBytes.length) });
+      res.end(pngBytes);
+    } else if (req.url === '/photo') {
+      res.writeHead(200, { 'content-type': 'image/jpeg; charset=binary' });
+      res.end(jpgBytes);
+    } else if (req.url === '/from-url.webp') {
+      res.writeHead(200);
+      res.end(webpBytes);
+    } else if (req.url === '/too-big.png') {
+      res.writeHead(200, { 'content-type': 'image/png', 'content-length': '9999999' });
+      res.end(pngBytes);
+    } else {
+      res.writeHead(404);
+      res.end('not found');
+    }
+  });
+  await new Promise(resolve => imgServer.listen(0, '127.0.0.1', resolve));
+  const baseUrl = `http://127.0.0.1:${imgServer.address().port}`;
+
+  const mockClaude = await makeMockExecutable(
+    join(dir, 'mock-claude'),
+    `
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(claudeArgsLog)}, JSON.stringify(args) + '\\n');
+const pIdx = args.indexOf('-p');
+const prompt = pIdx >= 0 ? args[pIdx + 1] : '';
+console.log(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'ses-img-claude' }));
+console.log(JSON.stringify({ type: 'result', subtype: 'success', session_id: 'ses-img-claude', result: 'CLAUDE_IMG_OK:' + prompt }));
+`,
+  );
+  const mockCodex = await makeMockExecutable(
+    join(dir, 'mock-codex'),
+    `
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(codexArgsLog)}, JSON.stringify(args) + '\\n');
+console.log(JSON.stringify({ type: 'thread.started', thread_id: 'thread-img-codex' }));
+console.log(JSON.stringify({ type: 'item.completed', item: { id: 'm1', type: 'agent_message', text: 'CODEX_IMG_OK' } }));
+console.log(JSON.stringify({ type: 'turn.completed' }));
+`,
+  );
+
+  const prevClaude = process.env.CLAUDE_BIN;
+  const prevCodex = process.env.CODEX_BIN;
+  process.env.CLAUDE_BIN = mockClaude;
+  process.env.CODEX_BIN = mockCodex;
+
+  const tempDownloads = [];
+  t.after(async () => {
+    if (prevClaude === undefined) delete process.env.CLAUDE_BIN;
+    else process.env.CLAUDE_BIN = prevClaude;
+    if (prevCodex === undefined) delete process.env.CODEX_BIN;
+    else process.env.CODEX_BIN = prevCodex;
+    for (const p of tempDownloads) await rm(p, { force: true }).catch(() => {});
+    imgServer.closeAllConnections?.();
+    await new Promise(resolve => imgServer.close(resolve));
+    await rm(rawDir, { recursive: true, force: true });
+  });
+
+  // 1. downloadTempImage checks (both exports)
+  assert.equal(downloadTempImage, downloadWeComTempImage);
+  await assert.rejects(() => downloadTempImage('file:///etc/passwd'), /不支持的图片协议/);
+  await assert.rejects(() => downloadTempImage('not-a-url'), /无效的图片 URL/);
+  await assert.rejects(() => downloadTempImage(`${baseUrl}/missing.png`), /HTTP 404/);
+  await assert.rejects(() => downloadTempImage(`${baseUrl}/too-big.png`, { maxBytes: 1024 }), /超出限制/);
+
+  const dlPng = await downloadTempImage(`${baseUrl}/ok.png`);
+  const dlJpg = await downloadTempImage(`${baseUrl}/photo`);
+  const dlWebp = await downloadTempImage(`${baseUrl}/from-url.webp`);
+  tempDownloads.push(dlPng, dlJpg, dlWebp);
+
+  assert.match(dlPng, /agent-pet-img-.*\.png$/);
+  assert.match(dlJpg, /agent-pet-img-.*\.jpg$/);
+  assert.match(dlWebp, /agent-pet-img-.*\.webp$/);
+  assert.equal((await stat(dlPng)).mode & 0o777, 0o600);
+  assert.deepEqual(await readFile(dlPng), pngBytes);
+  assert.deepEqual(await readFile(dlJpg), jpgBytes);
+
+  // 2. TaskDispatcher image forwarding (claude deduplicated --add-dir & codex -i on exec + resume)
+  const img1 = join(imgDirA, 'shot1.png');
+  const img2 = join(imgDirA, 'shot2.png');
+  const img3 = join(imgDirB, 'shot3.jpg');
+  await writeFile(img1, pngBytes);
+  await writeFile(img2, pngBytes);
+  await writeFile(img3, jpgBytes);
+
+  const dispatcher = new TaskDispatcher({
+    dataDir,
+    allowedWorkspaces: [dir],
+    defaultCwd: workDir,
+  });
+
+  const cRes = await dispatcher.dispatch({
+    engine: 'claude',
+    prompt: '看看这些图',
+    cwd: workDir,
+    images: [img1, img2, img3, join(dir, 'does-not-exist.png'), img1],
+  });
+  assert.equal(cRes.status, 'completed');
+  const claudeInv = JSON.parse((await readFile(claudeArgsLog, 'utf8')).trim().split('\n')[0]);
+  const cPrompt = claudeInv[claudeInv.indexOf('-p') + 1];
+  assert.match(cPrompt, new RegExp(`\\[附加图片路径: ${img1.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}, ${img2.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}, ${img3.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} — 请先读取查看图片内容\\]`));
+  const addDirs = [];
+  for (let i = 0; i < claudeInv.length; i++) {
+    if (claudeInv[i] === '--add-dir') addDirs.push(claudeInv[i + 1]);
+  }
+  assert.deepEqual(addDirs, [imgDirA, imgDirB]);
+
+  const xRes1 = await dispatcher.dispatch({ engine: 'codex', prompt: '分析首图', cwd: workDir, images: [img1, img3] });
+  const xRes2 = await dispatcher.dispatch({ engine: 'codex', prompt: '追问图', cwd: workDir, sessionId: xRes1.sessionId, images: [img2] });
+  assert.equal(xRes2.status, 'completed');
+  const codexInvs = (await readFile(codexArgsLog, 'utf8')).trim().split('\n').map(l => JSON.parse(l));
+  assert.ok(codexInvs[0].includes('-i'));
+  assert.equal(codexInvs[0][codexInvs[0].indexOf('-i') + 1], img1);
+  assert.equal(codexInvs[1][0], 'exec');
+  assert.equal(codexInvs[1][1], 'resume');
+  assert.ok(codexInvs[1].includes('-i'));
+  assert.equal(codexInvs[1][codexInvs[1].indexOf('-i') + 1], img2);
+
+  // 3. End-to-end QQ + WeCom image download -> BotService -> CommandRouter -> TaskDispatcher + cleanup
+  const svc = new BotService({ rootDir: ROOT_DIR, dataDir });
+  t.after(() => svc.stop());
+  await svc.start();
+  await svc.saveConfig({
+    defaultEngine: 'claude',
+    defaultCwd: workDir,
+    allowedWorkspaces: [dir],
+    authorizedUsers: { qq: ['3003'], wecom: ['wangwu'] },
+    qq: { enabled: true, mode: 'server', listenHost: '127.0.0.1', listenPort: 0, listenPath: '/onebot/v11/ws' },
+  });
+
+  const qqPort = svc.getState().channels.qq.port;
+  const qqSent = [];
+  const qqSeenImages = [];
+  svc.qq.on('message', m => qqSeenImages.push(...m.images));
+  const qqWs = new globalThis.WebSocket(`ws://127.0.0.1:${qqPort}/onebot/v11/ws`);
+  t.after(() => { try { qqWs.close(); } catch {} });
+  await new Promise((resolve, reject) => {
+    qqWs.addEventListener('open', resolve, { once: true });
+    qqWs.addEventListener('error', reject, { once: true });
+  });
+  qqWs.addEventListener('message', ev => {
+    const f = JSON.parse(String(ev.data));
+    qqSent.push(f);
+    if (f.echo) qqWs.send(JSON.stringify({ status: 'ok', retcode: 0, echo: f.echo }));
+  });
+  await waitFor(() => svc.qq.isConnected());
+
+  // Image-only QQ segment triggers default image prompt & temp file gets cleaned up afterwards
+  qqWs.send(JSON.stringify({
+    post_type: 'message',
+    message_type: 'private',
+    self_id: 99001,
+    user_id: 3003,
+    message: [{ type: 'image', data: { url: `${baseUrl}/ok.png` } }],
+  }));
+  await waitFor(() => qqSent.some(f => f.params?.message?.includes('CLAUDE_IMG_OK')));
+  const qqReply = qqSent.find(f => f.params?.message?.includes('CLAUDE_IMG_OK')).params.message;
+  assert.match(qqReply, /请分析这张图片中的问题并给出解决方案/);
+  assert.equal(qqSeenImages.length, 1);
+  await waitFor(() => !existsSync(qqSeenImages[0]));
+
+  // WeCom mixed image + text through loopback WS server
+  let wecomConn = null;
+  const wecomReplies = [];
+  const wecomWsSrv = await createLoopbackWsServer({
+    onConnection: conn => {
+      wecomConn = conn;
+      conn.onText = raw => {
+        const frame = JSON.parse(raw);
+        if (frame.cmd === 'aibot_subscribe') {
+          conn.sendJson({ headers: { req_id: frame.headers.req_id }, errcode: 0, errmsg: 'ok' });
+        } else if (frame.cmd === 'aibot_respond_msg') {
+          wecomReplies.push(frame);
+        }
+      };
+    },
+  });
+  t.after(() => wecomWsSrv.close());
+
+  await svc.saveConfig({
+    wecom: { enabled: true, wsUrl: wecomWsSrv.url, botId: 'b-img', secret: 's-img' },
+  });
+  await waitFor(() => svc.wecom.subscribed && wecomConn);
+
+  const wecomSeenImages = [];
+  svc.wecom.on('message', m => wecomSeenImages.push(...m.images));
+  wecomConn.sendJson({
+    cmd: 'aibot_msg_callback',
+    headers: { req_id: 'cb-img-1' },
+    body: {
+      msgid: 'm-img-1',
+      chattype: 'single',
+      from: { userid: 'wangwu' },
+      mixed: {
+        msg_item: [
+          { msgtype: 'text', text: { content: '检查企微截图' } },
+          { msgtype: 'image', image: { url: `${baseUrl}/photo` } },
+        ],
+      },
+    },
+  });
+
+  await waitFor(() => wecomReplies.some(f => f.body?.stream?.finish && f.body.stream.content.includes('CLAUDE_IMG_OK')));
+  const finalWecom = wecomReplies.find(f => f.body?.stream?.finish);
+  assert.match(finalWecom.body.stream.content, /检查企微截图/);
+  assert.equal(wecomSeenImages.length, 1);
+  assert.match(wecomSeenImages[0], /\.jpg$/);
+  await waitFor(() => !existsSync(wecomSeenImages[0]));
+});
+
+test('AutoStartManager LaunchAgent plist 生成、XML 转义、enable/disable/setEnabled 与临时 homeDir 隔离', async t => {
+  const tempRoot = await mkdtemp(join(tmpdir(), 'agent-pet-autostart-'));
+  const fakeHome = join(tempRoot, "home & 'test'");
+  const fakeRoot = join(tempRoot, 'repo<dir>');
+  await mkdir(fakeHome, { recursive: true });
+  await mkdir(fakeRoot, { recursive: true });
+  t.after(() => rm(tempRoot, { recursive: true, force: true }));
+
+  const mgr = new AutoStartManager({ homeDir: fakeHome, rootDir: fakeRoot });
+  assert.equal(mgr.plistPath(), join(fakeHome, 'Library', 'LaunchAgents', `${LAUNCH_AGENT_LABEL}.plist`));
+  assert.equal(mgr.isEnabled(), false);
+
+  // Fallback ProgramArguments uses node + scripts/start.cjs
+  assert.deepEqual(mgr.resolveProgramArguments(), [process.execPath, join(fakeRoot, 'scripts', 'start.cjs')]);
+
+  // Enable & validate XML plist + 0644 permissions + XML escaping
+  const enabledRes = mgr.setEnabled(true);
+  assert.equal(enabledRes.enabled, true);
+  assert.equal(enabledRes.plistPath, mgr.plistPath());
+  assert.equal(mgr.isEnabled(), true);
+  assert.equal((await stat(mgr.plistPath())).mode & 0o777, 0o644);
+
+  const xml = await readFile(mgr.plistPath(), 'utf8');
+  assert.match(xml, /^<\?xml version="1\.0" encoding="UTF-8"\?>/);
+  assert.match(xml, /<!DOCTYPE plist PUBLIC "-\/\/Apple\/\/DTD PLIST 1\.0\/\/EN"/);
+  assert.match(xml, new RegExp(`<key>Label<\\/key>\\s*<string>${LAUNCH_AGENT_LABEL}<\\/string>`));
+  assert.match(xml, /<key>RunAtLoad<\/key>\s*<true\/>/);
+  assert.match(xml, /<key>KeepAlive<\/key>\s*<false\/>/);
+  assert.match(xml, /<key>ProcessType<\/key>\s*<string>Interactive<\/string>/);
+  assert.match(xml, /repo&lt;dir&gt;\/scripts\/start\.cjs/);
+
+  // Bundled AgentPet binary takes precedence over fallback
+  const bundledExec = join(fakeHome, 'Applications', 'Agent Pet.app', 'Contents', 'MacOS', 'AgentPet');
+  await mkdir(dirname(bundledExec), { recursive: true });
+  await writeFile(bundledExec, '#!/bin/sh\n', { mode: 0o755 });
+  assert.deepEqual(mgr.resolveProgramArguments(), [bundledExec]);
+
+  mgr.enable();
+  const bundledXml = await readFile(mgr.plistPath(), 'utf8');
+  assert.match(bundledXml, /home &amp; &apos;test&apos;\/Applications\/Agent Pet\.app\/Contents\/MacOS\/AgentPet/);
+
+  // Explicit appExecPath overrides bundled binary
+  const customMgr = new AutoStartManager({ homeDir: fakeHome, rootDir: fakeRoot, appExecPath: '/Custom/AgentPet' });
+  assert.deepEqual(customMgr.resolveProgramArguments(), ['/Custom/AgentPet']);
+
+  // Disable removes plist and is idempotent
+  const disabledRes = mgr.setEnabled(false);
+  assert.equal(disabledRes.enabled, false);
+  assert.equal(mgr.isEnabled(), false);
+  assert.equal(existsSync(mgr.plistPath()), false);
+  assert.equal(mgr.disable(), false);
 });

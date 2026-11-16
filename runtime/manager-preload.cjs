@@ -22,6 +22,7 @@ contextBridge.exposeInMainWorld('agentManager', Object.freeze({
     testPush: channel => ipcRenderer.invoke('companion:bot', { action: 'test', channel }),
     stopJob: jobId => ipcRenderer.invoke('companion:bot', { action: 'stop-job', jobId }),
     browseCwd: () => ipcRenderer.invoke('companion:bot', { action: 'browse-cwd' }),
+    setAutoStart: enabled => ipcRenderer.invoke('companion:bot', { action: 'autostart', enabled }),
     onUpdated: callback => subscribe('companion:bot-updated', callback),
   }),
 }));

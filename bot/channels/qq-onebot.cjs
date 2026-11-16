@@ -1,7 +1,10 @@
 'use strict';
 
 const crypto = require('node:crypto');
+const fs = require('node:fs');
 const http = require('node:http');
+const os = require('node:os');
+const path = require('node:path');
 const { EventEmitter } = require('node:events');
 
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
@@ -9,6 +12,97 @@ const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 const MAX_CHUNK_LEN = 3500;
 const INITIAL_BACKOFF_MS = 2000;
 const MAX_BACKOFF_MS = 30000;
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const IMAGE_DOWNLOAD_TIMEOUT_MS = 10_000;
+
+const MIME_TO_EXT = {
+  'image/png': '.png',
+  'image/jpeg': '.jpg',
+  'image/jpg': '.jpg',
+  'image/webp': '.webp',
+  'image/gif': '.gif',
+  'image/bmp': '.bmp',
+};
+const VALID_IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp']);
+
+async function downloadTempImage(url, {
+  fetchImpl = globalThis.fetch,
+  timeoutMs = IMAGE_DOWNLOAD_TIMEOUT_MS,
+  maxBytes = MAX_IMAGE_BYTES,
+} = {}) {
+  if (typeof fetchImpl !== 'function') {
+    throw new Error('当前环境不支持 fetch');
+  }
+  let parsed;
+  try {
+    parsed = new URL(String(url || '').trim());
+  } catch {
+    throw new Error(`无效的图片 URL: ${url}`);
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw new Error(`不支持的图片协议: ${parsed.protocol}`);
+  }
+
+  const response = await fetchImpl(parsed.toString(), {
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!response?.ok) {
+    throw new Error(`下载图片失败: HTTP ${response?.status ?? 'unknown'}`);
+  }
+
+  const contentLengthHeader = response.headers?.get?.('content-length');
+  if (contentLengthHeader) {
+    const expectedLen = Number(contentLengthHeader);
+    if (Number.isFinite(expectedLen) && expectedLen > maxBytes) {
+      throw new Error(`图片大小超出限制 (${expectedLen} > ${maxBytes})`);
+    }
+  }
+
+  let buf;
+  if (response.body && typeof response.body.getReader === 'function') {
+    const reader = response.body.getReader();
+    const chunks = [];
+    let total = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = Buffer.from(value);
+        total += chunk.length;
+        if (total > maxBytes) {
+          throw new Error(`图片大小超出限制 (>${maxBytes} bytes)`);
+        }
+        chunks.push(chunk);
+      }
+    } catch (err) {
+      try { await reader.cancel(); } catch {}
+      throw err;
+    }
+    buf = Buffer.concat(chunks, total);
+  } else {
+    const ab = await response.arrayBuffer();
+    if (ab.byteLength > maxBytes) {
+      throw new Error(`图片大小超出限制 (${ab.byteLength} > ${maxBytes})`);
+    }
+    buf = Buffer.from(ab);
+  }
+
+  const rawContentType = String(response.headers?.get?.('content-type') || '')
+    .split(';')[0]
+    .trim()
+    .toLowerCase();
+  let ext = MIME_TO_EXT[rawContentType] || '';
+  if (!ext) {
+    const urlExt = path.extname(parsed.pathname || '').toLowerCase();
+    if (VALID_IMAGE_EXTS.has(urlExt)) ext = urlExt;
+  }
+  if (!ext) ext = '.png';
+
+  const filePath = path.join(os.tmpdir(), `agent-pet-img-${crypto.randomUUID()}${ext}`);
+  await fs.promises.writeFile(filePath, buf, { mode: 0o600 });
+  await fs.promises.chmod(filePath, 0o600).catch(() => {});
+  return filePath;
+}
 
 function computeWebSocketAccept(secWebSocketKey) {
   return crypto
@@ -165,6 +259,20 @@ function stripCQCodeText(raw, effectiveSelfId) {
   return { text: text.trim(), mentioned };
 }
 
+function extractCQImageUrls(raw) {
+  const urls = [];
+  const str = String(raw || '');
+  const re = /\[CQ:image,[^\]]*url=([^,\]]+)[^\]]*\]/gi;
+  let m;
+  while ((m = re.exec(str)) !== null) {
+    const u = unescapeCQ(m[1]).trim();
+    if (/^https?:\/\//i.test(u) && !urls.includes(u)) {
+      urls.push(u);
+    }
+  }
+  return urls;
+}
+
 function extractOneBotText(event, fallbackSelfId = '') {
   if (!event || event.post_type !== 'message') return null;
 
@@ -179,6 +287,13 @@ function extractOneBotText(event, fallbackSelfId = '') {
 
   let mentioned = false;
   let text = '';
+  const imageUrls = [];
+  const addImageUrl = rawUrl => {
+    const u = typeof rawUrl === 'string' ? rawUrl.trim() : '';
+    if (/^https?:\/\//i.test(u) && !imageUrls.includes(u)) {
+      imageUrls.push(u);
+    }
+  };
 
   if (Array.isArray(event.message) && event.message.length > 0) {
     const parts = [];
@@ -195,6 +310,8 @@ function extractOneBotText(event, fallbackSelfId = '') {
         } else if (qq) {
           parts.push(`@${qq} `);
         }
+      } else if (seg.type === 'image') {
+        addImageUrl(seg.data?.url || seg.data?.file);
       }
     }
     text = parts.join('').trim();
@@ -206,6 +323,9 @@ function extractOneBotText(event, fallbackSelfId = '') {
         text = text.replace(selfAtRe, '').trim();
       }
     }
+    if (event.raw_message) {
+      for (const u of extractCQImageUrls(event.raw_message)) addImageUrl(u);
+    }
   } else {
     const raw = typeof event.message === 'string' && event.message
       ? event.message
@@ -213,10 +333,15 @@ function extractOneBotText(event, fallbackSelfId = '') {
     const parsed = stripCQCodeText(raw, effectiveSelfId);
     text = parsed.text;
     mentioned = parsed.mentioned;
+    for (const u of extractCQImageUrls(raw)) addImageUrl(u);
+    if (event.raw_message && event.raw_message !== raw) {
+      for (const u of extractCQImageUrls(event.raw_message)) addImageUrl(u);
+    }
   }
 
   return {
     text,
+    imageUrls,
     mentioned,
     isPrivate: messageType === 'private',
     isGroup: messageType === 'group',
@@ -302,6 +427,7 @@ class QQOneBotAdapter extends EventEmitter {
     this.config = this.#normalizeConfig(options.config || options);
     this.onMessage = typeof options.onMessage === 'function' ? options.onMessage : null;
     this.WebSocketImpl = options.WebSocketImpl || globalThis.WebSocket;
+    this.fetchImpl = options.fetchImpl || globalThis.fetch;
     this.started = false;
     this.selfId = '';
     this.status = 'disconnected';
@@ -826,7 +952,24 @@ class QQOneBotAdapter extends EventEmitter {
     if (extracted.isGroup && this.config.groupRequireMention !== false) {
       if (!extracted.mentioned && !isCommandPrefix) return;
     }
-    if (!extracted.text) return;
+    const imageUrls = Array.isArray(extracted.imageUrls) ? extracted.imageUrls : [];
+    if (!extracted.text && imageUrls.length === 0) return;
+
+    void this.#dispatchIncomingMessage(payload, extracted, imageUrls);
+  }
+
+  async #dispatchIncomingMessage(payload, extracted, imageUrls) {
+    const downloadedImages = [];
+    if (imageUrls.length > 0) {
+      const settled = await Promise.allSettled(
+        imageUrls.map(url => downloadTempImage(url, { fetchImpl: this.fetchImpl })),
+      );
+      for (const res of settled) {
+        if (res.status === 'fulfilled' && res.value) {
+          downloadedImages.push(res.value);
+        }
+      }
+    }
 
     const replyTarget = extracted.isGroup
       ? { type: 'group', id: extracted.groupId }
@@ -842,6 +985,8 @@ class QQOneBotAdapter extends EventEmitter {
       groupId: extracted.groupId || undefined,
       mentioned: extracted.mentioned,
       text: extracted.text,
+      imageUrls,
+      images: downloadedImages,
       raw: payload,
       reply: text => this.sendMessage(replyTarget, text),
       onProgress: progress => {
@@ -854,11 +999,24 @@ class QQOneBotAdapter extends EventEmitter {
       },
     };
 
-    this.emit('message', msg);
-    if (this.onMessage) {
-      Promise.resolve(this.onMessage(msg)).catch(err => {
-        if (this.listenerCount('error') > 0) this.emit('error', err);
-      });
+    try {
+      this.emit('message', msg);
+      if (this.onMessage) {
+        await this.onMessage(msg);
+      }
+    } catch (err) {
+      if (this.listenerCount('error') > 0) this.emit('error', err);
+    } finally {
+      if (downloadedImages.length > 0) {
+        if (this.onMessage) {
+          await Promise.all(downloadedImages.map(p => fs.promises.unlink(p).catch(() => {})));
+        } else {
+          const timer = setTimeout(() => {
+            for (const p of downloadedImages) fs.promises.unlink(p).catch(() => {});
+          }, 30_000);
+          timer.unref?.();
+        }
+      }
     }
   }
 
@@ -954,4 +1112,5 @@ module.exports = {
   extractOneBotText,
   chunkText,
   parseOneBotTarget,
+  downloadTempImage,
 };

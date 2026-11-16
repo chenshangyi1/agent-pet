@@ -65,7 +65,8 @@ function makeProviderIcon(provider = 'dsh') {
   }, { once: true });
   return img;
 }
-let source = 'auto', dshConnected = false, knownSources = [];
+const DIRECT_CHAT_SOURCES = new Set(['auto', 'dsh', 'claude', 'codex']);
+let source = 'auto', dshConnected = false, localEngine = 'claude', knownSources = [], sourceInitialized = false;
 let items = [], current, animationKey, polling = false, noticeTimer, drag, suppressClick = false;
 
 /* -------------------------------------------------------------------------- */
@@ -277,8 +278,9 @@ function makeCard(item, { stacked = false, stackLayer = 0, stackTotal = 1 } = {}
     head.append(el('span', 'activity-stack-count', `${stackTotal} 项 ⌄`));
   }
   copy.append(head);
-  const fallback = item.detail || labels[item.status] || '打开 DSH 会话';
-  copy.append(el('span', 'activity-detail', shortDetail(fallback) || labels[item.status] || '打开 DSH 会话'));
+  const openFallback = item.provider === 'dsh' ? '打开 DSH 会话' : '打开会话';
+  const fallback = item.detail || labels[item.status] || openFallback;
+  copy.append(el('span', 'activity-detail', shortDetail(fallback) || labels[item.status] || openFallback));
   copy.append(el('span', 'activity-detail-full', fallback));
   if (['running', 'waiting'].includes(item.status)) {
     const progress = item.progress;
@@ -320,7 +322,7 @@ function makeCard(item, { stacked = false, stackLayer = 0, stackTotal = 1 } = {}
       const reason = pending.reason ? ` · ${pending.reason}` : '';
       approval.append(el('span', 'approval-reason', `需要批准 ${pending.toolName || '操作'}${reason}`));
     }
-    const handle = el('button', 'approval-open', '在 DSH 中处理');
+    const handle = el('button', 'approval-open', item.provider === 'dsh' ? '在 DSH 中处理' : '立即查看');
     handle.type = 'button';
     handle.addEventListener('click', event => { event.stopPropagation(); run(() => openDsh(item)); });
     approval.append(handle);
@@ -420,13 +422,18 @@ async function poll() {
   try {
     const response = await action('list');
     knownSources = Array.isArray(response.sources) ? response.sources : knownSources;
-    dshConnected = response.sources ? Boolean(response.sources.find(row => row.id === 'dsh')?.connected) : true;
-    const isReadOnlySource = source !== 'auto' && source !== 'dsh';
-    const readOnlyLabel = isReadOnlySource ? (knownSources.find(row => row.id === source)?.label || source) : '';
-    composeButton.disabled = !readOnlyLabel && !dshConnected;
-    composeButton.title = readOnlyLabel ? `打开 ${readOnlyLabel}` : dshConnected ? '新建 DSH 聊天' : '请先启动 DSH';
+    dshConnected = response.sources ? Boolean(response.sources.find(row => row.id === 'dsh')?.connected) : false;
+    const isDirectChat = DIRECT_CHAT_SOURCES.has(source);
+    const readOnlyLabel = !isDirectChat ? (knownSources.find(row => row.id === source)?.label || source) : '';
+    const activeLocalName = source === 'codex' || (source !== 'claude' && localEngine === 'codex') ? 'Codex' : 'Claude Code';
+    composeButton.disabled = false;
+    composeButton.title = readOnlyLabel
+      ? `打开 ${readOnlyLabel}`
+      : (dshConnected && ['auto', 'dsh'].includes(source))
+        ? '新建 DSH 聊天'
+        : `新建本地聊天 (${activeLocalName})`;
     composeButton.setAttribute('aria-label', composeButton.title);
-    voiceButton.disabled = Boolean(readOnlyLabel) || !dshConnected;
+    voiceButton.disabled = !isDirectChat;
     const next = visibleActivities(response.items ?? []);
     // Stamp the first moment a card is offerable, so its lifetime is counted from
     // when the user could actually see it rather than from the session's start.
@@ -448,6 +455,14 @@ async function poll() {
 }
 
 async function openDsh(item = current) {
+  if (item?.sessionId?.startsWith('local:')) {
+    await openTranscript(item.sessionId);
+    return;
+  }
+  if (!item && !dshConnected && DIRECT_CHAT_SOURCES.has(source)) {
+    showQuickChat();
+    return;
+  }
   await action(item ? 'focus' : 'home', item ? { sessionId: item.sessionId } : {});
   pet.classList.remove('show'); character.blur();
   await poll();
@@ -466,7 +481,11 @@ async function sendPrompt(text, { sessionId: existingSessionId, trackReply = fal
   const options = { sessionId: existingSessionId, trackReply, content: extra, quoted: quotedText, reuseActive };
   try {
     let sessionId = existingSessionId ?? (reuseActive ? prefs.activeSessionId : null);
-    if (!sessionId) { sessionId = `session-${crypto.randomUUID()}`; await action('create', { sessionId }); }
+    if (!sessionId) {
+      const requestedId = `session-${crypto.randomUUID()}`;
+      const created = await action('create', { sessionId: requestedId });
+      sessionId = created?.sessionId || requestedId;
+    }
     const baselineSeq = trackReply ? (await action('conversation', { sessionId })).lastSeq ?? -1 : undefined;
     const parts = [];
     if (quotedText) parts.push({ type: 'text', text: `[引用] ${quotedText.slice(0, 400)}` });
@@ -486,7 +505,10 @@ async function sendPrompt(text, { sessionId: existingSessionId, trackReply = fal
     $('context-popover').hidden = true;
     pet.classList.remove('context-open');
     $('tool-context').setAttribute('aria-expanded', 'false');
-    showFeedback(existingSessionId ? '已回复该会话' : '已发送到新的 DSH 会话');
+    const isLocalReply = sessionId.startsWith('local:') || ['claude', 'codex'].includes(source) || !dshConnected;
+    showFeedback(existingSessionId
+      ? '已回复该会话'
+      : (isLocalReply ? '已发送给小鑫本地助手' : '已发送到新的 DSH 会话'));
     pet.classList.add('activities-open');
     activitiesButton.setAttribute('aria-pressed', 'true');
     await poll();
@@ -522,8 +544,9 @@ function renderModel() {
 }
 async function ensureSession() {
   if (prefs.activeSessionId) return prefs.activeSessionId;
-  const sessionId = `session-${crypto.randomUUID()}`;
-  await action('create', { sessionId });
+  const requestedId = `session-${crypto.randomUUID()}`;
+  const created = await action('create', { sessionId: requestedId });
+  const sessionId = created?.sessionId || requestedId;
   prefs.activeSessionId = sessionId; savePrefs();
   return sessionId;
 }
@@ -606,7 +629,7 @@ async function loadTranscript() {
     for (const message of view.messages) {
       const row = el('div', 'transcript-message');
       row.dataset.role = message.role;
-      row.append(el('span', 'transcript-role', message.role === 'user' ? '你' : 'DSH'));
+      row.append(el('span', 'transcript-role', message.role === 'user' ? '你' : (transcriptSessionId?.startsWith('local:') ? '小鑫' : 'DSH')));
       row.append(el('span', 'transcript-body', message.text || (message.attachments ? `[${message.attachments} 个附件]` : '')));
       const reply = el('button', 'transcript-reply', '回复');
       reply.type = 'button';
@@ -683,6 +706,7 @@ async function speakReply(text, epoch) {
 }
 
 async function waitForVoiceReply(sessionId, baselineSeq, epoch) {
+  const isLocalVoice = sessionId.startsWith('local:') || ['claude', 'codex'].includes(source) || !dshConnected;
   const deadline = Date.now() + 5 * 60_000;
   while (voiceConversation && epoch === voiceEpoch && Date.now() < deadline) {
     const view = await action('conversation', { sessionId });
@@ -690,16 +714,18 @@ async function waitForVoiceReply(sessionId, baselineSeq, epoch) {
       const messages = (view.messages ?? []).filter(message => message.seq > baselineSeq);
       const heardPrompt = messages.some(message => message.role === 'user');
       const reply = heardPrompt && [...messages].reverse().find(message => message.role === 'assistant' && message.text?.trim());
-      if (reply) { showFeedback('DSH 正在语音回复…'); await speakReply(reply.text, epoch); return true; }
+      if (reply) { showFeedback(isLocalVoice ? '小鑫正在语音回复…' : 'DSH 正在语音回复…'); await speakReply(reply.text, epoch); return true; }
     }
     if (['waiting', 'blocked'].includes(view.status)) {
       voiceConversation = false; setVoiceButton(false);
-      showFeedback(view.detail || '任务需要你在 DSH 中处理');
+      showFeedback(view.detail || (isLocalVoice ? '任务需要你进一步处理' : '任务需要你在 DSH 中处理'));
       return false;
     }
     await new Promise(resolve => setTimeout(resolve, 900));
   }
-  if (voiceConversation && epoch === voiceEpoch) throw new Error('等待 DSH 回复超时，请在 DSH 中查看任务');
+  if (voiceConversation && epoch === voiceEpoch) {
+    throw new Error(isLocalVoice ? '等待小鑫回复超时，请稍后重试' : '等待 DSH 回复超时，请在 DSH 中查看任务');
+  }
 }
 
 async function recordVoiceChunk(epoch) {
@@ -794,7 +820,7 @@ async function startVoice() {
 character.addEventListener('click', event => { if (suppressClick) { suppressClick = false; return; } if (event.detail === 1) notice(); });
 character.addEventListener('dblclick', () => { if (!suppressClick) run(() => openDsh()); });
 composeButton.addEventListener('click', event => {
-  if (source !== 'auto' && source !== 'dsh') { run(() => action('home')); return; }
+  if (!DIRECT_CHAT_SOURCES.has(source)) { run(() => action('home')); return; }
   const open = pet.classList.toggle('compose-open');
   event.currentTarget.setAttribute('aria-expanded', String(open));
   if (open) { pet.classList.add('show'); closeContext(); setTimeout(() => quickInput.focus(), 30); }
@@ -805,7 +831,7 @@ $('quick-chat').addEventListener('submit', event => {
   run(() => sendPrompt(quickInput.value, { content: pendingImages, reuseActive: true }));
 });
 voiceButton.addEventListener('click', () => {
-  if (!dshConnected) { showFeedback('请先启动 DSH 后再开始语音对话'); notice(); return; }
+  if (!DIRECT_CHAT_SOURCES.has(source)) { showFeedback('当前工具仅支持状态观察，请切换到自动/Claude/Codex/DSH'); notice(); return; }
   if (voiceButton.dataset.available === 'false') { showFeedback('当前桌面环境未找到语音识别组件'); notice(); return; }
   run(startVoice);
 });
@@ -907,17 +933,35 @@ if (native) {
   const applySource = mode => {
     if (mode.source && source !== mode.source) {
       source = mode.source;
+      if (sourceInitialized) {
+        prefs.activeSessionId = null;
+        prefs.model = null;
+        savePrefs();
+        renderModel();
+      }
       voiceConversation = false; voiceEpoch++; voiceSessionId = undefined;
       if (recorder?.state === 'recording') recorder.stop();
       mediaStream?.getTracks().forEach(track => track.stop()); window.speechSynthesis?.cancel(); setVoiceButton(false);
       pet.classList.remove('show', 'compose-open', 'transcript-open', 'context-open');
       $('transcript').hidden = true; $('context-popover').hidden = true;
-      run(poll);
+      run(async () => {
+        const info = await action('info').catch(() => null);
+        if (info) {
+          voiceButton.dataset.available = String(Boolean(info.speechAvailable));
+          if (info.localEngine) localEngine = info.localEngine;
+        }
+        await poll();
+      });
     }
+    sourceInitialized = true;
   };
   native.onMode(mode => { applySource(mode); applyPlacement(mode.placement); document.body.classList.toggle('control-only', mode.controlOnly); if (mode.notice) notice(); if (mode.focusQuickChat) showQuickChat(); });
   run(async () => { const mode = await native.window('placement'); applySource(mode); applyPlacement(mode.placement); document.body.classList.toggle('control-only', mode.controlOnly); });
-  run(async () => { const info = await action('info'); voiceButton.dataset.available = String(Boolean(info.speechAvailable)); });
+  run(async () => {
+    const info = await action('info');
+    voiceButton.dataset.available = String(Boolean(info.speechAvailable));
+    if (info.localEngine) localEngine = info.localEngine;
+  });
   // Click-through must follow real geometry, not CSS `:hover`. Turning on
   // `setIgnoreMouseEvents` makes the page stop receiving hover, which hides the
   // panel mid-travel — that is what made it vanish on the way down.

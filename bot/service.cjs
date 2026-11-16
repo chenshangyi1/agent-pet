@@ -8,6 +8,7 @@ const { EventEmitter } = require('node:events');
 
 const { TaskDispatcher } = require('./dispatcher.cjs');
 const { CommandRouter } = require('./commands.cjs');
+const { LocalChatBridge } = require('./local-chat.cjs');
 const { QQOneBotAdapter } = require('./channels/qq-onebot.cjs');
 const { WeComAdapter } = require('./channels/wecom.cjs');
 
@@ -205,6 +206,11 @@ class BotService extends EventEmitter {
       allowedWorkspaces: this.config.allowedWorkspaces,
       defaultCwd: this.config.defaultCwd,
       sandboxMode: this.config.sandboxMode,
+    });
+
+    this.localChat = new LocalChatBridge({
+      dispatcher: this.dispatcher,
+      getConfig: () => this.config,
     });
 
     this.router = options.router || new CommandRouter({
@@ -407,6 +413,7 @@ class BotService extends EventEmitter {
         senderId: msg.senderId,
         senderName: msg.senderName,
         text: msg.text,
+        images: Array.isArray(msg.images) ? msg.images : [],
         isAuthorized: isAuth,
         pairingCode: this.config.pairingCode,
         reply: wrappedReply,
