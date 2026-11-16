@@ -4,9 +4,9 @@ const { app, BrowserWindow, ipcMain, globalShortcut, Tray, Menu, nativeImage, sh
 const { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync } = require('node:fs');
 const path = require('node:path');
 const { homedir } = require('node:os');
-const { execFile } = require('node:child_process');
+const { execFile, spawn } = require('node:child_process');
 const { createServer } = require('node:http');
-const { randomBytes, timingSafeEqual } = require('node:crypto');
+const { randomBytes, randomUUID, timingSafeEqual } = require('node:crypto');
 const { Providers, sortRows } = require('./providers.cjs');
 const { createNotch } = require('./notch.cjs');
 const { layoutPet } = require('./placement.cjs');
@@ -144,7 +144,14 @@ function menuTemplate() {
 }
 function setSource(source) {
   if (!validSources().includes(source)) throw new Error('来源无效');
-  settings.source = source; save(); win?.webContents.send('companion:mode', mode()); notch?.send();
+  settings.source = source;
+  if (source !== 'auto' && CATALOG_BY_ID[source]) {
+    settings.chatTarget = source;
+    if (botService?.localChat && ['claude', 'codex', 'opencode', 'dsh'].includes(source)) {
+      botService.localChat.selectedEngine = source;
+    }
+  }
+  save(); win?.webContents.send('companion:mode', mode()); notch?.send();
 }
 function openBundle(providerId) {
   const entry = CATALOG_BY_ID[providerId];
@@ -163,7 +170,94 @@ async function rpc(body) {
   }
 }
 const INTERACTIVE_ACTIONS = new Set(['create', 'prompt', 'conversation', 'cancel', 'models', 'selectModel', 'skills', 'files']);
-const DIRECT_CHAT_SOURCES = new Set(['auto', 'dsh', 'claude', 'codex']);
+const DIRECT_CHAT_SOURCES = new Set(['auto', 'dsh', 'claude', 'codex', 'opencode']);
+
+function isDshOnline() {
+  return Boolean(providers.snapshot?.sources?.find(row => row.id === 'dsh')?.connected);
+}
+
+function currentTargetAgent() {
+  const saved = typeof settings.chatTarget === 'string' ? settings.chatTarget.trim() : '';
+  if (saved && CATALOG_BY_ID[saved]) return saved;
+  const probes = botService?.dispatcher?.probeEngines ? botService.dispatcher.probeEngines() : {};
+  if (probes.claude?.available) return 'claude';
+  if (probes.codex?.available) return 'codex';
+  if (probes.opencode?.available) return 'opencode';
+  return 'dsh';
+}
+
+function getChatTargets() {
+  const probes = botService?.dispatcher?.probeEngines ? botService.dispatcher.probeEngines() : {};
+  const dshOnline = isDshOnline();
+  const out = [];
+  for (const id of registry.enabledIds()) {
+    const entry = CATALOG_BY_ID[id];
+    if (!entry) continue;
+    let isDirect = false;
+    if (id === 'claude') isDirect = Boolean(probes.claude?.available);
+    else if (id === 'codex') isDirect = Boolean(probes.codex?.available);
+    else if (id === 'opencode') isDirect = Boolean(probes.opencode?.available);
+    else if (id === 'dsh') isDirect = dshOnline;
+    else if (id === 'antigravity') isDirect = Boolean(probes.antigravity?.available);
+    out.push({
+      id,
+      label: entry.label,
+      mode: isDirect ? 'direct' : 'launch',
+      available: true,
+    });
+  }
+  return out;
+}
+
+function copyToClipboard(text) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('/usr/bin/pbcopy', [], { stdio: ['pipe', 'ignore', 'ignore'] });
+    child.on('error', reject);
+    child.on('close', code => (code === 0 ? resolve() : reject(new Error('复制到剪贴板失败'))));
+    child.stdin.end(String(text || ''), 'utf8');
+  });
+}
+
+function extractPromptText(body = {}) {
+  const parts = [];
+  if (typeof body.text === 'string' && body.text.trim()) parts.push(body.text.trim());
+  if (Array.isArray(body.content)) {
+    for (const part of body.content) {
+      if (typeof part === 'string' && !part.startsWith('data:image/') && part.trim()) parts.push(part.trim());
+      else if (part && typeof part === 'object' && part.type === 'text' && typeof part.text === 'string' && part.text.trim()) parts.push(part.text.trim());
+    }
+  } else if (typeof body.content === 'string' && !body.content.startsWith('data:image/') && body.content.trim()) {
+    parts.push(body.content.trim());
+  }
+  return parts.join('\n').trim();
+}
+
+function parseInlineTarget(body = {}) {
+  const check = raw => {
+    const trimmed = typeof raw === 'string' ? raw.trim() : '';
+    if (!trimmed || trimmed.startsWith('[引用]')) return null;
+    const match = trimmed.match(/^@([a-z0-9-]+)(?:\s+([\s\S]*))?$/i);
+    if (!match) return null;
+    const id = match[1].toLowerCase();
+    if (!CATALOG_BY_ID[id]) return null;
+    return { id, rest: String(match[2] || '').trim() };
+  };
+  if (typeof body.text === 'string') {
+    const hit = check(body.text);
+    if (hit) return hit;
+  }
+  if (Array.isArray(body.content)) {
+    for (const part of body.content) {
+      const raw = typeof part === 'string' ? part : (part?.type === 'text' ? part.text : '');
+      const hit = check(raw);
+      if (hit) return hit;
+    }
+  } else if (typeof body.content === 'string') {
+    const hit = check(body.content);
+    if (hit) return hit;
+  }
+  return null;
+}
 
 async function agentAction(body) {
   if (body.action === 'list') {
@@ -185,26 +279,25 @@ async function agentAction(body) {
     return { ...base, items: sortRows([...mergedMap.values()]) };
   }
   if (body.action === 'info') {
-    const localEngine = botService?.localChat?.resolveEngine(settings.source)
-      || (settings.source === 'codex' ? 'codex' : 'claude');
-    if (['dsh', 'auto'].includes(settings.source)) {
+    let dshConnected = isDshOnline();
+    let dshSpeech = false;
+    if (['dsh', 'auto'].includes(settings.source) || dshConnected) {
       try {
         const info = await rpc(body);
-        return {
-          ...info,
-          connected: true,
-          dshConnected: true,
-          localEngine,
-          speechAvailable: Boolean(info.speechAvailable || localSpeech.hasRecognizer()),
-          source: settings.source,
-        };
+        dshConnected = true;
+        dshSpeech = Boolean(info?.speechAvailable);
       } catch {}
     }
+    const targetAgent = currentTargetAgent();
+    const localEngine = botService?.localChat?.resolveEngine(settings.source)
+      || (['claude', 'codex', 'opencode'].includes(targetAgent) ? targetAgent : 'claude');
     return {
       connected: true,
-      dshConnected: false,
+      dshConnected,
       localEngine,
-      speechAvailable: localSpeech.hasRecognizer(),
+      targetAgent,
+      targets: getChatTargets(),
+      speechAvailable: Boolean(dshSpeech || localSpeech.hasRecognizer()),
       source: settings.source,
     };
   }
@@ -217,7 +310,116 @@ async function agentAction(body) {
     } catch {}
     return localSpeech.transcribeWave(body.audio, typeof body.locale === 'string' ? body.locale : 'zh-CN');
   }
+  if (body.action === 'models') {
+    const targets = getChatTargets();
+    return {
+      current: currentTargetAgent(),
+      targets,
+      groups: [
+        {
+          id: 'agents',
+          name: '目标 AI Agent',
+          models: targets.map(t => ({ id: t.id, name: t.label, mode: t.mode })),
+        },
+      ],
+    };
+  }
+  if (body.action === 'selectModel') {
+    const candidates = [
+      body.targetAgent,
+      typeof body.model === 'string' ? body.model : null,
+      body.model?.model,
+      body.model?.id,
+      body.model?.provider,
+    ];
+    let id = '';
+    for (const cand of candidates) {
+      const val = String(cand || '').trim();
+      if (val && CATALOG_BY_ID[val]) {
+        id = val;
+        break;
+      }
+    }
+    if (!id) throw new Error('未知的目标 AI Agent');
+    settings.chatTarget = id;
+    save();
+    if (botService?.localChat && ['claude', 'codex', 'opencode', 'dsh'].includes(id)) {
+      botService.localChat.selectedEngine = id;
+    }
+    return {
+      targetAgent: id,
+      label: CATALOG_BY_ID[id].label,
+      targets: getChatTargets(),
+    };
+  }
   const sessionId = String(body.sessionId || '');
+  if (body.action === 'create' || body.action === 'prompt') {
+    const inline = parseInlineTarget(body);
+    const explicitTarget = typeof body.targetAgent === 'string' && CATALOG_BY_ID[body.targetAgent.trim()]
+      ? body.targetAgent.trim()
+      : '';
+    const target = inline?.id
+      || explicitTarget
+      || (sessionId.startsWith('local:claude:') ? 'claude'
+        : sessionId.startsWith('local:codex:') ? 'codex'
+        : sessionId.startsWith('local:opencode:') ? 'opencode'
+        : sessionId.startsWith('launch:') && CATALOG_BY_ID[sessionId.slice(7)] ? sessionId.slice(7)
+        : currentTargetAgent());
+    const dshOnline = isDshOnline();
+    if (target === 'dsh' && dshOnline) {
+      if (body.action === 'prompt' && (sessionId.startsWith('local:') || sessionId.startsWith('launch:'))) {
+        const created = await rpc({ action: 'create', sessionId: `session-${randomUUID()}` });
+        return await rpc({ ...body, sessionId: created?.sessionId || body.sessionId });
+      }
+      return await rpc(body);
+    }
+    const probes = botService?.dispatcher?.probeEngines ? botService.dispatcher.probeEngines() : {};
+    const isDirectLocal = target === 'claude'
+      || target === 'codex'
+      || target === 'opencode'
+      || target === 'dsh'
+      || (target === 'antigravity' && Boolean(probes.antigravity?.available));
+    if (isDirectLocal) {
+      if (!botService?.localChat) throw new Error('本地对话服务尚未就绪');
+      const localTarget = target === 'dsh'
+        ? (probes.claude?.available ? 'claude' : probes.codex?.available ? 'codex' : probes.opencode?.available ? 'opencode' : 'claude')
+        : target;
+      return botService.localChat.handleAction({ ...body, targetAgent: localTarget }, localTarget);
+    }
+    if (body.action === 'create') {
+      return { sessionId: `launch:${target}`, targetAgent: target, mode: 'launch' };
+    }
+    let promptText = extractPromptText(body);
+    if (inline?.id === target) {
+      promptText = promptText.replace(new RegExp(`^@${target}\\s*`, 'i'), '').trim();
+    }
+    if (promptText) {
+      await copyToClipboard(promptText);
+    }
+    if (CATALOG_BY_ID[target]?.bundleId) {
+      await openBundle(target);
+    }
+    return {
+      sessionId: `launch:${target}`,
+      launched: true,
+      targetAgent: target,
+      providerLabel: CATALOG_BY_ID[target]?.label || target,
+    };
+  }
+  if (sessionId.startsWith('launch:')) {
+    const launchTarget = sessionId.slice('launch:'.length);
+    if (['focus', 'home'].includes(body.action)) {
+      if (CATALOG_BY_ID[launchTarget]?.bundleId) return openBundle(launchTarget).catch(() => ({ opened: true }));
+      return { opened: true };
+    }
+    if (body.action === 'conversation') {
+      return { sessionId, title: CATALOG_BY_ID[launchTarget]?.label || launchTarget, status: 'idle', messages: [] };
+    }
+    if (body.action === 'cancel') return { cancelled: true };
+    if (['skills', 'files'].includes(body.action) && botService?.localChat) {
+      return botService.localChat.handleAction(body, settings.source);
+    }
+  }
   const isLocalSession = Boolean(botService?.localChat?.isLocalSessionId(sessionId));
   if (isLocalSession) {
     if (['focus', 'home'].includes(body.action)) {
@@ -242,12 +444,12 @@ async function agentAction(body) {
     throw new Error(`请在 ${CATALOG_BY_ID[targetProvider].label} 中继续此任务`);
   }
   if (INTERACTIVE_ACTIONS.has(body.action)) {
-    if (['claude', 'codex'].includes(settings.source)) {
+    if (['claude', 'codex', 'opencode'].includes(settings.source)) {
       if (!botService?.localChat) throw new Error('本地对话服务尚未就绪');
       return botService.localChat.handleAction(body, settings.source);
     }
     if (['auto', 'dsh'].includes(settings.source)) {
-      const dshOnline = Boolean(providers.snapshot?.sources?.find(row => row.id === 'dsh')?.connected);
+      const dshOnline = isDshOnline();
       if (dshOnline) {
         try {
           return await rpc(body);
@@ -466,6 +668,12 @@ app.whenReady().then(async () => {
   botService.on('updated', state => {
     if (managerWin && !managerWin.isDestroyed()) managerWin.webContents.send('companion:bot-updated', { ...state, autoStart: autoStart.isEnabled() });
   });
+  {
+    const initialTarget = currentTargetAgent();
+    if (botService.localChat && ['claude', 'codex', 'opencode', 'dsh'].includes(initialTarget)) {
+      botService.localChat.selectedEngine = initialTarget;
+    }
+  }
   try {
     await botService.start();
   } catch (error) {

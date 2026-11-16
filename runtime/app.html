@@ -35,7 +35,7 @@
       <button class="tool-button" id="tool-compose" type="button" aria-label="开始新聊天" title="开始新聊天" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 4.2H8.2a4 4 0 0 0-4 4v7.6a4 4 0 0 0 4 4h7.6a4 4 0 0 0 4-4V12"/><path d="m9.8 14.2 8.2-8.2a1.25 1.25 0 0 1 1.77 1.77l-8.2 8.2-2.6.7.7-2.6Z"/></svg></button>
       <form id="quick-chat" autocomplete="off">
         <button id="tool-context" class="tool-mini" type="button" aria-label="添加上下文" aria-expanded="false" title="添加上下文"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button>
-        <span id="quick-model" hidden></span>
+        <button id="quick-model" type="button" title="切换对话的目标 AI Agent" aria-label="切换目标 AI Agent" aria-expanded="false"><img id="quick-model-icon" alt="" aria-hidden="true"><span id="quick-model-label">Claude</span><span class="quick-model-caret" aria-hidden="true">▾</span></button>
         <input id="quick-input" maxlength="100000" aria-label="新聊天内容" placeholder="询问，或开始一个新任务…">
         <button id="quick-send" type="submit" aria-label="发送">↑</button>
       </form>
@@ -50,11 +50,11 @@
     <div id="attachment-strip" hidden aria-label="待发送的图片"></div>
     <div id="context-popover" class="glass-card" hidden>
       <div class="context-head"><span>添加上下文</span><button id="context-close" type="button" aria-label="关闭">×</button></div>
+      <div class="context-section"><p class="context-label">发送给 AI Agent</p><div id="context-models" class="context-options"></div></div>
       <button id="context-image" class="context-row" type="button"><span class="context-glyph">▧</span>选择图片<span class="context-hint">最多 5 张</span></button>
       <input id="context-file" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden>
       <div class="context-section"><p class="context-label">技能 <kbd>/</kbd></p><div id="context-skills" class="context-options"></div></div>
       <div class="context-section"><p class="context-label">文件引用 <kbd>@</kbd></p><input id="context-query" placeholder="输入文件名搜索…" aria-label="搜索文件引用"><div id="context-files" class="context-options"></div></div>
-      <div class="context-section"><p class="context-label">模型</p><div id="context-models" class="context-options"></div></div>
       <p id="context-note" class="context-note" hidden></p>
     </div>
     <p id="feedback" role="status" aria-live="polite"><span id="feedback-text"></span><button id="feedback-retry" type="button" hidden>重试</button><button id="feedback-close" type="button" aria-label="关闭提示" hidden>×</button></p>

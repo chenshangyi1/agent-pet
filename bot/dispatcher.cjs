@@ -35,6 +35,10 @@ function expandHome(inputPath) {
   return raw;
 }
 
+function stripAnsi(str) {
+  return String(str || '').replace(/\x1B\[[0-9;?]*[ -/]*[@-~]|\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)/g, '');
+}
+
 function cleanMeta(value, limit) {
   if (typeof value !== 'string') return '';
   return value.replace(/\s+/g, ' ').trim().slice(0, limit);
@@ -448,6 +452,10 @@ class TaskDispatcher {
   probeEngines() {
     const claudePath = findBinary('claude', [process.env.CLAUDE_BIN]);
     const codexPath = findBinary('codex', [process.env.CODEX_BIN]);
+    const opencodePath = findBinary('opencode', [
+      process.env.OPENCODE_BIN,
+      '/Applications/OpenCode.app/Contents/Resources/opencode-cli',
+    ]) || findBinary('opencode-cli', [process.env.OPENCODE_BIN]);
     const agyPath = findBinary('agy', [process.env.AGY_BIN]);
 
     let antigravity;
@@ -484,6 +492,11 @@ class TaskDispatcher {
         available: Boolean(codexPath),
         path: codexPath,
         label: 'Codex',
+      },
+      opencode: {
+        available: Boolean(opencodePath),
+        path: opencodePath,
+        label: 'OpenCode',
       },
       antigravity,
       dsh: {
@@ -607,7 +620,7 @@ class TaskDispatcher {
     const normalizedEngine = String(engine || 'claude').trim().toLowerCase() === 'agy'
       ? 'antigravity'
       : String(engine || 'claude').trim().toLowerCase();
-    if (!['claude', 'codex', 'antigravity', 'dsh'].includes(normalizedEngine)) {
+    if (!['claude', 'codex', 'opencode', 'antigravity', 'dsh'].includes(normalizedEngine)) {
       throw new Error(`不支持的执行引擎: ${engine}`);
     }
 
@@ -640,6 +653,8 @@ class TaskDispatcher {
           return await this._dispatchClaude(job, cleanPrompt, onProgress);
         case 'codex':
           return await this._dispatchCodex(job, cleanPrompt, onProgress);
+        case 'opencode':
+          return await this._dispatchOpencode(job, cleanPrompt, onProgress);
         case 'antigravity':
           return await this._dispatchAntigravity(job, cleanPrompt, onProgress);
         case 'dsh':
@@ -1021,6 +1036,131 @@ class TaskDispatcher {
           text: outputText,
           error: errMsg,
           toolsUsed: [...job.toolsUsed],
+        });
+      });
+    });
+  }
+
+  _dispatchOpencode(job, prompt, onProgress) {
+    const probes = this.probeEngines();
+    const bin = probes.opencode?.path;
+    if (!bin) {
+      throw new Error('未检测到 opencode CLI，请先安装 OpenCode 或设置 OPENCODE_BIN');
+    }
+
+    const args = ['run', '--auto'];
+    if (job.sessionId) args.push('-s', job.sessionId);
+    const images = Array.isArray(job.images) ? job.images : [];
+    for (const imgPath of images) {
+      args.push('-f', imgPath);
+    }
+    args.push(prompt);
+
+    const mirror = this._createMirrorSession('opencode', job.cwd, job.sessionId);
+    mirror.start(job.jobId);
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let stdoutText = '';
+      let stderrText = '';
+
+      const child = spawn(bin, args, {
+        cwd: job.cwd,
+        env: this._buildChildEnv('opencode'),
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      job.child = child;
+      child.stdin?.end();
+
+      child.stdout.on('data', chunk => {
+        const piece = chunk.toString('utf8');
+        stdoutText += piece;
+        const preview = cleanMeta(stripAnsi(piece), 120);
+        if (preview) {
+          try {
+            onProgress?.({ type: 'text', text: `💬 ${preview}` });
+          } catch {}
+        }
+      });
+
+      child.stderr.on('data', chunk => {
+        if (stderrText.length < 16384) stderrText += chunk.toString('utf8');
+      });
+
+      child.on('error', err => {
+        if (settled) return;
+        settled = true;
+        job.child = null;
+        job.endedAt = Date.now();
+        if (job.cancelled) {
+          job.status = 'cancelled';
+          mirror.emit('Stop', { terminationReason: 'USER_CANCELED' });
+          resolve({
+            jobId: job.jobId,
+            engine: 'opencode',
+            status: 'cancelled',
+            sessionId: job.sessionId || (`opencode-${job.jobId}`),
+            text: stripAnsi(stdoutText).trim() || '任务已取消',
+            toolsUsed: [],
+          });
+          return;
+        }
+        job.status = 'failed';
+        job.error = err.message;
+        mirror.emit('StopFailure', { hasError: true });
+        reject(err);
+      });
+
+      child.on('close', code => {
+        if (settled) return;
+        settled = true;
+        job.child = null;
+        job.endedAt = Date.now();
+
+        const output = stripAnsi(stdoutText).trim();
+        const finalSessionId = job.sessionId || (`opencode-${job.jobId}`);
+        if (job.cancelled) {
+          job.status = 'cancelled';
+          mirror.emit('Stop', { terminationReason: 'USER_CANCELED' });
+          resolve({
+            jobId: job.jobId,
+            engine: 'opencode',
+            status: 'cancelled',
+            sessionId: finalSessionId,
+            text: output || '任务已取消',
+            toolsUsed: [],
+          });
+          return;
+        }
+
+        if (code === 0) {
+          job.sessionId = finalSessionId;
+          this._markDispatched('opencode', finalSessionId);
+          job.status = 'completed';
+          mirror.emit('Stop');
+          resolve({
+            jobId: job.jobId,
+            engine: 'opencode',
+            status: 'completed',
+            sessionId: finalSessionId,
+            text: output || '已完成任务',
+            toolsUsed: [],
+          });
+          return;
+        }
+
+        const errMsg = stripAnsi(stderrText).trim() || output || `OpenCode 退出码 ${code}`;
+        job.status = 'failed';
+        job.error = errMsg;
+        mirror.emit('StopFailure', { hasError: true });
+        resolve({
+          jobId: job.jobId,
+          engine: 'opencode',
+          status: 'failed',
+          sessionId: finalSessionId,
+          text: output,
+          error: errMsg,
+          toolsUsed: [],
         });
       });
     });

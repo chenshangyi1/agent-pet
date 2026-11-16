@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
+const { CATALOG_BY_ID } = require('../connectors/catalog.cjs');
 
 const MAX_LIST_FILES = 20;
 const MAX_SCAN_ENTRIES = 4000;
@@ -22,7 +23,27 @@ const MIME_TO_EXT = {
 const PROVIDER_LABELS = {
   claude: 'Claude Code',
   codex: 'Codex',
+  opencode: 'OpenCode',
+  dsh: 'DSH',
 };
+
+const DIRECT_ENGINES = new Set(['claude', 'codex', 'opencode']);
+const VALID_ENGINES = new Set(['claude', 'codex', 'opencode', 'dsh']);
+
+function getProviderLabel(id) {
+  return PROVIDER_LABELS[id] || CATALOG_BY_ID[id]?.label || id;
+}
+
+function stripInlineAgentPrefix(rawText) {
+  const text = typeof rawText === 'string' ? rawText.trim() : '';
+  if (!text) return { text: '', inlineEngine: null };
+  const match = text.match(/^@(claude|codex|opencode|dsh)(?:\s+([\s\S]*))?$/i);
+  if (!match) return { text, inlineEngine: null };
+  return {
+    text: String(match[2] || '').trim(),
+    inlineEngine: match[1].toLowerCase(),
+  };
+}
 
 function parseDataUrlImage(dataUrl) {
   if (typeof dataUrl !== 'string') return null;
@@ -107,19 +128,20 @@ class LocalChatBridge {
 
   resolveEngine(preferredSource = 'auto') {
     const preferred = String(preferredSource || '').trim().toLowerCase();
-    if (preferred === 'claude' || preferred === 'codex') {
+    if (DIRECT_ENGINES.has(preferred)) {
       return preferred;
     }
-    if (this.selectedEngine === 'claude' || this.selectedEngine === 'codex') {
+    if (VALID_ENGINES.has(this.selectedEngine)) {
       return this.selectedEngine;
     }
     const cfgEngine = String(this.getConfig()?.defaultEngine || '').trim().toLowerCase();
-    if (cfgEngine === 'claude' || cfgEngine === 'codex') {
+    if (VALID_ENGINES.has(cfgEngine)) {
       return cfgEngine;
     }
     const probes = this.dispatcher?.probeEngines ? this.dispatcher.probeEngines() : {};
     if (probes.claude?.available) return 'claude';
     if (probes.codex?.available) return 'codex';
+    if (probes.opencode?.available) return 'opencode';
     return 'claude';
   }
 
@@ -145,7 +167,7 @@ class LocalChatBridge {
     const session = {
       sessionId: canonicalId,
       provider: engine,
-      providerLabel: PROVIDER_LABELS[engine] || engine,
+      providerLabel: getProviderLabel(engine),
       cliSessionId: null,
       title: '本地对话',
       cwd: this._defaultCwd(),
@@ -167,9 +189,24 @@ class LocalChatBridge {
     const textParts = [];
     const dispatchImages = [];
     const tempFiles = [];
+    let inlineEngine = null;
+
+    const pushText = raw => {
+      const trimmed = typeof raw === 'string' ? raw.trim() : '';
+      if (!trimmed) return;
+      if (!inlineEngine && !trimmed.startsWith('[引用]')) {
+        const parsed = stripInlineAgentPrefix(trimmed);
+        if (parsed.inlineEngine) {
+          inlineEngine = parsed.inlineEngine;
+          if (parsed.text) textParts.push(parsed.text);
+          return;
+        }
+      }
+      textParts.push(trimmed);
+    };
 
     if (typeof body.text === 'string' && body.text.trim()) {
-      textParts.push(body.text.trim());
+      pushText(body.text);
     }
 
     const pushDataUrl = rawUrl => {
@@ -187,12 +224,12 @@ class LocalChatBridge {
         if (!part) continue;
         if (typeof part === 'string') {
           if (part.startsWith('data:image/')) pushDataUrl(part);
-          else if (part.trim()) textParts.push(part.trim());
+          else if (part.trim()) pushText(part);
           continue;
         }
         if (typeof part !== 'object') continue;
         if (part.type === 'text' && typeof part.text === 'string' && part.text.trim()) {
-          textParts.push(part.text.trim());
+          pushText(part.text);
         } else if (part.type === 'image') {
           if (typeof part.data === 'string' && part.data.startsWith('data:image/')) {
             pushDataUrl(part.data);
@@ -215,7 +252,7 @@ class LocalChatBridge {
       }
     } else if (typeof body.content === 'string' && body.content.trim()) {
       if (body.content.startsWith('data:image/')) pushDataUrl(body.content);
-      else textParts.push(body.content.trim());
+      else pushText(body.content);
     }
 
     if (Array.isArray(body.images)) {
@@ -233,6 +270,7 @@ class LocalChatBridge {
       text: textParts.join('\n').trim(),
       images: dispatchImages,
       tempFiles,
+      inlineEngine,
     };
   }
 
@@ -293,18 +331,30 @@ class LocalChatBridge {
     }
 
     if (action === 'selectModel') {
-      const rawModel = typeof body.model === 'string'
-        ? body.model
-        : (body.model?.model || body.model?.id || '');
-      const normalized = String(rawModel || '').trim().toLowerCase();
-      if (normalized === 'claude' || normalized === 'codex') {
+      const candidates = [
+        body.targetAgent,
+        body.engine,
+        typeof body.model === 'string' ? body.model : null,
+        body.model?.model,
+        body.model?.id,
+        body.model?.provider,
+      ];
+      let normalized = '';
+      for (const cand of candidates) {
+        const val = String(cand || '').trim().toLowerCase();
+        if (VALID_ENGINES.has(val)) {
+          normalized = val;
+          break;
+        }
+      }
+      if (normalized) {
         this.selectedEngine = normalized;
         const target = this._resolveSession(body.sessionId);
         if (target) {
           target.model = normalized;
           if (target.messages.length === 0) {
             target.provider = normalized;
-            target.providerLabel = PROVIDER_LABELS[normalized] || normalized;
+            target.providerLabel = getProviderLabel(normalized);
           }
         }
       }
@@ -365,13 +415,15 @@ class LocalChatBridge {
     }
 
     if (action === 'create' || action === 'prompt') {
-      const engine = this.resolveEngine(currentSource);
-      let session = this._resolveSession(body.sessionId);
+      const { text: promptText, images, tempFiles, inlineEngine } = this._extractPromptAndImages(body);
+      const requested = String(inlineEngine || body.targetAgent || body.engine || '').trim().toLowerCase();
+      const engine = VALID_ENGINES.has(requested) ? requested : this.resolveEngine(currentSource);
+      const existing = this._resolveSession(body.sessionId);
+      let session = existing && existing.provider === engine ? existing : null;
       if (!session) {
-        session = this._createSession(engine, body.sessionId || null);
+        session = this._createSession(engine, existing ? null : (body.sessionId || null));
       }
 
-      const { text: promptText, images, tempFiles } = this._extractPromptAndImages(body);
       if (!promptText && images.length === 0) {
         if (action === 'create') {
           return { sessionId: session.sessionId, status: session.status };

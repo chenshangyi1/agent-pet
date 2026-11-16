@@ -52,21 +52,46 @@ const el = (tag, className, text) => {
   if (text !== undefined) node.textContent = text;
   return node;
 };
-function makeProviderIcon(provider = 'dsh') {
-  const id = typeof provider === 'string' && /^[a-z0-9-]+$/.test(provider) ? provider : 'dsh';
-  const img = el('img', 'activity-provider-icon');
-  img.src = native ? `../assets/icons/${id}.png` : `/companion/icon-${id}`;
+const iconUrl = (id = 'dsh') => {
+  const safeId = typeof id === 'string' && /^[a-z0-9-]+$/.test(id) ? id : 'dsh';
+  return native ? `../assets/icons/${safeId}.png` : `/companion/icon-${safeId}`;
+};
+function bindIconFallback(img) {
+  if (img.dataset.fallbackBound) return;
+  img.dataset.fallbackBound = '1';
+  img.addEventListener('error', () => {
+    const fallback = iconUrl('dsh');
+    if (!img.src.endsWith('/dsh.png') && !img.src.endsWith('/icon-dsh')) img.src = fallback;
+  });
+}
+function makeProviderIcon(provider = 'dsh', className = 'activity-provider-icon') {
+  const img = el('img', className);
   img.alt = '';
   img.setAttribute('aria-hidden', 'true');
   img.decoding = 'async';
-  img.addEventListener('error', () => {
-    const fallback = native ? '../assets/icons/dsh.png' : '/companion/icon-dsh';
-    if (!img.src.endsWith('/dsh.png') && !img.src.endsWith('/icon-dsh')) img.src = fallback;
-  }, { once: true });
+  bindIconFallback(img);
+  img.src = iconUrl(provider);
   return img;
 }
-const DIRECT_CHAT_SOURCES = new Set(['auto', 'dsh', 'claude', 'codex']);
+const DIRECT_CHAT_SOURCES = new Set(['auto', 'dsh', 'claude', 'codex', 'opencode']);
+const TARGET_LABELS = {
+  claude: 'Claude Code',
+  codex: 'Codex',
+  opencode: 'OpenCode',
+  dsh: 'DSH',
+  antigravity: 'Antigravity',
+  cursor: 'Cursor',
+  zcode: 'ZCode',
+  workbuddy: 'WorkBuddy',
+  'workbuddy-ai': 'WorkBuddy AI',
+  kiro: 'Kiro',
+  trae: 'Trae',
+  'trae-cn': 'Trae CN',
+  'qoder-cn': 'Qoder CN',
+  windsurf: 'Windsurf',
+};
 let source = 'auto', dshConnected = false, localEngine = 'claude', knownSources = [], sourceInitialized = false;
+let chatTargets = [];
 let items = [], current, animationKey, polling = false, noticeTimer, drag, suppressClick = false;
 
 /* -------------------------------------------------------------------------- */
@@ -74,10 +99,11 @@ let items = [], current, animationKey, polling = false, noticeTimer, drag, suppr
 /* authoritative: dismissal/mute are display-only and never touch DSH data.   */
 /* -------------------------------------------------------------------------- */
 const PREFS_KEY = 'dsh-companion:prefs:v1';
-const defaultPrefs = { firstAwakeSeen: false, muted: [], dismissed: [], activeSessionId: null, model: null, stackCollapsed: true, dockCollapsed: true };
+const defaultPrefs = { firstAwakeSeen: false, muted: [], dismissed: [], activeSessionId: null, model: null, targetAgent: null, stackCollapsed: true, dockCollapsed: true };
 let prefs;
 try { prefs = { ...defaultPrefs, ...JSON.parse(localStorage.getItem(PREFS_KEY) || '{}') }; }
 catch { prefs = { ...defaultPrefs }; }
+let targetAgent = prefs.targetAgent || 'claude';
 function savePrefs() { try { localStorage.setItem(PREFS_KEY, JSON.stringify(prefs)); } catch { /* private mode */ } }
 // Persist the quiet collapsed dock as the boot state. An Electron restart must
 // come back to the pill, never to a panel that happened to be open on exit.
@@ -177,6 +203,7 @@ function showQuickChat() {
   $('context-popover').hidden = true;
   pet.classList.remove('context-open');
   $('tool-context').setAttribute('aria-expanded', 'false');
+  $('quick-model')?.setAttribute('aria-expanded', 'false');
   composeButton.setAttribute('aria-expanded', 'true');
   setTimeout(() => quickInput.focus(), 30);
 }
@@ -423,17 +450,18 @@ async function poll() {
     const response = await action('list');
     knownSources = Array.isArray(response.sources) ? response.sources : knownSources;
     dshConnected = response.sources ? Boolean(response.sources.find(row => row.id === 'dsh')?.connected) : false;
-    const isDirectChat = DIRECT_CHAT_SOURCES.has(source);
-    const readOnlyLabel = !isDirectChat ? (knownSources.find(row => row.id === source)?.label || source) : '';
-    const activeLocalName = source === 'codex' || (source !== 'claude' && localEngine === 'codex') ? 'Codex' : 'Claude Code';
+    const isChatSource = DIRECT_CHAT_SOURCES.has(source) || chatTargets.some(t => t.id === source);
+    const isDirectVoice = DIRECT_CHAT_SOURCES.has(source) || chatTargets.some(t => t.id === source && t.mode === 'direct');
+    const readOnlyLabel = !isChatSource ? (knownSources.find(row => row.id === source)?.label || source) : '';
+    const activeTargetLabel = getTargetInfo(targetAgent).label;
     composeButton.disabled = false;
     composeButton.title = readOnlyLabel
       ? `打开 ${readOnlyLabel}`
-      : (dshConnected && ['auto', 'dsh'].includes(source))
+      : (dshConnected && targetAgent === 'dsh')
         ? '新建 DSH 聊天'
-        : `新建本地聊天 (${activeLocalName})`;
+        : `向 ${activeTargetLabel} 发消息`;
     composeButton.setAttribute('aria-label', composeButton.title);
-    voiceButton.disabled = !isDirectChat;
+    voiceButton.disabled = !isDirectVoice;
     const next = visibleActivities(response.items ?? []);
     // Stamp the first moment a card is offerable, so its lifetime is counted from
     // when the user could actually see it rather than from the session's start.
@@ -479,14 +507,21 @@ async function sendPrompt(text, { sessionId: existingSessionId, trackReply = fal
   $('quick-send').disabled = true;
   showFeedback('正在发送…');
   const options = { sessionId: existingSessionId, trackReply, content: extra, quoted: quotedText, reuseActive };
+  const promptTarget = existingSessionId
+    ? (existingSessionId.startsWith('local:')
+      ? existingSessionId.split(':')[1]
+      : (existingSessionId.startsWith('launch:') ? existingSessionId.slice(7) : 'dsh'))
+    : targetAgent;
   try {
     let sessionId = existingSessionId ?? (reuseActive ? prefs.activeSessionId : null);
     if (!sessionId) {
       const requestedId = `session-${crypto.randomUUID()}`;
-      const created = await action('create', { sessionId: requestedId });
+      const created = await action('create', { sessionId: requestedId, targetAgent: promptTarget });
       sessionId = created?.sessionId || requestedId;
     }
-    const baselineSeq = trackReply ? (await action('conversation', { sessionId })).lastSeq ?? -1 : undefined;
+    const isLaunchSession = sessionId.startsWith('launch:')
+      || (!existingSessionId && getTargetInfo(promptTarget).mode === 'launch' && !/^@(?:claude|codex|opencode|dsh)\b/i.test(request));
+    const baselineSeq = trackReply && !isLaunchSession ? (await action('conversation', { sessionId })).lastSeq ?? -1 : undefined;
     const parts = [];
     if (quotedText) parts.push({ type: 'text', text: `[引用] ${quotedText.slice(0, 400)}` });
     if (request) parts.push({ type: 'text', text: request });
@@ -495,20 +530,35 @@ async function sendPrompt(text, { sessionId: existingSessionId, trackReply = fal
     // sending a request the bridge is guaranteed to reject.
     const usedExtras = Math.max(0, Math.min(extra.length, 6 - parts.length));
     parts.push(...extra.slice(0, usedExtras));
-    await action('prompt', { sessionId, requestId: crypto.randomUUID(), content: parts, clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone });
+    const promptResult = await action('prompt', {
+      sessionId,
+      targetAgent: promptTarget,
+      requestId: crypto.randomUUID(),
+      content: parts,
+      clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    });
+    const finishComposeUi = () => {
+      quickInput.value = '';
+      pendingImages = pendingImages.slice(usedExtras); quoted = null;
+      renderAttachments(); renderQuote();
+      pet.classList.remove('compose-open');
+      composeButton.setAttribute('aria-expanded', 'false');
+      closeContext();
+    };
+    if (promptResult?.launched || sessionId.startsWith('launch:')) {
+      finishComposeUi();
+      const targetLabel = promptResult?.providerLabel || getTargetInfo(promptResult?.targetAgent || promptTarget).label;
+      showFeedback(`已复制指令并打开 ${targetLabel}（可直接 ⌘V 粘贴）`);
+      return { sessionId, launched: true };
+    }
     if (reuseActive) { prefs.activeSessionId = sessionId; savePrefs(); }
-    quickInput.value = '';
-    pendingImages = pendingImages.slice(usedExtras); quoted = null;
-    renderAttachments(); renderQuote();
-    pet.classList.remove('compose-open');
-    composeButton.setAttribute('aria-expanded', 'false');
-    $('context-popover').hidden = true;
-    pet.classList.remove('context-open');
-    $('tool-context').setAttribute('aria-expanded', 'false');
-    const isLocalReply = sessionId.startsWith('local:') || ['claude', 'codex'].includes(source) || !dshConnected;
+    finishComposeUi();
+    const resolvedTargetId = promptResult?.targetAgent
+      || (sessionId.startsWith('local:') ? sessionId.split(':')[1] : promptTarget);
+    const currentTargetLabel = promptResult?.providerLabel || getTargetInfo(resolvedTargetId).label;
     showFeedback(existingSessionId
       ? '已回复该会话'
-      : (isLocalReply ? '已发送给小鑫本地助手' : '已发送到新的 DSH 会话'));
+      : `已发送给 ${currentTargetLabel}`);
     pet.classList.add('activities-open');
     activitiesButton.setAttribute('aria-pressed', 'true');
     await poll();
@@ -537,15 +587,44 @@ function renderQuote() {
   $('transcript-quote').hidden = !quoted;
   $('transcript-quote-text').textContent = quoted && quoted.length > 90 ? quoted.slice(0, 90) + '…' : quoted || '';
 }
+function getTargetInfo(id = targetAgent) {
+  const found = chatTargets.find(t => t.id === id);
+  if (found) return found;
+  const label = TARGET_LABELS[id] || id || 'Claude Code';
+  const mode = ['claude', 'codex', 'opencode', 'dsh'].includes(id) ? 'direct' : 'launch';
+  return { id, label, mode };
+}
+function syncTargetFromInfo(info) {
+  if (!info) return;
+  if (Array.isArray(info.targets)) chatTargets = info.targets;
+  if (info.targetAgent && (!prefs.targetAgent || (chatTargets.length && !chatTargets.some(t => t.id === targetAgent)))) {
+    targetAgent = info.targetAgent;
+    prefs.targetAgent = info.targetAgent;
+    savePrefs();
+  }
+  renderModel();
+}
 function renderModel() {
   const chip = $('quick-model');
-  chip.hidden = !prefs.model;
-  chip.textContent = prefs.model ? prefs.model.label : '';
+  const icon = $('quick-model-icon');
+  const labelEl = $('quick-model-label');
+  const info = getTargetInfo(targetAgent);
+  const label = info?.label || TARGET_LABELS[targetAgent] || targetAgent;
+  chip.hidden = false;
+  chip.title = `当前目标：${label}（点击切换 AI Agent）`;
+  if (icon) {
+    bindIconFallback(icon);
+    icon.src = iconUrl(targetAgent);
+  }
+  if (labelEl) labelEl.textContent = label;
+  quickInput.placeholder = info?.mode === 'launch'
+    ? `发指令给 ${label}（自动复制并打开应用）…`
+    : `向 ${label} 提问，或输入 @codex / @claude…`;
 }
 async function ensureSession() {
   if (prefs.activeSessionId) return prefs.activeSessionId;
   const requestedId = `session-${crypto.randomUUID()}`;
-  const created = await action('create', { sessionId: requestedId });
+  const created = await action('create', { sessionId: requestedId, targetAgent });
   const sessionId = created?.sessionId || requestedId;
   prefs.activeSessionId = sessionId; savePrefs();
   return sessionId;
@@ -561,6 +640,38 @@ function renderOptions(container, rows, { label, onPick, emptyText }) {
     container.append(button);
   }
 }
+function renderTargetOptions(targets) {
+  const container = $('context-models');
+  container.textContent = '';
+  if (!targets.length) {
+    container.append(el('span', 'context-empty', '没有可用 AI Agent'));
+    return;
+  }
+  for (const row of targets) {
+    const label = row.label || TARGET_LABELS[row.id] || row.id;
+    const mode = row.mode || (['claude', 'codex', 'opencode', 'dsh'].includes(row.id) ? 'direct' : 'launch');
+    const button = el('button', 'context-target');
+    button.type = 'button';
+    if (row.id === targetAgent) button.classList.add('is-active');
+    button.title = mode === 'launch' ? `${label}（复制指令并打开应用）` : `${label}（直接对话）`;
+    button.append(makeProviderIcon(row.id, 'context-target-icon'));
+    button.append(el('span', 'context-target-label', label));
+    button.append(el('span', 'context-target-tag', mode === 'launch' ? '唤起' : '直连'));
+    button.addEventListener('click', () => run(async () => {
+      await action('selectModel', { targetAgent: row.id });
+      targetAgent = row.id;
+      prefs.targetAgent = row.id;
+      prefs.activeSessionId = null;
+      savePrefs();
+      renderModel();
+      renderTargetOptions(targets);
+      showFeedback(mode === 'launch'
+        ? `已切换至 ${label}（发送时将复制指令并打开应用）`
+        : `已切换对话目标：${label}`);
+    }));
+    container.append(button);
+  }
+}
 async function loadContext(sessionId) {
   const note = $('context-note');
   note.hidden = false; note.textContent = '正在读取上下文…';
@@ -569,9 +680,21 @@ async function loadContext(sessionId) {
   ]);
   const skillRows = skills.status === 'fulfilled' ? skills.value.skills ?? [] : [];
   const fileRows = files.status === 'fulfilled' ? files.value.candidates ?? [] : [];
-  const modelRows = models.status === 'fulfilled'
-    ? (models.value.groups ?? []).flatMap(group => (group.models ?? []).map(model => ({ provider: group.id, model: model.id, label: `${group.name} · ${model.name}` })))
-    : [];
+  let targetRows = [];
+  if (models.status === 'fulfilled') {
+    if (Array.isArray(models.value?.targets) && models.value.targets.length) {
+      targetRows = models.value.targets;
+      chatTargets = targetRows;
+      if (!prefs.targetAgent && models.value.current) targetAgent = models.value.current;
+      renderModel();
+    } else if (Array.isArray(models.value?.groups)) {
+      targetRows = models.value.groups.flatMap(group => (group.models ?? []).map(m => ({
+        id: m.id, label: m.name || TARGET_LABELS[m.id] || m.id, mode: m.mode || 'direct',
+      })));
+      if (targetRows.length) chatTargets = targetRows;
+    }
+  }
+  if (!targetRows.length) targetRows = chatTargets;
   renderOptions($('context-skills'), skillRows, {
     label: row => `/${row.name}`, emptyText: '没有可用技能',
     onPick: row => { insertIntoQuickInput(`/${row.name} `); },
@@ -580,14 +703,7 @@ async function loadContext(sessionId) {
     label: row => `@${row.path ?? row.name ?? row.value ?? ''}`, emptyText: '输入文件名以搜索',
     onPick: row => { insertIntoQuickInput(`@${row.path ?? row.name ?? row.value ?? ''} `); },
   });
-  renderOptions($('context-models'), modelRows, {
-    label: row => row.label, emptyText: '没有可用模型',
-    onPick: row => run(async () => {
-      await action('selectModel', { sessionId, model: { provider: row.provider, model: row.model } });
-      prefs.model = { provider: row.provider, model: row.model, label: row.label };
-      savePrefs(); renderModel(); showFeedback(`已切换模型：${row.label}`);
-    }),
-  });
+  renderTargetOptions(targetRows);
   const unavailable = [skills, files, models].filter(result => result.status === 'rejected' || result.value?.unavailable).length;
   note.textContent = unavailable ? '部分目录暂不可用；图片附件仍可添加' : '';
   note.hidden = !unavailable;
@@ -606,6 +722,7 @@ function openContext() {
   popover.hidden = !open;
   pet.classList.toggle('context-open', open);
   $('tool-context').setAttribute('aria-expanded', String(open));
+  $('quick-model')?.setAttribute('aria-expanded', String(open));
   if (!open) return;
   renderModel();
   run(async () => {
@@ -617,6 +734,7 @@ function closeContext() {
   $('context-popover').hidden = true;
   pet.classList.remove('context-open');
   $('tool-context').setAttribute('aria-expanded', 'false');
+  $('quick-model')?.setAttribute('aria-expanded', 'false');
 }
 async function loadTranscript() {
   const container = $('transcript-list');
@@ -629,7 +747,10 @@ async function loadTranscript() {
     for (const message of view.messages) {
       const row = el('div', 'transcript-message');
       row.dataset.role = message.role;
-      row.append(el('span', 'transcript-role', message.role === 'user' ? '你' : (transcriptSessionId?.startsWith('local:') ? '小鑫' : 'DSH')));
+      const assistantRole = transcriptSessionId?.startsWith('local:')
+        ? (getTargetInfo(transcriptSessionId.split(':')[1])?.label || '小鑫')
+        : 'DSH';
+      row.append(el('span', 'transcript-role', message.role === 'user' ? '你' : assistantRole));
       row.append(el('span', 'transcript-body', message.text || (message.attachments ? `[${message.attachments} 个附件]` : '')));
       const reply = el('button', 'transcript-reply', '回复');
       reply.type = 'button';
@@ -706,7 +827,7 @@ async function speakReply(text, epoch) {
 }
 
 async function waitForVoiceReply(sessionId, baselineSeq, epoch) {
-  const isLocalVoice = sessionId.startsWith('local:') || ['claude', 'codex'].includes(source) || !dshConnected;
+  const isLocalVoice = sessionId.startsWith('local:') || ['claude', 'codex', 'opencode'].includes(source) || !dshConnected;
   const deadline = Date.now() + 5 * 60_000;
   while (voiceConversation && epoch === voiceEpoch && Date.now() < deadline) {
     const view = await action('conversation', { sessionId });
@@ -820,7 +941,8 @@ async function startVoice() {
 character.addEventListener('click', event => { if (suppressClick) { suppressClick = false; return; } if (event.detail === 1) notice(); });
 character.addEventListener('dblclick', () => { if (!suppressClick) run(() => openDsh()); });
 composeButton.addEventListener('click', event => {
-  if (!DIRECT_CHAT_SOURCES.has(source)) { run(() => action('home')); return; }
+  const canChat = DIRECT_CHAT_SOURCES.has(source) || chatTargets.some(t => t.id === source);
+  if (!canChat) { run(() => action('home')); return; }
   const open = pet.classList.toggle('compose-open');
   event.currentTarget.setAttribute('aria-expanded', String(open));
   if (open) { pet.classList.add('show'); closeContext(); setTimeout(() => quickInput.focus(), 30); }
@@ -831,7 +953,8 @@ $('quick-chat').addEventListener('submit', event => {
   run(() => sendPrompt(quickInput.value, { content: pendingImages, reuseActive: true }));
 });
 voiceButton.addEventListener('click', () => {
-  if (!DIRECT_CHAT_SOURCES.has(source)) { showFeedback('当前工具仅支持状态观察，请切换到自动/Claude/Codex/DSH'); notice(); return; }
+  const canVoice = DIRECT_CHAT_SOURCES.has(source) || chatTargets.some(t => t.id === source && t.mode === 'direct');
+  if (!canVoice) { showFeedback('当前工具仅支持状态观察或唤起应用，请切换到直连对话目标'); notice(); return; }
   if (voiceButton.dataset.available === 'false') { showFeedback('当前桌面环境未找到语音识别组件'); notice(); return; }
   run(startVoice);
 });
@@ -844,6 +967,7 @@ activitiesButton.addEventListener('click', event => {
   renderActivities();
 });
 $('tool-context').addEventListener('click', openContext);
+$('quick-model')?.addEventListener('click', openContext);
 $('context-close').addEventListener('click', closeContext);
 $('context-image').addEventListener('click', () => $('context-file').click());
 $('context-file').addEventListener('change', async event => {
@@ -931,6 +1055,13 @@ if (native) {
     renderActivities();
   };
   const applySource = mode => {
+    if (mode.source && mode.source !== 'auto' && targetAgent !== mode.source) {
+      targetAgent = mode.source;
+      prefs.targetAgent = mode.source;
+      prefs.activeSessionId = null;
+      savePrefs();
+      renderModel();
+    }
     if (mode.source && source !== mode.source) {
       source = mode.source;
       if (sourceInitialized) {
@@ -949,6 +1080,7 @@ if (native) {
         if (info) {
           voiceButton.dataset.available = String(Boolean(info.speechAvailable));
           if (info.localEngine) localEngine = info.localEngine;
+          syncTargetFromInfo(info);
         }
         await poll();
       });
@@ -961,6 +1093,7 @@ if (native) {
     const info = await action('info');
     voiceButton.dataset.available = String(Boolean(info.speechAvailable));
     if (info.localEngine) localEngine = info.localEngine;
+    syncTargetFromInfo(info);
   });
   // Click-through must follow real geometry, not CSS `:hover`. Turning on
   // `setIgnoreMouseEvents` makes the page stop receiving hover, which hides the
@@ -1004,6 +1137,10 @@ if (native) {
   pet.classList.add('activities-open');
   activitiesButton.setAttribute('aria-pressed', 'true');
   activitiesButton.setAttribute('aria-label', '收起活动');
+  run(async () => {
+    const info = await action('info').catch(() => null);
+    syncTargetFromInfo(info);
+  });
 }
 renderModel(); renderAttachments(); renderQuote();
 run(poll);

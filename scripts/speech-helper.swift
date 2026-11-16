@@ -71,7 +71,16 @@ SFSpeechRecognizer.requestAuthorization { status in
         } else if let error {
             settled = true
             let msg = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
-            emitJSON(["error": msg.isEmpty ? "没有识别到清晰语音，请重试" : msg], exitCode: 1)
+            let lower = msg.lowercased()
+            let localized: String
+            if msg.isEmpty {
+                localized = "没有识别到清晰语音，请重试"
+            } else if lower.contains("no speech") || lower.contains("retry") {
+                localized = "未检测到说话声，请靠近麦克风再试一次"
+            } else {
+                localized = msg
+            }
+            emitJSON(["error": localized], exitCode: 1)
         }
     }
 }
