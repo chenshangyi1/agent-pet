@@ -52,8 +52,12 @@
       <div class="context-head"><span>添加上下文</span><button id="context-close" type="button" aria-label="关闭">×</button></div>
       <div class="context-section"><p class="context-label">发送给 AI Agent</p><div id="context-models" class="context-options"></div></div>
       <div class="context-section">
-        <div class="context-row-head"><p class="context-label">项目目录</p><button id="context-browse-cwd" class="context-mini-btn" type="button">📁 选择文件夹…</button></div>
+        <div class="context-row-head"><p id="context-workspaces-label" class="context-label">项目目录（当前应用）</p><div class="context-row-actions"><button id="context-toggle-extra" class="context-mini-btn" type="button" aria-expanded="false">＋ 本机项目</button><button id="context-browse-cwd" class="context-mini-btn" type="button">📁 选择文件夹…</button></div></div>
         <div id="context-workspaces" class="context-options"></div>
+      </div>
+      <div id="context-extra-section" class="context-section" hidden>
+        <div class="context-row-head"><p class="context-label">本机更多项目（Mac 全盘发现）</p><button id="context-scan-extra" class="context-mini-btn" type="button">↻ 扫描本机</button></div>
+        <div id="context-extra-workspaces" class="context-options"></div>
       </div>
       <div class="context-section">
         <div class="context-row-head"><p class="context-label">项目会话</p><button id="context-new-session" class="context-mini-btn" type="button">＋ 新建会话</button></div>

@@ -88,7 +88,15 @@ const TARGET_LABELS = {
   trae: 'Trae',
   'trae-cn': 'Trae CN',
   'qoder-cn': 'Qoder CN',
+  qoder: 'Qoder',
   windsurf: 'Windsurf',
+  codebuddy: 'CodeBuddy',
+  'codebuddy-cn': 'CodeBuddy CN',
+  copilot: 'GitHub Copilot',
+  'gemini-cli': 'Gemini CLI',
+  'qwen-code': 'Qwen Code',
+  droid: 'Droid',
+  cline: 'Cline',
 };
 let source = 'auto', dshConnected = false, localEngine = 'claude', knownSources = [], sourceInitialized = false;
 let chatTargets = [];
@@ -107,7 +115,11 @@ let targetAgent = prefs.targetAgent || 'claude';
 let currentCwd = prefs.cwd || '';
 let activeSessionTitle = prefs.activeSessionTitle || '';
 let workspaceOptions = [];
+let extraWorkspaceOptions = [];
 let sessionOptions = [];
+let contextMode = 'agent';
+let contextExtraOpen = false;
+let scanningExtra = false;
 function savePrefs() { try { localStorage.setItem(PREFS_KEY, JSON.stringify(prefs)); } catch { /* private mode */ } }
 // Persist the quiet collapsed dock as the boot state. An Electron restart must
 // come back to the pill, never to a panel that happened to be open on exit.
@@ -204,10 +216,7 @@ function showQuickChat() {
   pet.classList.add('show', 'compose-open');
   pet.classList.remove('transcript-open');
   $('transcript').hidden = true;
-  $('context-popover').hidden = true;
-  pet.classList.remove('context-open');
-  $('tool-context').setAttribute('aria-expanded', 'false');
-  $('quick-model')?.setAttribute('aria-expanded', 'false');
+  closeContext();
   composeButton.setAttribute('aria-expanded', 'true');
   setTimeout(() => quickInput.focus(), 30);
 }
@@ -687,6 +696,22 @@ function renderOptions(container, rows, { label, onPick, emptyText }) {
     container.append(button);
   }
 }
+function updateWorkspaceSectionLabel() {
+  const labelEl = $('context-workspaces-label');
+  if (!labelEl) return;
+  const agentLabel = getTargetInfo(targetAgent)?.label || TARGET_LABELS[targetAgent] || targetAgent;
+  labelEl.textContent = `${agentLabel} · 打开/最近目录`;
+}
+function setExtraSectionOpen(open) {
+  contextExtraOpen = Boolean(open);
+  const section = $('context-extra-section');
+  const toggleBtn = $('context-toggle-extra');
+  if (section) section.hidden = !contextExtraOpen;
+  if (toggleBtn) {
+    toggleBtn.classList.toggle('is-active', contextExtraOpen);
+    toggleBtn.setAttribute('aria-expanded', String(contextExtraOpen));
+  }
+}
 function renderTargetOptions(targets) {
   const container = $('context-models');
   container.textContent = '';
@@ -712,9 +737,27 @@ function renderTargetOptions(targets) {
       activeSessionTitle = '';
       prefs.activeSessionTitle = '';
       savePrefs();
+      updateWorkspaceSectionLabel();
       renderModel();
       renderTargetOptions(targets);
-      const nextSessions = await action('sessions', { targetAgent, cwd: currentCwd || undefined }).catch(() => null);
+      const [nextWorkspaces, nextSessions] = await Promise.all([
+        action('workspaces', { targetAgent, includeExtra: contextExtraOpen }).catch(() => null),
+        action('sessions', { targetAgent, cwd: currentCwd || undefined }).catch(() => null),
+      ]);
+      if (Array.isArray(nextWorkspaces?.workspaces)) {
+        workspaceOptions = nextWorkspaces.workspaces;
+        if (!currentCwd && nextWorkspaces?.currentCwd) {
+          currentCwd = nextWorkspaces.currentCwd;
+          prefs.cwd = currentCwd;
+          savePrefs();
+          renderModel();
+        }
+        renderWorkspaceOptions(workspaceOptions);
+      }
+      if (contextExtraOpen && Array.isArray(nextWorkspaces?.extraWorkspaces)) {
+        extraWorkspaceOptions = nextWorkspaces.extraWorkspaces;
+        renderExtraWorkspaceOptions(extraWorkspaceOptions);
+      }
       if (Array.isArray(nextSessions?.sessions)) {
         sessionOptions = nextSessions.sessions;
         renderSessionOptions(sessionOptions);
@@ -740,42 +783,97 @@ async function refreshFilesForWorkspace() {
     onPick: row => { insertIntoQuickInput(`@${row.path ?? row.name ?? row.value ?? ''} `); },
   });
 }
+async function selectWorkspacePath(cwdPath, displayName, { isExtra = false } = {}) {
+  const res = await action('selectWorkspace', { cwd: cwdPath, targetAgent });
+  currentCwd = res?.currentCwd || cwdPath;
+  prefs.cwd = currentCwd;
+  prefs.activeSessionId = null;
+  activeSessionTitle = '';
+  prefs.activeSessionTitle = '';
+  savePrefs();
+  if (Array.isArray(res?.workspaces)) workspaceOptions = res.workspaces;
+  if (Array.isArray(res?.sessions)) {
+    sessionOptions = res.sessions;
+  } else {
+    const nextSessions = await action('sessions', { targetAgent, cwd: currentCwd }).catch(() => null);
+    if (Array.isArray(nextSessions?.sessions)) sessionOptions = nextSessions.sessions;
+  }
+  renderWorkspaceOptions(workspaceOptions);
+  if (contextExtraOpen) renderExtraWorkspaceOptions(extraWorkspaceOptions);
+  renderSessionOptions(sessionOptions);
+  renderModel();
+  refreshFilesForWorkspace();
+  showFeedback(isExtra ? `已选择本机项目：${displayName}` : `已切换工作目录：${displayName}`);
+}
+function makeWorkspaceChip(w, { isExtra = false } = {}) {
+  const dirName = w.name || cwdBasename(w.path) || w.path;
+  const button = el('button', 'context-option context-workspace-chip');
+  button.type = 'button';
+  if (w.isOpen) {
+    button.classList.add('is-open');
+    const dot = el('span', 'context-open-dot');
+    dot.setAttribute('aria-hidden', 'true');
+    button.append(dot);
+  }
+  button.append(el('span', 'context-option-label', `${isExtra ? '🗂' : '📁'} ${dirName}`));
+  if (w.isOpen) button.append(el('span', 'context-open-tag', '已打开'));
+  button.title = w.isOpen ? `${w.path}（已打开）` : w.path;
+  if (w.path === currentCwd || (!currentCwd && !isExtra && w.active)) button.classList.add('is-active');
+  button.addEventListener('click', () => run(() => selectWorkspacePath(w.path, dirName, { isExtra })));
+  return button;
+}
 function renderWorkspaceOptions(workspaces = workspaceOptions) {
   const container = $('context-workspaces');
   if (!container) return;
   container.textContent = '';
   if (!workspaces.length) {
-    container.append(el('span', 'context-empty', '暂无目录，点击右上角选择文件夹'));
+    container.append(el('span', 'context-empty', '暂无打开/最近目录，可点 ＋ 本机项目或选择文件夹'));
     return;
   }
   for (const w of workspaces) {
-    const dirName = w.name || cwdBasename(w.path) || w.path;
-    const button = el('button', 'context-option', `📁 ${dirName}`);
-    button.type = 'button';
-    button.title = w.path;
-    if (w.path === currentCwd || (!currentCwd && w.active)) button.classList.add('is-active');
-    button.addEventListener('click', () => run(async () => {
-      const res = await action('selectWorkspace', { cwd: w.path, targetAgent });
-      currentCwd = res?.currentCwd || w.path;
-      prefs.cwd = currentCwd;
-      prefs.activeSessionId = null;
-      activeSessionTitle = '';
-      prefs.activeSessionTitle = '';
-      savePrefs();
-      if (Array.isArray(res?.workspaces)) workspaceOptions = res.workspaces;
-      if (Array.isArray(res?.sessions)) {
-        sessionOptions = res.sessions;
-      } else {
-        const nextSessions = await action('sessions', { targetAgent, cwd: currentCwd }).catch(() => null);
-        if (Array.isArray(nextSessions?.sessions)) sessionOptions = nextSessions.sessions;
-      }
+    container.append(makeWorkspaceChip(w, { isExtra: false }));
+  }
+}
+function renderExtraWorkspaceOptions(extraWorkspaces = extraWorkspaceOptions, { loading = false } = {}) {
+  const container = $('context-extra-workspaces');
+  if (!container) return;
+  container.textContent = '';
+  if (loading && !extraWorkspaces.length) {
+    container.append(el('span', 'context-empty', '正在扫描本机项目…'));
+    return;
+  }
+  if (!extraWorkspaces.length) {
+    container.append(el('span', 'context-empty', '未发现更多本机项目，可点「📁 选择文件夹…」'));
+    return;
+  }
+  for (const w of extraWorkspaces) {
+    container.append(makeWorkspaceChip(w, { isExtra: true }));
+  }
+}
+async function fetchExtraWorkspaces({ forceScan = false } = {}) {
+  if (scanningExtra) return;
+  scanningExtra = true;
+  const scanBtn = $('context-scan-extra');
+  if (scanBtn) {
+    scanBtn.disabled = true;
+    scanBtn.textContent = '扫描中…';
+  }
+  renderExtraWorkspaceOptions(extraWorkspaceOptions, { loading: true });
+  try {
+    const res = await action('workspaces', { targetAgent, includeExtra: true, forceScan });
+    if (Array.isArray(res?.workspaces)) {
+      workspaceOptions = res.workspaces;
       renderWorkspaceOptions(workspaceOptions);
-      renderSessionOptions(sessionOptions);
-      renderModel();
-      refreshFilesForWorkspace();
-      showFeedback(`已切换工作目录：${dirName}`);
-    }));
-    container.append(button);
+    }
+    extraWorkspaceOptions = Array.isArray(res?.extraWorkspaces) ? res.extraWorkspaces : [];
+    renderExtraWorkspaceOptions(extraWorkspaceOptions);
+    if (forceScan) showFeedback(`已扫描本机项目（发现 ${extraWorkspaceOptions.length} 个）`);
+  } finally {
+    scanningExtra = false;
+    if (scanBtn) {
+      scanBtn.disabled = false;
+      scanBtn.textContent = '↻ 扫描本机';
+    }
   }
 }
 async function selectNewSession() {
@@ -833,14 +931,17 @@ function renderSessionOptions(sessions = sessionOptions) {
     container.append(button);
   }
 }
-async function loadContext(sessionId) {
+async function loadContext(sessionId, { includeExtra = contextExtraOpen } = {}) {
   const note = $('context-note');
   note.hidden = false; note.textContent = '正在读取上下文…';
+  if (includeExtra && !extraWorkspaceOptions.length) {
+    renderExtraWorkspaceOptions([], { loading: true });
+  }
   const [skills, models, files, workspaces, sessions] = await Promise.allSettled([
     action('skills', { sessionId }),
     action('models'),
     action('files', { sessionId, query: '', cwd: currentCwd || undefined }),
-    action('workspaces', { targetAgent }),
+    action('workspaces', { targetAgent, includeExtra }),
     action('sessions', { targetAgent, cwd: currentCwd || undefined }),
   ]);
   const skillRows = skills.status === 'fulfilled' ? skills.value.skills ?? [] : [];
@@ -862,6 +963,9 @@ async function loadContext(sessionId) {
   if (!targetRows.length) targetRows = chatTargets;
   if (workspaces.status === 'fulfilled') {
     workspaceOptions = Array.isArray(workspaces.value?.workspaces) ? workspaces.value.workspaces : [];
+    if (includeExtra) {
+      extraWorkspaceOptions = Array.isArray(workspaces.value?.extraWorkspaces) ? workspaces.value.extraWorkspaces : [];
+    }
     if (!currentCwd && workspaces.value?.currentCwd) {
       currentCwd = workspaces.value.currentCwd;
       prefs.cwd = currentCwd;
@@ -870,6 +974,7 @@ async function loadContext(sessionId) {
     }
   } else {
     workspaceOptions = [];
+    if (includeExtra) extraWorkspaceOptions = [];
   }
   if (sessions.status === 'fulfilled') {
     sessionOptions = Array.isArray(sessions.value?.sessions) ? sessions.value.sessions : [];
@@ -884,8 +989,12 @@ async function loadContext(sessionId) {
     label: row => `@${row.path ?? row.name ?? row.value ?? ''}`, emptyText: '输入文件名以搜索',
     onPick: row => { insertIntoQuickInput(`@${row.path ?? row.name ?? row.value ?? ''} `); },
   });
+  updateWorkspaceSectionLabel();
   renderTargetOptions(targetRows);
   renderWorkspaceOptions(workspaceOptions);
+  if (includeExtra || contextExtraOpen) {
+    renderExtraWorkspaceOptions(extraWorkspaceOptions);
+  }
   renderSessionOptions(sessionOptions);
   const unavailable = [skills, files, models].filter(result => result.status === 'rejected' || result.value?.unavailable).length;
   note.textContent = unavailable ? '部分目录暂不可用；图片附件仍可添加' : '';
@@ -899,23 +1008,32 @@ function insertIntoQuickInput(text) {
   quickInput.setSelectionRange(start + text.length, start + text.length);
   if (!$('pet').classList.contains('compose-open')) showQuickChat();
 }
-function openContext() {
+function openContext(mode = 'all') {
   const popover = $('context-popover');
-  const open = popover.hidden;
-  popover.hidden = !open;
-  pet.classList.toggle('context-open', open);
-  $('tool-context').setAttribute('aria-expanded', String(open));
-  $('quick-model')?.setAttribute('aria-expanded', String(open));
-  if (!open) return;
+  const wasOpen = !popover.hidden;
+  const nextOpen = wasOpen && mode !== contextMode ? true : !wasOpen;
+  contextMode = mode;
+  popover.hidden = !nextOpen;
+  pet.classList.toggle('context-open', nextOpen);
+  $('tool-context').setAttribute('aria-expanded', String(nextOpen && mode === 'plus'));
+  $('quick-model')?.setAttribute('aria-expanded', String(nextOpen && mode === 'agent'));
+  if (!nextOpen) {
+    setExtraSectionOpen(false);
+    return;
+  }
+  const wantExtra = mode === 'plus';
+  setExtraSectionOpen(wantExtra);
   renderModel();
+  updateWorkspaceSectionLabel();
   run(async () => {
     contextSessionId = await ensureContextSession();
-    await loadContext(contextSessionId);
+    await loadContext(contextSessionId, { includeExtra: wantExtra });
   });
 }
 function closeContext() {
   $('context-popover').hidden = true;
   pet.classList.remove('context-open');
+  setExtraSectionOpen(false);
   $('tool-context').setAttribute('aria-expanded', 'false');
   $('quick-model')?.setAttribute('aria-expanded', 'false');
 }
@@ -1151,9 +1269,15 @@ activitiesButton.addEventListener('click', event => {
   event.currentTarget.title = open ? '收起活动' : '显示活动';
   renderActivities();
 });
-$('tool-context').addEventListener('click', openContext);
-$('quick-model')?.addEventListener('click', openContext);
+$('tool-context').addEventListener('click', () => openContext('plus'));
+$('quick-model')?.addEventListener('click', () => openContext('agent'));
 $('context-close').addEventListener('click', closeContext);
+$('context-toggle-extra')?.addEventListener('click', () => run(async () => {
+  const next = !contextExtraOpen;
+  setExtraSectionOpen(next);
+  if (next) await fetchExtraWorkspaces({ forceScan: false });
+}));
+$('context-scan-extra')?.addEventListener('click', () => run(() => fetchExtraWorkspaces({ forceScan: true })));
 $('context-browse-cwd')?.addEventListener('click', () => run(async () => {
   const res = await action('selectWorkspace', { browse: true, targetAgent });
   if (res?.canceled) return;
@@ -1168,6 +1292,7 @@ $('context-browse-cwd')?.addEventListener('click', () => run(async () => {
   if (Array.isArray(res?.workspaces)) workspaceOptions = res.workspaces;
   if (Array.isArray(res?.sessions)) sessionOptions = res.sessions;
   renderWorkspaceOptions(workspaceOptions);
+  if (contextExtraOpen) renderExtraWorkspaceOptions(extraWorkspaceOptions);
   renderSessionOptions(sessionOptions);
   renderModel();
   refreshFilesForWorkspace();

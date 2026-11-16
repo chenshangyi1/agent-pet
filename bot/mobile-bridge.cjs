@@ -194,21 +194,32 @@ class MobileBridgeServer {
     return safeCompareToken(supplied, expected);
   }
 
-  buildStatePayload({ targetAgent, cwd } = {}) {
+  buildStatePayload({ targetAgent, cwd, includeExtra = false, forceScan = false } = {}) {
     const localChat = this.botService?.localChat;
     const snapshot = this.providers?.snapshot || { items: [], sources: [] };
-    return {
+    const effectiveEngine = targetAgent || localChat?.selectedEngine || this.botService?.config?.defaultEngine;
+    const workspaces = localChat
+      ? localChat.discoverWorkspaces({ engine: effectiveEngine, providers: this.providers })
+      : [];
+    const payload = {
       ok: true,
       currentCwd: localChat ? localChat.currentCwd() : (this.botService?.config?.defaultCwd || ''),
       currentSessionId: localChat?.selectedSessionId || null,
       defaultEngine: this.botService?.config?.defaultEngine || 'claude',
       engines: this.botService?.probeEngines ? this.botService.probeEngines() : {},
-      workspaces: localChat ? localChat.discoverWorkspaces() : [],
-      sessions: localChat ? localChat.discoverSessions({ engine: targetAgent, cwd }) : [],
+      workspaces,
+      sessions: localChat ? localChat.discoverSessions({ engine: effectiveEngine, cwd }) : [],
       activities: Array.isArray(snapshot.items) ? snapshot.items : [],
       sources: Array.isArray(snapshot.sources) ? snapshot.sources : [],
       jobs: this.botService?.listJobs ? this.botService.listJobs() : [],
     };
+    if (includeExtra && localChat && typeof localChat.discoverExtraWorkspaces === 'function') {
+      payload.extraWorkspaces = localChat.discoverExtraWorkspaces({
+        excludePaths: workspaces.map(w => w.path),
+        forceScan: Boolean(forceScan),
+      });
+    }
+    return payload;
   }
 
   _syncMobileRouterCwd(cwd) {
@@ -277,7 +288,11 @@ class MobileBridgeServer {
     if (req.method === 'GET' && pathname === '/api/mobile/state') {
       const targetAgent = urlObj.searchParams.get('targetAgent') || undefined;
       const cwd = urlObj.searchParams.get('cwd') || undefined;
-      sendJson(res, 200, this.buildStatePayload({ targetAgent, cwd }));
+      const extraParam = urlObj.searchParams.get('extra');
+      const includeExtra = extraParam === '1' || extraParam === 'true';
+      const forceScanParam = urlObj.searchParams.get('forceScan');
+      const forceScan = forceScanParam === '1' || forceScanParam === 'true';
+      sendJson(res, 200, this.buildStatePayload({ targetAgent, cwd, includeExtra, forceScan }));
       return;
     }
 

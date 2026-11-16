@@ -218,6 +218,7 @@ class BotService extends EventEmitter {
 
     this.localChat = new LocalChatBridge({
       dispatcher: this.dispatcher,
+      providers: this.providers,
       getConfig: () => this.config,
       onUpdate: () => this.mobileBridge?.scheduleBroadcast(),
     });

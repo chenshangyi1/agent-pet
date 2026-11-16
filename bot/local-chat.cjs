@@ -1,9 +1,11 @@
 'use strict';
 
+const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
+const { URL, pathToFileURL } = require('node:url');
 const { CATALOG_BY_ID } = require('../connectors/catalog.cjs');
 
 const MAX_LIST_FILES = 20;
@@ -32,7 +34,38 @@ const VALID_ENGINES = new Set(['claude', 'codex', 'opencode', 'dsh']);
 const MAX_DISCOVER_FILES = 15;
 const MAX_DISCOVER_WORKSPACES = 12;
 const MAX_DISCOVER_SESSIONS = 10;
+const MAX_EXTRA_WORKSPACES = 20;
+const MAX_EXTRA_CACHE_ITEMS = 60;
+const MAX_EXTRA_SCAN_ENTRIES = 6000;
+const EXTRA_SCAN_CACHE_TTL_MS = 30_000;
 const JSONL_HEAD_BYTES = 65536;
+
+const VSCODE_FORK_APP_NAMES = {
+  cursor: 'Cursor',
+  kiro: 'Kiro',
+  trae: 'Trae',
+  'trae-cn': 'Trae CN',
+  'qoder-cn': 'Qoder CN',
+  qoder: 'Qoder',
+  windsurf: 'Windsurf',
+  codebuddy: 'CodeBuddy',
+  'codebuddy-cn': 'CodeBuddy CN',
+};
+
+const PROJECT_MARKERS = ['.git', 'package.json', 'Package.swift', 'pyproject.toml', 'Cargo.toml', 'go.mod'];
+const EXTRA_SKIP_DIRS = new Set([
+  'node_modules',
+  '.git',
+  'Library',
+  'Applications',
+  'dist',
+  'build',
+  '.next',
+  '.cache',
+  'DerivedData',
+  '__pycache__',
+  'venv',
+]);
 
 function safeRealpath(targetPath) {
   if (typeof targetPath !== 'string' || !targetPath.trim()) return null;
@@ -50,6 +83,126 @@ function isExistingDirectory(dirPath) {
   } catch {
     return false;
   }
+}
+
+function readJsonSafe(filePath) {
+  if (typeof filePath !== 'string' || !filePath.trim()) return null;
+  try {
+    const raw = fs.readFileSync(filePath, 'utf8').trim();
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function querySqliteJson(dbPath, sql) {
+  if (typeof dbPath !== 'string' || !dbPath.trim()) return [];
+  const resolved = path.resolve(dbPath.trim());
+  try {
+    if (!fs.statSync(resolved).isFile()) return [];
+  } catch {
+    return [];
+  }
+
+  const attempts = [
+    resolved,
+    `${pathToFileURL(resolved).href}?mode=ro`,
+    `${pathToFileURL(resolved).href}?immutable=1`,
+  ];
+  for (const target of attempts) {
+    try {
+      const raw = execFileSync('/usr/bin/sqlite3', ['-readonly', '-json', target, sql], {
+        timeout: 1500,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      const trimmed = String(raw || '').trim();
+      if (!trimmed) return [];
+      const parsed = JSON.parse(trimmed);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      // Retry with read-only URI options when WAL/locked DBs reject bare -readonly.
+    }
+  }
+  return [];
+}
+
+function parseFileUri(uri, { parentIfFile = false } = {}) {
+  if (typeof uri !== 'string') return null;
+  const trimmed = uri.trim();
+  if (!trimmed || !trimmed.startsWith('file://')) return null;
+  try {
+    const urlObj = new URL(trimmed);
+    if (urlObj.protocol !== 'file:') return null;
+    let decoded = decodeURIComponent(urlObj.pathname);
+    if (!decoded) return null;
+    if (parentIfFile) {
+      if (decoded.endsWith('.code-workspace')) {
+        decoded = path.dirname(decoded);
+      } else {
+        try {
+          if (fs.statSync(decoded).isFile()) {
+            decoded = path.dirname(decoded);
+          }
+        } catch {}
+      }
+    }
+    const real = safeRealpath(decoded);
+    return real && isExistingDirectory(real) ? real : null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveWorkspaceCandidate(raw, { parentIfFile = false } = {}) {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith('file://')) {
+    return parseFileUri(trimmed, { parentIfFile });
+  }
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) {
+    return null;
+  }
+  const expanded = trimmed === '~'
+    ? os.homedir()
+    : trimmed.startsWith('~/')
+      ? path.join(os.homedir(), trimmed.slice(2))
+      : trimmed;
+  let candidate = expanded;
+  if (parentIfFile && candidate.endsWith('.code-workspace')) {
+    candidate = path.dirname(candidate);
+  }
+  const real = safeRealpath(candidate);
+  return real && isExistingDirectory(real) ? real : null;
+}
+
+function parseWorkspaceUris(raw) {
+  let list = [];
+  if (Array.isArray(raw)) {
+    list = raw;
+  } else if (typeof raw === 'string' && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) list = parsed;
+    } catch {}
+  }
+  const resolved = [];
+  for (const uri of list) {
+    const dir = parseFileUri(uri);
+    if (dir) resolved.push(dir);
+  }
+  return resolved;
+}
+
+function hasProjectMarker(dirPath) {
+  for (const marker of PROJECT_MARKERS) {
+    try {
+      if (fs.existsSync(path.join(dirPath, marker))) return true;
+    } catch {}
+  }
+  return false;
 }
 
 function readHeadLines(filePath, maxBytes = JSONL_HEAD_BYTES) {
@@ -100,32 +253,6 @@ function collectRecentJsonlFiles(rootDir, maxDepth = 4, limit = MAX_DISCOVER_FIL
 
   found.sort((a, b) => b.mtimeMs - a.mtimeMs);
   return found.slice(0, limit);
-}
-
-function collectSubdirectories(rootDir, maxDepth = 2) {
-  if (!isExistingDirectory(rootDir)) return [];
-  const dirs = [];
-  const queue = [{ dir: rootDir, depth: 0 }];
-  while (queue.length > 0) {
-    const { dir, depth } = queue.shift();
-    if (depth >= maxDepth) continue;
-    let entries;
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      if (entry.name.startsWith('.') || SKIP_DIRS.has(entry.name)) continue;
-      if (!entry.isDirectory()) continue;
-      const fullPath = path.join(dir, entry.name);
-      dirs.push(fullPath);
-      if (depth + 1 < maxDepth) {
-        queue.push({ dir: fullPath, depth: depth + 1 });
-      }
-    }
-  }
-  return dirs;
 }
 
 function isBoilerplateUserText(text) {
@@ -323,8 +450,23 @@ function listWorkspaceFiles(rootDir, query = '', limit = MAX_LIST_FILES) {
 }
 
 class LocalChatBridge {
-  constructor({ dispatcher, getConfig, onUpdate, codexSessionsDir, claudeProjectsDir } = {}) {
+  constructor({
+    dispatcher,
+    getConfig,
+    onUpdate,
+    providers,
+    codexSessionsDir,
+    claudeProjectsDir,
+    appSupportDir,
+    opencodeDbPath,
+    zcodeDir,
+    workbuddyDbPath,
+    workbuddyAiDbPath,
+    antigravityDbPath,
+    extraScanRoots,
+  } = {}) {
     this.dispatcher = dispatcher || null;
+    this.providers = providers || dispatcher?.providers || null;
     this.getConfig = typeof getConfig === 'function' ? getConfig : () => ({});
     this.onUpdate = typeof onUpdate === 'function' ? onUpdate : null;
     this.sessions = new Map();
@@ -332,8 +474,29 @@ class LocalChatBridge {
     this.selectedEngine = null;
     this.selectedCwd = null;
     this.selectedSessionId = null;
-    this._codexSessionsDir = codexSessionsDir || path.join(os.homedir(), '.codex', 'sessions');
-    this._claudeProjectsDir = claudeProjectsDir || path.join(os.homedir(), '.claude', 'projects');
+    const home = os.homedir();
+    this._codexSessionsDir = codexSessionsDir || path.join(home, '.codex', 'sessions');
+    this._claudeProjectsDir = claudeProjectsDir || path.join(home, '.claude', 'projects');
+    this._appSupportDir = appSupportDir || path.join(home, 'Library', 'Application Support');
+    this._opencodeDbPath = opencodeDbPath || path.join(home, '.local', 'share', 'opencode', 'opencode.db');
+    this._zcodeDir = zcodeDir || path.join(home, '.zcode', 'v2');
+    this._workbuddyDbPath = workbuddyDbPath || path.join(home, '.workbuddy', 'workbuddy.db');
+    this._workbuddyAiDbPath = workbuddyAiDbPath || path.join(home, '.workbuddy-ai', 'workbuddy.db');
+    this._antigravityDbPath = antigravityDbPath || path.join(home, '.gemini', 'antigravity', 'conversation_summaries.db');
+    this._extraScanRoots = Array.isArray(extraScanRoots)
+      ? extraScanRoots
+      : [
+        path.join(home, 'AI'),
+        path.join(home, 'AI', 'Codex'),
+        path.join(home, 'Desktop'),
+        path.join(home, 'Documents'),
+        path.join(home, 'Projects'),
+        path.join(home, 'Developer'),
+        path.join(home, 'Code'),
+        path.join(home, 'workspace'),
+        home,
+      ];
+    this._extraCache = null;
   }
 
   _defaultCwd() {
@@ -377,65 +540,315 @@ class LocalChatBridge {
     return real;
   }
 
-  discoverWorkspaces() {
-    const candidates = [];
-    const pushCandidate = dir => {
-      if (typeof dir === 'string' && dir.trim()) {
-        candidates.push(dir.trim());
+  _isAllowedWorkspace(real) {
+    if (!real || !isExistingDirectory(real)) return false;
+    if (this.dispatcher && typeof this.dispatcher.validateWorkspace === 'function') {
+      try {
+        this.dispatcher.validateWorkspace(real);
+        return true;
+      } catch {
+        return false;
       }
+    }
+    return true;
+  }
+
+  _resolveTargetEngine(engine) {
+    const reqEng = String(engine || '').trim().toLowerCase();
+    return reqEng && reqEng !== 'auto' ? reqEng : this.resolveEngine('auto');
+  }
+
+  discoverWorkspaces({ engine, includeExtra = false, providers } = {}) {
+    const targetEngine = this._resolveTargetEngine(engine);
+    const activeProviders = providers || this.providers || this.dispatcher?.providers || null;
+    const activeReal = safeRealpath(this.currentCwd()) || this.currentCwd();
+
+    const ordered = [];
+    const byReal = new Map();
+    const pushCandidate = (raw, { isOpen = false, parentIfFile = false } = {}) => {
+      const real = resolveWorkspaceCandidate(raw, { parentIfFile });
+      if (!real || !this._isAllowedWorkspace(real)) return;
+      const existing = byReal.get(real);
+      if (existing) {
+        if (isOpen && !existing.isOpen) existing.isOpen = true;
+        return;
+      }
+      const entry = { real, isOpen: Boolean(isOpen) };
+      byReal.set(real, entry);
+      ordered.push(entry);
     };
 
-    pushCandidate(this.currentCwd());
-    pushCandidate(this._defaultCwd());
+    // 1. Respect explicit selectedCwd at top, then live sessions for targetEngine.
+    if (this.selectedCwd) {
+      pushCandidate(this.selectedCwd, { isOpen: false });
+    }
     for (const s of this.sessions.values()) {
-      pushCandidate(s.cwd);
+      if (s.provider !== targetEngine || !s.cwd) continue;
+      pushCandidate(s.cwd, { isOpen: ['running', 'waiting', 'blocked'].includes(s.status) });
+    }
+    const snapshotItems = Array.isArray(activeProviders?.snapshot?.items)
+      ? activeProviders.snapshot.items
+      : [];
+    for (const item of snapshotItems) {
+      if (!item || item.provider !== targetEngine) continue;
+      const itemCwd = item.cwd || item.workingDirectory || item.workspacePath;
+      if (itemCwd) {
+        pushCandidate(itemCwd, { isOpen: ['running', 'waiting', 'blocked'].includes(item.status) });
+      }
     }
 
-    const recentCodexFiles = collectRecentJsonlFiles(this._codexSessionsDir, 4, MAX_DISCOVER_FILES);
-    for (const { filePath, mtimeMs } of recentCodexFiles) {
-      const meta = parseCodexSessionMeta(filePath, mtimeMs);
-      if (meta?.cwd) pushCandidate(meta.cwd);
-    }
+    // 2. Agent-specific opened & recent project discovery.
+    const vscodeAppName = VSCODE_FORK_APP_NAMES[targetEngine];
+    if (vscodeAppName) {
+      const globalStorage = path.join(this._appSupportDir, vscodeAppName, 'User', 'globalStorage');
+      const storage = readJsonSafe(path.join(globalStorage, 'storage.json'));
+      if (storage && typeof storage === 'object') {
+        const openedWindows = Array.isArray(storage.windowsState?.openedWindows)
+          ? storage.windowsState.openedWindows
+          : [];
+        for (const win of openedWindows) {
+          if (!win || typeof win !== 'object') continue;
+          const uri = win.folder || win.workspaceIdentifier?.configURIPath;
+          if (uri) {
+            pushCandidate(uri, { isOpen: true, parentIfFile: !win.folder });
+          }
+        }
 
-    const home = os.homedir();
-    for (const dir of collectSubdirectories(path.join(home, 'AI', 'Codex'), 2)) {
-      pushCandidate(dir);
-    }
-    for (const dir of collectSubdirectories(path.join(home, 'AI'), 2)) {
-      pushCandidate(dir);
-    }
+        const backupFolders = Array.isArray(storage.backupWorkspaces?.folders)
+          ? storage.backupWorkspaces.folders
+          : [];
+        for (const item of backupFolders) {
+          if (item?.folderUri) {
+            pushCandidate(item.folderUri, { isOpen: true });
+          }
+        }
+        const backupWorkspaces = Array.isArray(storage.backupWorkspaces?.workspaces)
+          ? storage.backupWorkspaces.workspaces
+          : [];
+        for (const item of backupWorkspaces) {
+          if (item?.configURIPath) {
+            pushCandidate(item.configURIPath, { isOpen: true, parentIfFile: true });
+          }
+        }
 
-    pushCandidate(process.cwd());
-
-    const activeReal = safeRealpath(this.currentCwd()) || this.currentCwd();
-    const seen = new Set();
-    const out = [];
-
-    for (const cand of candidates) {
-      if (out.length >= MAX_DISCOVER_WORKSPACES) break;
-      const real = safeRealpath(cand);
-      if (!real || seen.has(real) || !isExistingDirectory(real)) continue;
-      if (this.dispatcher && typeof this.dispatcher.validateWorkspace === 'function') {
-        try {
-          this.dispatcher.validateWorkspace(real);
-        } catch {
-          continue;
+        const lastActive = storage.windowsState?.lastActiveWindow;
+        if (lastActive && typeof lastActive === 'object') {
+          const uri = lastActive.folder || lastActive.workspaceIdentifier?.configURIPath;
+          if (uri) {
+            pushCandidate(uri, { isOpen: false, parentIfFile: !lastActive.folder });
+          }
         }
       }
-      seen.add(real);
-      out.push({
-        path: real,
-        name: path.basename(real) || real,
-        active: real === activeReal,
-      });
+
+      const vscdbPath = path.join(globalStorage, 'state.vscdb');
+      const rows = querySqliteJson(
+        vscdbPath,
+        "SELECT value FROM ItemTable WHERE key = 'history.recentlyOpenedPathsList' LIMIT 1;",
+      );
+      if (rows[0]?.value) {
+        try {
+          const parsed = JSON.parse(rows[0].value);
+          const entries = Array.isArray(parsed?.entries) ? parsed.entries : [];
+          for (const entry of entries) {
+            if (!entry || typeof entry !== 'object') continue;
+            if (entry.folderUri) {
+              pushCandidate(entry.folderUri, { isOpen: false });
+            } else if (entry.workspace?.configPath) {
+              pushCandidate(entry.workspace.configPath, { isOpen: false, parentIfFile: true });
+            }
+          }
+        } catch {}
+      }
+    } else if (targetEngine === 'opencode') {
+      const homeReal = safeRealpath(os.homedir());
+      const rows = querySqliteJson(
+        this._opencodeDbPath,
+        'SELECT worktree, COALESCE(time_active, time_updated, time_created) AS ts FROM project ORDER BY ts DESC LIMIT 15;',
+      );
+      const fallbackRoots = [];
+      for (const row of rows) {
+        const real = resolveWorkspaceCandidate(row?.worktree);
+        if (!real) continue;
+        if (real === homeReal || real === '/') {
+          fallbackRoots.push(real);
+        } else {
+          pushCandidate(real, { isOpen: false });
+        }
+      }
+      for (const fallback of fallbackRoots) {
+        if (fallback !== '/' || ordered.length === 0) {
+          pushCandidate(fallback, { isOpen: false });
+        }
+      }
+    } else if (targetEngine === 'antigravity') {
+      const rows = querySqliteJson(
+        this._antigravityDbPath,
+        'SELECT workspace_uris, last_modified_time FROM conversation_summaries ORDER BY last_modified_time DESC LIMIT 30;',
+      );
+      for (const row of rows) {
+        for (const dir of parseWorkspaceUris(row?.workspace_uris)) {
+          pushCandidate(dir, { isOpen: false });
+        }
+      }
+    } else if (targetEngine === 'zcode') {
+      const setting = readJsonSafe(path.join(this._zcodeDir, 'setting.json'));
+      const recent = Array.isArray(setting?.recentProjects) ? setting.recentProjects : [];
+      for (const item of recent) {
+        const dir = typeof item === 'string' ? item : item?.path;
+        if (dir) pushCandidate(dir, { isOpen: false });
+      }
+      const rows = querySqliteJson(
+        path.join(this._zcodeDir, 'tasks-index.sqlite'),
+        'SELECT DISTINCT workspace_path, MAX(updated_at) AS ts FROM tasks WHERE workspace_path IS NOT NULL GROUP BY workspace_path ORDER BY ts DESC LIMIT 15;',
+      );
+      for (const row of rows) {
+        if (row?.workspace_path) pushCandidate(row.workspace_path, { isOpen: false });
+      }
+    } else if (targetEngine === 'workbuddy' || targetEngine === 'workbuddy-ai') {
+      const dbPath = targetEngine === 'workbuddy-ai' ? this._workbuddyAiDbPath : this._workbuddyDbPath;
+      const rows = querySqliteJson(
+        dbPath,
+        'SELECT path, last_opened_at FROM workspaces ORDER BY last_opened_at DESC LIMIT 15;',
+      );
+      for (const row of rows) {
+        if (row?.path) pushCandidate(row.path, { isOpen: false });
+      }
+    } else if (targetEngine === 'claude') {
+      const files = collectRecentJsonlFiles(this._claudeProjectsDir, 2, 30);
+      for (const { filePath, mtimeMs } of files) {
+        const meta = parseClaudeSessionMeta(filePath, mtimeMs);
+        if (meta?.cwd) pushCandidate(meta.cwd, { isOpen: false });
+      }
+    } else if (targetEngine === 'codex') {
+      const files = collectRecentJsonlFiles(this._codexSessionsDir, 4, 30);
+      for (const { filePath, mtimeMs } of files) {
+        const meta = parseCodexSessionMeta(filePath, mtimeMs);
+        if (meta?.cwd) pushCandidate(meta.cwd, { isOpen: false });
+      }
+    } else if (targetEngine === 'dsh') {
+      const dshItems = typeof activeProviders?.list === 'function'
+        ? (activeProviders.list('dsh')?.items || [])
+        : snapshotItems.filter(item => item?.provider === 'dsh');
+      for (const item of dshItems) {
+        const itemCwd = item?.cwd || item?.workingDirectory || item?.workspacePath;
+        if (itemCwd) pushCandidate(itemCwd, { isOpen: false });
+      }
+      pushCandidate(this._defaultCwd(), { isOpen: false });
+    }
+
+    if (ordered.length === 0) {
+      pushCandidate(this._defaultCwd(), { isOpen: false });
+      pushCandidate(process.cwd(), { isOpen: false });
+    }
+
+    ordered.sort((a, b) => (a.isOpen === b.isOpen ? 0 : a.isOpen ? -1 : 1));
+
+    const out = ordered.slice(0, MAX_DISCOVER_WORKSPACES).map(entry => ({
+      path: entry.real,
+      name: path.basename(entry.real) || entry.real,
+      active: entry.real === activeReal,
+      isOpen: Boolean(entry.isOpen),
+      sourceEngine: targetEngine,
+    }));
+
+    if (includeExtra) {
+      const extras = this.discoverExtraWorkspaces({ excludePaths: out.map(w => w.path) });
+      for (const ex of extras) {
+        out.push({
+          ...ex,
+          isOpen: false,
+          sourceEngine: targetEngine,
+        });
+      }
     }
 
     return out;
   }
 
+  _scanExtraWorkspaces() {
+    const found = [];
+    const seenProjects = new Set();
+    const visitedAtDepth = new Map();
+    let visitedEntries = 0;
+
+    for (const rawRoot of this._extraScanRoots) {
+      if (found.length >= MAX_EXTRA_CACHE_ITEMS || visitedEntries >= MAX_EXTRA_SCAN_ENTRIES) break;
+      const rootReal = safeRealpath(rawRoot);
+      if (!rootReal || !isExistingDirectory(rootReal)) continue;
+      if (rootReal === '/Volumes' || rootReal.startsWith('/Volumes/')) continue;
+
+      const queue = [{ dir: rootReal, depth: 0 }];
+      while (queue.length > 0 && found.length < MAX_EXTRA_CACHE_ITEMS && visitedEntries < MAX_EXTRA_SCAN_ENTRIES) {
+        const { dir, depth } = queue.shift();
+        const prevDepth = visitedAtDepth.get(dir);
+        if (prevDepth !== undefined && prevDepth <= depth) continue;
+        visitedAtDepth.set(dir, depth);
+
+        if (depth >= 1 && depth <= 3 && hasProjectMarker(dir)) {
+          if (!seenProjects.has(dir)) {
+            seenProjects.add(dir);
+            found.push(dir);
+          }
+          continue;
+        }
+
+        if (depth >= 3) continue;
+
+        let entries;
+        try {
+          entries = fs.readdirSync(dir, { withFileTypes: true });
+        } catch {
+          continue;
+        }
+        for (const entry of entries) {
+          if (visitedEntries >= MAX_EXTRA_SCAN_ENTRIES) break;
+          visitedEntries += 1;
+          if (!entry.isDirectory()) continue;
+          if (entry.name.startsWith('.') || EXTRA_SKIP_DIRS.has(entry.name)) continue;
+          const child = path.join(dir, entry.name);
+          const childReal = safeRealpath(child);
+          if (!childReal || childReal === '/Volumes' || childReal.startsWith('/Volumes/')) continue;
+          queue.push({ dir: childReal, depth: depth + 1 });
+        }
+      }
+    }
+
+    return found;
+  }
+
+  discoverExtraWorkspaces({ excludePaths = [], forceScan = false } = {}) {
+    const now = Date.now();
+    let basePaths;
+    if (!forceScan && this._extraCache && (now - this._extraCache.ts) < EXTRA_SCAN_CACHE_TTL_MS) {
+      basePaths = this._extraCache.items;
+    } else {
+      basePaths = this._scanExtraWorkspaces();
+      this._extraCache = { ts: now, items: basePaths };
+    }
+
+    const excludeSet = new Set();
+    for (const p of Array.isArray(excludePaths) ? excludePaths : []) {
+      const real = safeRealpath(p);
+      if (real) excludeSet.add(real);
+    }
+
+    const activeReal = safeRealpath(this.currentCwd()) || this.currentCwd();
+    const out = [];
+    for (const projPath of basePaths) {
+      if (out.length >= MAX_EXTRA_WORKSPACES) break;
+      if (excludeSet.has(projPath) || !isExistingDirectory(projPath)) continue;
+      out.push({
+        path: projPath,
+        name: path.basename(projPath) || projPath,
+        active: projPath === activeReal,
+        kind: 'extra',
+      });
+    }
+    return out;
+  }
+
   discoverSessions({ engine, cwd } = {}) {
-    const reqEng = String(engine || '').trim().toLowerCase();
-    const eng = VALID_ENGINES.has(reqEng) ? reqEng : this.resolveEngine('auto');
+    const eng = this._resolveTargetEngine(engine);
     const filterCwd = cwd || this.currentCwd();
     const normFilterCwd = safeRealpath(filterCwd) || filterCwd;
 
@@ -461,6 +874,9 @@ class LocalChatBridge {
       });
     }
 
+    const isSelectedSession = id =>
+      id === this.selectedSessionId || (Boolean(selectedCliId) && id === selectedCliId);
+
     if (eng === 'codex') {
       const files = collectRecentJsonlFiles(this._codexSessionsDir, 4, MAX_DISCOVER_FILES);
       for (const { filePath, mtimeMs } of files) {
@@ -476,7 +892,7 @@ class LocalChatBridge {
           title: meta.title,
           updatedAt: meta.updatedAt,
           matchesCwd: Boolean(normFilterCwd && normCwd === normFilterCwd),
-          active: meta.sessionId === this.selectedSessionId || (Boolean(selectedCliId) && meta.cliSessionId === selectedCliId),
+          active: isSelectedSession(meta.cliSessionId),
         });
       }
     } else if (eng === 'claude') {
@@ -494,7 +910,105 @@ class LocalChatBridge {
           title: meta.title,
           updatedAt: meta.updatedAt,
           matchesCwd: Boolean(normFilterCwd && normCwd === normFilterCwd),
-          active: meta.sessionId === this.selectedSessionId || (Boolean(selectedCliId) && meta.cliSessionId === selectedCliId),
+          active: isSelectedSession(meta.cliSessionId),
+        });
+      }
+    } else if (eng === 'opencode') {
+      const rows = querySqliteJson(
+        this._opencodeDbPath,
+        'SELECT id, directory, title, time_updated FROM session_v2 ORDER BY time_updated DESC LIMIT 20;',
+      );
+      for (const row of rows) {
+        const id = row?.id ? String(row.id) : '';
+        if (!id || seenCliIds.has(id)) continue;
+        seenCliIds.add(id);
+        const rowCwd = String(row.directory || '').trim();
+        const normCwd = safeRealpath(rowCwd) || rowCwd;
+        const base = rowCwd ? path.basename(rowCwd) : 'OpenCode';
+        items.push({
+          sessionId: id,
+          cliSessionId: id,
+          provider: 'opencode',
+          cwd: rowCwd || this.currentCwd(),
+          title: String(row.title || '').trim() || `${base || 'OpenCode'} · ${id.slice(0, 8)}`,
+          updatedAt: Number(row.time_updated || 0),
+          matchesCwd: Boolean(normFilterCwd && normCwd === normFilterCwd),
+          active: isSelectedSession(id),
+        });
+      }
+    } else if (eng === 'zcode') {
+      const rows = querySqliteJson(
+        path.join(this._zcodeDir, 'tasks-index.sqlite'),
+        'SELECT task_id, workspace_path, title, updated_at FROM tasks WHERE deleted = 0 ORDER BY updated_at DESC LIMIT 20;',
+      );
+      for (const row of rows) {
+        const id = row?.task_id ? String(row.task_id) : '';
+        if (!id || seenCliIds.has(id)) continue;
+        seenCliIds.add(id);
+        const rowCwd = String(row.workspace_path || '').trim();
+        const normCwd = safeRealpath(rowCwd) || rowCwd;
+        const base = rowCwd ? path.basename(rowCwd) : 'ZCode';
+        items.push({
+          sessionId: id,
+          cliSessionId: id,
+          provider: 'zcode',
+          cwd: rowCwd || this.currentCwd(),
+          title: String(row.title || '').trim() || `${base || 'ZCode'} · ${id.slice(0, 8)}`,
+          updatedAt: Number(row.updated_at || 0),
+          matchesCwd: Boolean(normFilterCwd && normCwd === normFilterCwd),
+          active: isSelectedSession(id),
+        });
+      }
+    } else if (eng === 'workbuddy' || eng === 'workbuddy-ai') {
+      const dbPath = eng === 'workbuddy-ai' ? this._workbuddyAiDbPath : this._workbuddyDbPath;
+      const rows = querySqliteJson(
+        dbPath,
+        'SELECT id, cwd, title, updated_at FROM sessions WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT 20;',
+      );
+      for (const row of rows) {
+        const id = row?.id ? String(row.id) : '';
+        if (!id || seenCliIds.has(id)) continue;
+        seenCliIds.add(id);
+        const rowCwd = String(row.cwd || '').trim();
+        const normCwd = safeRealpath(rowCwd) || rowCwd;
+        const label = getProviderLabel(eng);
+        const base = rowCwd ? path.basename(rowCwd) : label;
+        items.push({
+          sessionId: id,
+          cliSessionId: id,
+          provider: eng,
+          cwd: rowCwd || this.currentCwd(),
+          title: String(row.title || '').trim() || `${base || label} · ${id.slice(0, 8)}`,
+          updatedAt: Number(row.updated_at || 0),
+          matchesCwd: Boolean(normFilterCwd && normCwd === normFilterCwd),
+          active: isSelectedSession(id),
+        });
+      }
+    } else if (eng === 'antigravity') {
+      const rows = querySqliteJson(
+        this._antigravityDbPath,
+        'SELECT conversation_id, title, workspace_uris, last_modified_time FROM conversation_summaries ORDER BY last_modified_time DESC LIMIT 20;',
+      );
+      for (const row of rows) {
+        const id = row?.conversation_id ? String(row.conversation_id) : '';
+        if (!id || seenCliIds.has(id)) continue;
+        seenCliIds.add(id);
+        const uris = parseWorkspaceUris(row.workspace_uris);
+        const matched = normFilterCwd && uris.includes(normFilterCwd);
+        const rowCwd = matched ? normFilterCwd : (uris[0] || '');
+        const parsedTime = typeof row.last_modified_time === 'number'
+          ? row.last_modified_time
+          : (Date.parse(String(row.last_modified_time || '')) || 0);
+        const base = rowCwd ? path.basename(rowCwd) : 'Antigravity';
+        items.push({
+          sessionId: id,
+          cliSessionId: id,
+          provider: 'antigravity',
+          cwd: rowCwd || this.currentCwd(),
+          title: String(row.title || '').trim() || `${base || 'Antigravity'} · ${id.slice(0, 8)}`,
+          updatedAt: parsedTime,
+          matchesCwd: Boolean(matched),
+          active: isSelectedSession(id),
         });
       }
     }
@@ -837,34 +1351,47 @@ class LocalChatBridge {
     }
 
     if (action === 'workspaces') {
-      return {
+      const reqEng = String(body.targetAgent || body.engine || '').trim().toLowerCase();
+      const targetAgent = (reqEng && reqEng !== 'auto') ? reqEng : this.resolveEngine(currentSource);
+      const agentWorkspaces = this.discoverWorkspaces({ engine: targetAgent });
+      const res = {
         currentCwd: this.currentCwd(),
-        workspaces: this.discoverWorkspaces(),
+        targetAgent,
+        workspaces: agentWorkspaces,
       };
+      if (body.includeExtra) {
+        res.extraWorkspaces = this.discoverExtraWorkspaces({
+          excludePaths: agentWorkspaces.map(w => w.path),
+          forceScan: Boolean(body.forceScan),
+        });
+      }
+      return res;
     }
 
     if (action === 'selectWorkspace') {
       const resolvedCwd = this._validateOrResolveCwd(body.cwd, {
-        allowUserSelection: Boolean(body.userSelected || body.browse),
+        allowUserSelection: true,
       });
       this.selectedCwd = resolvedCwd;
       this.selectedSessionId = null;
       const reqEng = String(body.targetAgent || body.engine || '').trim().toLowerCase();
-      const eng = VALID_ENGINES.has(reqEng) ? reqEng : this.resolveEngine(currentSource);
+      const eng = (reqEng && reqEng !== 'auto') ? reqEng : this.resolveEngine(currentSource);
       this.onUpdate?.({ type: 'workspace', currentCwd: this.selectedCwd });
       return {
         currentCwd: this.selectedCwd,
-        workspaces: this.discoverWorkspaces(),
+        targetAgent: eng,
+        workspaces: this.discoverWorkspaces({ engine: eng }),
         sessions: this.discoverSessions({ engine: eng, cwd: this.selectedCwd }),
       };
     }
 
     if (action === 'sessions') {
       const reqEng = String(body.targetAgent || body.engine || '').trim().toLowerCase();
-      const eng = VALID_ENGINES.has(reqEng) ? reqEng : this.resolveEngine(currentSource);
+      const eng = (reqEng && reqEng !== 'auto') ? reqEng : this.resolveEngine(currentSource);
       const targetCwd = body.cwd || this.currentCwd();
       return {
         currentCwd: this.currentCwd(),
+        targetAgent: eng,
         currentSessionId: this.selectedSessionId,
         sessions: this.discoverSessions({ engine: eng, cwd: targetCwd }),
       };
@@ -897,12 +1424,12 @@ class LocalChatBridge {
       }
 
       const reqEng = String(body.provider || body.targetAgent || body.engine || '').trim().toLowerCase();
-      const eng = VALID_ENGINES.has(reqEng) ? reqEng : this.resolveEngine(currentSource);
+      const eng = (reqEng && reqEng !== 'auto') ? reqEng : this.resolveEngine(currentSource);
       const session = this._createSession(eng);
       session.cliSessionId = String(body.cliSessionId || body.sessionId);
       if (typeof body.cwd === 'string' && body.cwd.trim()) {
         try {
-          const validCwd = this._validateOrResolveCwd(body.cwd);
+          const validCwd = this._validateOrResolveCwd(body.cwd, { allowUserSelection: true });
           session.cwd = validCwd;
           this.selectedCwd = validCwd;
         } catch {
@@ -1146,4 +1673,6 @@ module.exports = {
   LocalChatBridge,
   listWorkspaceFiles,
   parseDataUrlImage,
+  querySqliteJson,
+  parseFileUri,
 };

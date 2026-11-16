@@ -18,6 +18,7 @@ import { spawnSync } from 'node:child_process';
 import net from 'node:net';
 import os, { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
@@ -54,6 +55,7 @@ const {
   downloadTempImage: downloadWeComTempImage,
 } = require('../bot/channels/wecom.cjs');
 const { LocalChatBridge } = require('../bot/local-chat.cjs');
+const { MobileBridgeServer } = require('../bot/mobile-bridge.cjs');
 const {
   BotService,
   DEFAULT_BOT_CONFIG,
@@ -2081,4 +2083,341 @@ test('AutoStartManager LaunchAgent plist 生成、XML 转义、enable/disable/se
   assert.equal(mgr.isEnabled(), false);
   assert.equal(existsSync(mgr.plistPath()), false);
   assert.equal(mgr.disable(), false);
+});
+
+function execSqlite(dbPath, sql) {
+  const res = spawnSync('/usr/bin/sqlite3', [dbPath, sql], { encoding: 'utf8' });
+  assert.equal(res.status, 0, res.stderr || res.stdout);
+}
+
+function sqlStr(val) {
+  return `'${String(val).replace(/'/g, "''")}'`;
+}
+
+test('LocalChatBridge Per-Agent 工作区与会话发现 (cursor/opencode/antigravity/zcode/workbuddy) 及额外项目缓存扫描', async t => {
+  const rawDir = await mkdtemp(join(tmpdir(), 'agent-pet-discover-'));
+  const dir = await realpath(rawDir);
+  t.after(() => rm(rawDir, { recursive: true, force: true }));
+
+  const defaultDir = join(dir, 'default-cwd');
+  const appSupportDir = join(dir, 'AppSupport');
+  const cursorStorageDir = join(appSupportDir, 'Cursor', 'User', 'globalStorage');
+  const zcodeDir = join(dir, 'zcode-v2');
+  const opencodeDbPath = join(dir, 'opencode.db');
+  const antigravityDbPath = join(dir, 'conversation_summaries.db');
+  const workbuddyDbPath = join(dir, 'workbuddy.db');
+  const extraRoot = join(dir, 'scan-root');
+
+  // Cursor directories (openedWindows vs lastActiveWindow vs state.vscdb)
+  const cursorOpen1 = join(dir, 'cursor open space');
+  const cursorOpenWsDir = join(dir, 'cursor-ws-open');
+  const cursorBackup = join(dir, 'cursor-backup');
+  const cursorLastActive = join(dir, 'cursor-last-active');
+  const cursorRecent = join(dir, 'cursor-recent');
+  const cursorRecentWsDir = join(dir, 'cursor-recent-ws');
+
+  // OpenCode directories
+  const ocProjNew = join(dir, 'oc-proj-new');
+  const ocProjOld = join(dir, 'oc-proj-old');
+
+  // Antigravity directories
+  const agyProj1 = join(dir, 'agy-proj-1');
+  const agyProj2 = join(dir, 'agy-proj-2');
+
+  // ZCode directories
+  const zcodeProj1 = join(dir, 'zcode-proj-1');
+  const zcodeProj2 = join(dir, 'zcode-proj-2');
+  const zcodeProj3 = join(dir, 'zcode-proj-3');
+
+  // WorkBuddy directories
+  const wbProj1 = join(dir, 'wb-proj-1');
+  const wbProj2 = join(dir, 'wb-proj-2');
+
+  // Extra scan directories
+  const extraProjGit = join(extraRoot, 'proj-git');
+  const extraProjPkg = join(extraRoot, 'proj-pkg');
+  const extraProjPy = join(extraRoot, 'group', 'proj-py');
+  const extraIgnoredNodeModules = join(extraRoot, 'node_modules', 'ignored-pkg');
+  const extraPlainDir = join(extraRoot, 'plain-dir');
+
+  for (const d of [
+    defaultDir, cursorStorageDir, zcodeDir,
+    cursorOpen1, cursorOpenWsDir, cursorBackup, cursorLastActive, cursorRecent, cursorRecentWsDir,
+    ocProjNew, ocProjOld,
+    agyProj1, agyProj2,
+    zcodeProj1, zcodeProj2, zcodeProj3,
+    wbProj1, wbProj2,
+    join(extraProjGit, '.git'), extraProjPkg, extraProjPy, extraIgnoredNodeModules, extraPlainDir,
+  ]) {
+    await mkdir(d, { recursive: true });
+  }
+  await writeFile(join(cursorOpenWsDir, 'team.code-workspace'), '{}', 'utf8');
+  await writeFile(join(cursorRecentWsDir, 'old.code-workspace'), '{}', 'utf8');
+  await writeFile(join(extraProjPkg, 'package.json'), '{"name":"extra-pkg"}\n', 'utf8');
+  await writeFile(join(extraProjPy, 'pyproject.toml'), '[project]\nname="extra-py"\n', 'utf8');
+  await writeFile(join(extraIgnoredNodeModules, 'package.json'), '{"name":"ignored"}\n', 'utf8');
+
+  // 1. Cursor fixtures: storage.json + state.vscdb
+  await writeFile(join(cursorStorageDir, 'storage.json'), JSON.stringify({
+    windowsState: {
+      openedWindows: [
+        { folder: pathToFileURL(cursorOpen1).href },
+        { workspaceIdentifier: { configURIPath: pathToFileURL(join(cursorOpenWsDir, 'team.code-workspace')).href } },
+      ],
+      lastActiveWindow: { folder: pathToFileURL(cursorLastActive).href },
+    },
+    backupWorkspaces: {
+      folders: [{ folderUri: pathToFileURL(cursorBackup).href }],
+    },
+  }), 'utf8');
+
+  const recentJson = JSON.stringify({
+    entries: [
+      { folderUri: pathToFileURL(cursorRecent).href },
+      { workspace: { configPath: pathToFileURL(join(cursorRecentWsDir, 'old.code-workspace')).href } },
+      { folderUri: pathToFileURL(cursorOpen1).href }, // duplicate of opened window; must stay isOpen: true
+    ],
+  });
+  execSqlite(
+    join(cursorStorageDir, 'state.vscdb'),
+    `CREATE TABLE ItemTable (key TEXT UNIQUE, value BLOB);
+     INSERT INTO ItemTable (key, value) VALUES ('history.recentlyOpenedPathsList', ${sqlStr(recentJson)});`,
+  );
+
+  // 2. OpenCode fixture: opencode.db (project + session_v2)
+  execSqlite(
+    opencodeDbPath,
+    `CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT, time_created INTEGER, time_updated INTEGER, time_active INTEGER);
+     INSERT INTO project VALUES ('p-root', '/', 100, 100, 9999);
+     INSERT INTO project VALUES ('p-old', ${sqlStr(ocProjOld)}, 100, 200, 200);
+     INSERT INTO project VALUES ('p-new', ${sqlStr(ocProjNew)}, 100, 500, 600);
+     CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, title TEXT, time_updated INTEGER);
+     INSERT INTO session_v2 VALUES ('oc-s-old-match', ${sqlStr(ocProjOld)}, 'Match Cwd Session', 1000);
+     INSERT INTO session_v2 VALUES ('oc-s-new-other', ${sqlStr(ocProjNew)}, 'Newer Other Session', 5000);`,
+  );
+
+  // 3. Antigravity fixture: conversation_summaries.db
+  execSqlite(
+    antigravityDbPath,
+    `CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, workspace_uris TEXT, last_modified_time INTEGER);
+     INSERT INTO conversation_summaries VALUES ('agy-s2', 'Older Match', ${sqlStr(JSON.stringify([pathToFileURL(agyProj1).href]))}, 1500);
+     INSERT INTO conversation_summaries VALUES ('agy-s1', 'Latest Other', ${sqlStr(JSON.stringify([pathToFileURL(agyProj2).href]))}, 3000);`,
+  );
+
+  // 4. ZCode fixture: setting.json + tasks-index.sqlite
+  await writeFile(join(zcodeDir, 'setting.json'), JSON.stringify({
+    recentProjects: [zcodeProj1, { path: zcodeProj2 }],
+  }), 'utf8');
+  execSqlite(
+    join(zcodeDir, 'tasks-index.sqlite'),
+    `CREATE TABLE tasks (task_id TEXT PRIMARY KEY, workspace_path TEXT, title TEXT, updated_at INTEGER, deleted INTEGER DEFAULT 0);
+     INSERT INTO tasks VALUES ('zc-t1', ${sqlStr(zcodeProj3)}, 'Active ZCode Task', 2000, 0);
+     INSERT INTO tasks VALUES ('zc-t2', ${sqlStr(zcodeProj1)}, 'Newer ZCode Task', 4000, 0);
+     INSERT INTO tasks VALUES ('zc-t-del', ${sqlStr(zcodeProj3)}, 'Deleted ZCode Task', 9999, 1);`,
+  );
+
+  // 5. WorkBuddy fixture: workbuddy.db (workspaces + sessions)
+  execSqlite(
+    workbuddyDbPath,
+    `CREATE TABLE workspaces (id TEXT PRIMARY KEY, path TEXT, last_opened_at INTEGER);
+     INSERT INTO workspaces VALUES ('wb-w1', ${sqlStr(wbProj2)}, 1000);
+     INSERT INTO workspaces VALUES ('wb-w2', ${sqlStr(wbProj1)}, 2000);
+     CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT, title TEXT, updated_at INTEGER, deleted_at INTEGER);
+     INSERT INTO sessions VALUES ('wb-s1', ${sqlStr(wbProj1)}, 'WB Active Match', 1500, NULL);
+     INSERT INTO sessions VALUES ('wb-s2', ${sqlStr(wbProj2)}, 'WB Newer Other', 3500, NULL);
+     INSERT INTO sessions VALUES ('wb-s-del', ${sqlStr(wbProj1)}, 'WB Soft Deleted', 9999, 12345);`,
+  );
+
+  const bridge = new LocalChatBridge({
+    dispatcher: {
+      defaultCwd: defaultDir,
+      allowedWorkspaces: [dir],
+      validateWorkspace: target => sanitizeWorkspace(target, [dir]),
+      probeEngines: () => ({ claude: { available: true } }),
+    },
+    getConfig: () => ({ defaultEngine: 'claude', defaultCwd: defaultDir }),
+    appSupportDir,
+    opencodeDbPath,
+    zcodeDir,
+    workbuddyDbPath,
+    antigravityDbPath,
+    extraScanRoots: [extraRoot],
+  });
+
+  // Verify Cursor workspace discovery & isOpen priority ordering (all isOpen: true before isOpen: false)
+  const cursorWs = bridge.discoverWorkspaces({ engine: 'cursor' });
+  assert.deepEqual(
+    cursorWs.map(w => [w.path, w.isOpen]),
+    [
+      [cursorOpen1, true],
+      [cursorOpenWsDir, true],
+      [cursorBackup, true],
+      [cursorLastActive, false],
+      [cursorRecent, false],
+      [cursorRecentWsDir, false],
+    ],
+  );
+  assert.ok(cursorWs.findIndex(w => w.path === cursorOpen1) < cursorWs.findIndex(w => w.path === cursorLastActive));
+  assert.ok(cursorWs.findIndex(w => w.path === cursorBackup) < cursorWs.findIndex(w => w.path === cursorLastActive));
+  assert.ok(cursorWs.findIndex(w => w.path === cursorOpenWsDir) < cursorWs.findIndex(w => w.path === cursorRecent));
+  assert.ok(cursorWs.every(w => w.sourceEngine === 'cursor'));
+
+  // Verify OpenCode workspace + session discovery
+  const ocWs = bridge.discoverWorkspaces({ engine: 'opencode' });
+  assert.deepEqual(ocWs.map(w => w.path), [ocProjNew, ocProjOld]);
+  const ocSessions = bridge.discoverSessions({ engine: 'opencode', cwd: ocProjOld });
+  assert.equal(ocSessions.length, 2);
+  assert.equal(ocSessions[0].sessionId, 'oc-s-old-match');
+  assert.equal(ocSessions[0].matchesCwd, true);
+  assert.equal(ocSessions[1].sessionId, 'oc-s-new-other');
+  assert.equal(ocSessions[1].matchesCwd, false);
+
+  // Verify Antigravity workspace + session discovery
+  const agyWs = bridge.discoverWorkspaces({ engine: 'antigravity' });
+  assert.deepEqual(agyWs.map(w => w.path), [agyProj2, agyProj1]);
+  const agySessions = bridge.discoverSessions({ engine: 'antigravity', cwd: agyProj1 });
+  assert.equal(agySessions.length, 2);
+  assert.equal(agySessions[0].sessionId, 'agy-s2');
+  assert.equal(agySessions[0].matchesCwd, true);
+  assert.equal(agySessions[1].sessionId, 'agy-s1');
+
+  // Verify ZCode workspace + session discovery (deleted = 1 excluded)
+  const zcodeWs = bridge.discoverWorkspaces({ engine: 'zcode' });
+  assert.deepEqual(zcodeWs.map(w => w.path), [zcodeProj1, zcodeProj2, zcodeProj3]);
+  const zcodeSessions = bridge.discoverSessions({ engine: 'zcode', cwd: zcodeProj3 });
+  assert.deepEqual(zcodeSessions.map(s => s.sessionId), ['zc-t1', 'zc-t2']);
+  assert.equal(zcodeSessions[0].matchesCwd, true);
+
+  // Verify WorkBuddy workspace + session discovery (deleted_at IS NOT NULL excluded)
+  const wbWs = bridge.discoverWorkspaces({ engine: 'workbuddy' });
+  assert.deepEqual(wbWs.map(w => w.path), [wbProj1, wbProj2]);
+  const wbSessions = bridge.discoverSessions({ engine: 'workbuddy', cwd: wbProj1 });
+  assert.deepEqual(wbSessions.map(s => s.sessionId), ['wb-s1', 'wb-s2']);
+  assert.equal(wbSessions[0].matchesCwd, true);
+
+  // Verify discoverExtraWorkspaces: marker recognition, excludePaths, forceScan, and 30s cache TTL
+  const extra1 = bridge.discoverExtraWorkspaces({ excludePaths: [extraProjGit] });
+  assert.deepEqual(extra1.map(w => w.path).sort(), [extraProjPkg, extraProjPy].sort());
+  assert.ok(extra1.every(w => w.kind === 'extra'));
+
+  const extraProjLate = join(extraRoot, 'proj-late');
+  await mkdir(extraProjLate, { recursive: true });
+  await writeFile(join(extraProjLate, 'Cargo.toml'), '[package]\nname="late"\n', 'utf8');
+
+  // Within 30s TTL without forceScan: returns cached result (no extraProjLate)
+  const extraCached = bridge.discoverExtraWorkspaces({ excludePaths: [extraProjGit] });
+  assert.equal(extraCached.some(w => w.path === extraProjLate), false);
+
+  // forceScan bypasses 30s cache
+  const extraForced = bridge.discoverExtraWorkspaces({ excludePaths: [extraProjGit], forceScan: true });
+  assert.equal(extraForced.some(w => w.path === extraProjLate), true);
+
+  // After 30s TTL expires, next call rescans automatically
+  const extraProjTtl = join(extraRoot, 'proj-ttl');
+  await mkdir(join(extraProjTtl, '.git'), { recursive: true });
+  bridge._extraCache.ts -= 31_000;
+  const extraAfterTtl = bridge.discoverExtraWorkspaces({ excludePaths: [extraProjGit] });
+  assert.equal(extraAfterTtl.some(w => w.path === extraProjTtl), true);
+});
+
+test('MobileBridgeServer GET /api/mobile/state?extra=1 按 targetAgent 返回工作区与 extraWorkspaces', async t => {
+  const rawDir = await mkdtemp(join(tmpdir(), 'agent-pet-mobile-state-'));
+  const dir = await realpath(rawDir);
+  t.after(() => rm(rawDir, { recursive: true, force: true }));
+
+  const defaultDir = join(dir, 'default-cwd');
+  const appSupportDir = join(dir, 'AppSupport');
+  const cursorGlobal = join(appSupportDir, 'Cursor', 'User', 'globalStorage');
+  const cursorOpen = join(dir, 'cursor-active-repo');
+  const opencodeDbPath = join(dir, 'opencode.db');
+  const ocProj = join(dir, 'oc-mobile-proj');
+  const extraRoot = join(dir, 'scan-root');
+  const extraRepo = join(extraRoot, 'discovered-repo');
+
+  for (const d of [defaultDir, cursorGlobal, cursorOpen, ocProj, join(extraRepo, '.git')]) {
+    await mkdir(d, { recursive: true });
+  }
+  await writeFile(join(cursorGlobal, 'storage.json'), JSON.stringify({
+    windowsState: { openedWindows: [{ folder: pathToFileURL(cursorOpen).href }] },
+  }), 'utf8');
+  execSqlite(
+    opencodeDbPath,
+    `CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT, time_created INTEGER, time_updated INTEGER, time_active INTEGER);
+     INSERT INTO project VALUES ('oc-1', ${sqlStr(ocProj)}, 100, 200, 300);
+     CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, title TEXT, time_updated INTEGER);
+     INSERT INTO session_v2 VALUES ('oc-ses-1', ${sqlStr(ocProj)}, 'Mobile OC Session', 500);`,
+  );
+
+  const localChat = new LocalChatBridge({
+    dispatcher: {
+      defaultCwd: defaultDir,
+      allowedWorkspaces: [dir],
+      validateWorkspace: target => sanitizeWorkspace(target, [dir]),
+      probeEngines: () => ({ claude: { available: true } }),
+    },
+    getConfig: () => ({ defaultEngine: 'claude', defaultCwd: defaultDir }),
+    appSupportDir,
+    opencodeDbPath,
+    extraScanRoots: [extraRoot],
+  });
+
+  const mockBotService = {
+    config: { defaultEngine: 'claude', defaultCwd: defaultDir, pairingCode: 'MB7890' },
+    localChat,
+    probeEngines: () => ({ claude: { available: true } }),
+    listJobs: () => [],
+  };
+  const srv = new MobileBridgeServer({
+    botService: mockBotService,
+    providers: { snapshot: { items: [], sources: [{ id: 'dsh', connected: false }] } },
+    host: '127.0.0.1',
+    port: 0,
+  });
+  await srv.start();
+  t.after(() => srv.stop());
+
+  const baseUrl = `http://127.0.0.1:${srv.getStatus().port}`;
+  const headers = { Authorization: 'Bearer MB7890' };
+
+  const resCursorExtra = await fetch(`${baseUrl}/api/mobile/state?targetAgent=cursor&extra=1`, { headers });
+  assert.equal(resCursorExtra.status, 200);
+  const bodyCursor = await resCursorExtra.json();
+  assert.equal(bodyCursor.ok, true);
+  assert.deepEqual(bodyCursor.workspaces.map(w => w.path), [cursorOpen]);
+  assert.equal(bodyCursor.workspaces[0].isOpen, true);
+  assert.equal(bodyCursor.workspaces[0].sourceEngine, 'cursor');
+  assert.deepEqual(bodyCursor.extraWorkspaces.map(w => w.path), [extraRepo]);
+  assert.equal(bodyCursor.extraWorkspaces[0].kind, 'extra');
+
+  const resOpencode = await fetch(`${baseUrl}/api/mobile/state?targetAgent=opencode`, { headers });
+  assert.equal(resOpencode.status, 200);
+  const bodyOc = await resOpencode.json();
+  assert.deepEqual(bodyOc.workspaces.map(w => w.path), [ocProj]);
+  assert.equal(bodyOc.workspaces[0].sourceEngine, 'opencode');
+  assert.equal(bodyOc.sessions[0].sessionId, 'oc-ses-1');
+  assert.equal(bodyOc.extraWorkspaces, undefined);
+
+  // Verify BotService forwards providers to LocalChatBridge even with a custom dispatcher lacking .providers
+  const dshWorkDir = join(dir, 'dsh-live-ws');
+  await mkdir(dshWorkDir, { recursive: true });
+  const customProviders = {
+    snapshot: { items: [], sources: [{ id: 'dsh', connected: true }] },
+    list: () => ({ items: [{ provider: 'dsh', cwd: dshWorkDir, status: 'running' }] }),
+  };
+  const svcWithCustomDispatcher = new BotService({
+    rootDir: ROOT_DIR,
+    dataDir: join(dir, 'svc-data'),
+    providers: customProviders,
+    dispatcher: {
+      defaultCwd: defaultDir,
+      allowedWorkspaces: [dir],
+      validateWorkspace: target => sanitizeWorkspace(target, [dir]),
+      probeEngines: () => ({ claude: { available: true } }),
+      listJobs: () => [],
+      stopJob: async () => ({ stopped: false }),
+    },
+  });
+  assert.equal(svcWithCustomDispatcher.localChat.providers, customProviders);
+  const dshWs = svcWithCustomDispatcher.localChat.discoverWorkspaces({ engine: 'dsh' });
+  assert.ok(dshWs.some(w => w.path === dshWorkDir));
 });
