@@ -9,4 +9,4 @@ function sessionRows(store, now = Date.now()) {
   return hook.sessionRows(store, 'workbuddy', now);
 }
 
-module.exports = { applyEvent, sessionRows, ACTIVE_TTL: hook.ACTIVE_TTL, HISTORY_TTL: hook.HISTORY_TTL };
+module.exports = { applyEvent, sessionRows, ACTIVE_TTL: hook.ACTIVE_TTL, BLOCKED_TTL: hook.BLOCKED_TTL, HISTORY_TTL: hook.HISTORY_TTL };

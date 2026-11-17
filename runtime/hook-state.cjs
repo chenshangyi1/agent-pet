@@ -3,6 +3,7 @@
 // Only normalized metadata enters this reducer; prompts/tool arguments never do.
 const { hookProvidersMap } = require('../connectors/catalog.cjs');
 const ACTIVE_TTL = 30 * 60_000;
+const BLOCKED_TTL = ACTIVE_TTL;
 const HISTORY_TTL = 24 * 60 * 60_000;
 const LABELS = {
   running: '正在工作',
@@ -12,6 +13,7 @@ const LABELS = {
   cancelled: '已取消',
   idle: '空闲',
   unknown: '状态待更新',
+  history: '历史记录',
 };
 const PROVIDERS = hookProvidersMap();
 const QUESTION_TOOL = /ask_?question|ask_user|request_user_input/i;
@@ -131,8 +133,10 @@ function sessionRows(store, providerId = 'workbuddy', now = Date.now()) {
   const provider = PROVIDERS[providerId];
   if (!provider) throw new Error(`Unknown hook provider: ${providerId}`);
   return Object.values(store).filter(row => now - row.updatedAt < HISTORY_TTL).map(row => {
-    const stale = ['running', 'waiting'].includes(row.status) && now - row.updatedAt > ACTIVE_TTL;
-    const status = stale ? 'unknown' : row.status;
+    const staleActive = ['running', 'waiting'].includes(row.status) && now - row.updatedAt > ACTIVE_TTL;
+    const staleBlocked = row.status === 'blocked' && now - row.updatedAt > BLOCKED_TTL;
+    const stale = staleActive || staleBlocked;
+    const status = stale ? (staleBlocked ? 'history' : 'unknown') : row.status;
     const shortId = row.sessionId.slice(-6);
     const title = row.sessionTitle
       ? (row.workspace ? `${row.workspace} · ${row.sessionTitle}` : row.sessionTitle)
@@ -144,7 +148,11 @@ function sessionRows(store, providerId = 'workbuddy', now = Date.now()) {
       title,
       status,
       statusText: LABELS[status] ?? '空闲',
-      detail: stale ? `一段时间未收到新事件，请在 ${provider.label} 查看` : row.detail || '等待任务',
+      detail: staleActive
+        ? `一段时间未收到新事件，请在 ${provider.label} 查看`
+        : staleBlocked
+          ? `较早之前的失败记录（已超过 30 分钟），请在 ${provider.label} 查看`
+          : row.detail || '等待任务',
       running: status === 'running',
       unread: ['ready', 'blocked', 'waiting'].includes(status),
       lastSeq: row.lastSeq,
@@ -154,4 +162,4 @@ function sessionRows(store, providerId = 'workbuddy', now = Date.now()) {
   });
 }
 
-module.exports = { applyEvent, sessionRows, ACTIVE_TTL, HISTORY_TTL, PROVIDERS };
+module.exports = { applyEvent, sessionRows, ACTIVE_TTL, BLOCKED_TTL, HISTORY_TTL, PROVIDERS };

@@ -176,10 +176,10 @@ const dismissExpired = rows => {
   const now = Date.now();
   const live = [];
   for (const item of rows) {
-    if (item.status === 'ready') {
-      const key = readyKey(item);
-      if (dismissed.has(key)) { readyShownAt.delete(item.sessionId); continue; }
-      if (expiresAt(item) <= now) { dismissed.add(key); readyShownAt.delete(item.sessionId); persistSets(); continue; }
+    const key = readyKey(item);
+    if (dismissed.has(key)) { readyShownAt.delete(item.sessionId); continue; }
+    if (item.status === 'ready' && expiresAt(item) <= now) {
+      dismissed.add(key); readyShownAt.delete(item.sessionId); persistSets(); continue;
     }
     live.push(item);
   }
@@ -227,7 +227,7 @@ function run(fn) { Promise.resolve().then(fn).catch(report); }
 /* quiet collapsed state persists indefinitely.                                 */
 /* -------------------------------------------------------------------------- */
 function syncView() {
-  const open = ['show', 'compose-open', 'activities-open', 'transcript-open', 'context-open']
+  const open = ['compose-open', 'activities-open', 'transcript-open', 'context-open']
     .some(name => pet.classList.contains(name));
   if (pet.classList.contains('expanded') !== open) pet.classList.toggle('expanded', open);
   // A focus ring on a capsule button must not reveal anything behind the dock.
@@ -247,12 +247,34 @@ function pingBadge() {
   void badge.offsetWidth;
   badge.classList.add('ping');
 }
+function syncActivitiesButton() {
+  const open = pet.classList.contains('activities-open');
+  activitiesButton.setAttribute('aria-pressed', String(open));
+  activitiesButton.setAttribute('aria-label', open ? '收起活动' : '显示活动');
+  activitiesButton.title = open ? '收起活动' : '显示活动';
+}
+function setActivitiesOpen(nextOpen) {
+  const open = Boolean(nextOpen);
+  pet.classList.toggle('activities-open', open);
+  pet.classList.remove('show');
+  if (open) {
+    closeContext();
+    closeTranscript();
+  } else {
+    prefs.stackCollapsed = true;
+    savePrefs();
+  }
+  syncActivitiesButton();
+  syncView();
+  renderActivities();
+}
 function showQuickChat() {
-  pet.classList.add('show', 'compose-open');
-  pet.classList.remove('transcript-open');
-  $('transcript').hidden = true;
+  pet.classList.add('compose-open');
+  pet.classList.remove('show');
+  closeTranscript();
   closeContext();
   composeButton.setAttribute('aria-expanded', 'true');
+  syncView();
   setTimeout(() => quickInput.focus(), 30);
 }
 
@@ -276,8 +298,11 @@ function visibleActivities(rows) {
   return rows.filter(item => ['waiting','blocked','running'].includes(item.status) || item.status === 'ready' && item.unread);
 }
 function dismissItem(item) {
-  dismissed.add(readyKey(item));
+  const key = readyKey(item);
+  dismissed.add(key);
   readyShownAt.delete(item.sessionId);
+  items = items.filter(entry => readyKey(entry) !== key);
+  current = items[0];
   persistSets(); renderActivities();
 }
 function toggleMute(item) {
@@ -540,7 +565,8 @@ async function openDsh(item = current) {
     return;
   }
   await action(item ? 'focus' : 'home', item ? { sessionId: item.sessionId } : {});
-  pet.classList.remove('show'); character.blur();
+  setActivitiesOpen(false);
+  character.blur();
   await poll();
 }
 /**
@@ -620,8 +646,7 @@ async function sendPrompt(text, { sessionId: existingSessionId, trackReply = fal
     showFeedback(existingSessionId
       ? '已回复该会话'
       : `已发送给 ${currentTargetLabel}`);
-    pet.classList.add('activities-open');
-    activitiesButton.setAttribute('aria-pressed', 'true');
+    setActivitiesOpen(true);
     await poll();
     return { sessionId, baselineSeq };
   } catch (error) { report(error, () => sendPrompt(request, options)); }
@@ -1210,8 +1235,10 @@ function openContext(mode = 'all') {
   const wasOpen = !popover.hidden;
   const nextOpen = wasOpen && mode !== contextMode ? true : !wasOpen;
   contextMode = mode;
+  if (nextOpen && pet.classList.contains('activities-open')) setActivitiesOpen(false);
   popover.hidden = !nextOpen;
   pet.classList.toggle('context-open', nextOpen);
+  syncView();
   $('tool-context').setAttribute('aria-expanded', String(nextOpen && mode === 'plus'));
   $('quick-model')?.setAttribute('aria-expanded', String(nextOpen && mode === 'agent'));
   if (!nextOpen) {
@@ -1266,11 +1293,13 @@ async function loadTranscript() {
 async function openTranscript(sessionId = prefs.activeSessionId) {
   if (!sessionId) return;
   transcriptSessionId = sessionId;
+  setActivitiesOpen(false);
   $('transcript').hidden = false;
-  pet.classList.add('show', 'transcript-open');
-  pet.classList.remove('compose-open');
+  pet.classList.add('transcript-open');
+  pet.classList.remove('show', 'compose-open');
   composeButton.setAttribute('aria-expanded', 'false');
   closeContext();
+  syncView();
   const row = items.find(item => item.sessionId === sessionId);
   $('transcript-title').textContent = row?.title || '快速聊天';
   renderQuote();
@@ -1445,9 +1474,18 @@ composeButton.addEventListener('click', event => {
   const canChat = DIRECT_CHAT_SOURCES.has(source) || chatTargets.some(t => t.id === source);
   if (!canChat) { run(() => action('home')); return; }
   const open = pet.classList.toggle('compose-open');
+  pet.classList.remove('show');
   event.currentTarget.setAttribute('aria-expanded', String(open));
-  if (open) { pet.classList.add('show'); closeContext(); setTimeout(() => quickInput.focus(), 30); }
-  else quickInput.blur();
+  if (open) {
+    closeContext();
+    closeTranscript();
+    syncView();
+    setTimeout(() => quickInput.focus(), 30);
+  } else {
+    closeContext();
+    syncView();
+    quickInput.blur();
+  }
 });
 $('quick-chat').addEventListener('submit', event => {
   event.preventDefault();
@@ -1459,13 +1497,11 @@ voiceButton.addEventListener('click', () => {
   if (voiceButton.dataset.available === 'false') { showFeedback('当前桌面环境未找到语音识别组件'); notice(); return; }
   run(startVoice);
 });
-activitiesButton.addEventListener('click', event => {
-  const open = pet.classList.toggle('activities-open');
-  if (!open) { prefs.stackCollapsed = true; savePrefs(); }
-  event.currentTarget.setAttribute('aria-pressed', String(open));
-  event.currentTarget.setAttribute('aria-label', open ? '收起活动' : '显示活动');
-  event.currentTarget.title = open ? '收起活动' : '显示活动';
-  renderActivities();
+activitiesButton.addEventListener('click', () => {
+  const currentlyShowing = pet.classList.contains('activities-open')
+    && !pet.classList.contains('context-open')
+    && !pet.classList.contains('transcript-open');
+  setActivitiesOpen(!currentlyShowing);
 });
 $('tool-context').addEventListener('click', () => openContext('plus'));
 $('quick-model')?.addEventListener('click', () => openContext('agent'));
@@ -1572,8 +1608,10 @@ document.addEventListener('keydown', event => {
     mediaStream?.getTracks().forEach(track => track.stop()); mediaStream = undefined;
     setVoiceButton(false);
     closeContext(); closeTranscript();
-    prefs.stackCollapsed = true; savePrefs();
-    pet.classList.remove('show', 'compose-open', 'activities-open'); character.blur();
+    pet.classList.remove('show', 'compose-open');
+    composeButton.setAttribute('aria-expanded', 'false');
+    setActivitiesOpen(false);
+    character.blur();
   }
 });
 
@@ -1615,6 +1653,8 @@ if (native) {
       if (recorder?.state === 'recording') recorder.stop();
       mediaStream?.getTracks().forEach(track => track.stop()); window.speechSynthesis?.cancel(); setVoiceButton(false);
       pet.classList.remove('show', 'compose-open', 'transcript-open', 'context-open');
+      composeButton.setAttribute('aria-expanded', 'false');
+      syncActivitiesButton(); syncView();
       $('transcript').hidden = true; $('context-popover').hidden = true;
       run(async () => {
         const info = await action('info').catch(() => null);

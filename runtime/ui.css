@@ -76,6 +76,7 @@ body[data-status=running] #mini-pill{background:#34c759;border-color:rgba(255,25
 #pet[data-panel-order=controls-last] #feedback{order:8}
 /* A transcript or a context picker owns the panel. Showing the notice stack at
    the same time would push everything past the transparent window's bounds. */
+#pet:not(.activities-open) #activity-list,#pet:not(.activities-open) #activity-stack,#pet:not(.activities-open) #first-awake,
 #pet.transcript-open #activity-list,#pet.transcript-open #activity-stack,#pet.transcript-open #first-awake,
 #pet.context-open #activity-list,#pet.context-open #activity-stack,#pet.context-open #first-awake,#pet.context-open #transcript{display:none!important}
 
@@ -88,7 +89,7 @@ body[data-status=running] #mini-pill{background:#34c759;border-color:rgba(255,25
 .tool-button{position:relative;flex:0 0 var(--bar-btn-w);width:var(--bar-btn-w);height:calc(var(--bar-h) - 8px);display:grid;place-items:center;border-radius:calc((var(--bar-h) - 8px)/2);background:transparent;color:#1c1c1e;opacity:var(--quick-chat-controls-opacity,1);transition:background .14s ease,opacity .14s ease,transform .12s ease}
 .tool-button:hover{background:rgba(25,30,40,.06);opacity:1}
 .tool-button:active{background:rgba(25,30,40,.11);transform:scale(.96)}
-.tool-button[aria-pressed=true]{background:rgba(25,30,40,.09);opacity:1}
+.tool-button[aria-pressed=true],#tool-compose[aria-expanded=true]{background:rgba(25,30,40,.09);opacity:1}
 .tool-button:disabled{opacity:.35;cursor:default;background:transparent}
 .tool-button svg{width:var(--bar-icon);height:var(--bar-icon);fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;filter:drop-shadow(0 0 1.5px rgba(255,255,255,.8))}
 /* Codex has exactly ONE hairline divider, between compose and the waveform.
@@ -144,7 +145,7 @@ body[data-status=running] #mini-pill{background:#34c759;border-color:rgba(255,25
 #activity-list{width:min(100%,348px);display:none;flex-direction:column;gap:8px;max-height:360px;overflow-y:auto;overscroll-behavior:contain;padding:2px}
 /* Only an explicit click (bell, character, shortcut, error) expands notices.
    A pointer drifting over the sprite keeps the collapsed capsule untouched. */
-#pet.expanded.activities-open #activity-list,#pet.expanded.show #activity-list{display:flex}
+#pet.expanded.activities-open #activity-list{display:flex}
 /* Compact card, sized to match Codex Pet's capsule width with ONLY the Agent
    icon anchored cleanly on the left. */
 #activity-list.is-stacked{gap:0;overflow:visible;max-height:none;padding-bottom:6px;cursor:pointer}

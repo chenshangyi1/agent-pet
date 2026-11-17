@@ -37,6 +37,33 @@ test('过期忙态明确标为未知，不伪装成已完成', () => {
   const store=Object.create(null), now=Date.now(); applyEvent(store,event('UserPromptSubmit',now));
   const rows=sessionRows(store,now+ACTIVE_TTL+1); assert.equal(rows[0].status,'unknown'); assert.equal(rows[0].unread,false);
 });
+test('超过冷却窗口的历史 StopFailure 不再长期作为未读失败告警挂起', async () => {
+  const store = Object.create(null);
+  const now = Date.now() - 1000;
+  hookState.applyEvent(store, {
+    v: 1,
+    id: randomUUID(),
+    provider: 'claude',
+    sessionId: '8c778582-test',
+    event: 'StopFailure',
+    at: now,
+    workspace: 'sub2api-main',
+  }, 'claude');
+  const fresh = hookState.sessionRows(store, 'claude', now + 60_000);
+  assert.equal(fresh[0].status, 'blocked');
+  assert.equal(fresh[0].unread, true);
+  const aged = hookState.sessionRows(store, 'claude', now + hookState.BLOCKED_TTL + 1);
+  assert.equal(aged[0].status, 'history');
+  assert.equal(aged[0].unread, false);
+
+  const uiCss = await readFile(new URL('../runtime/ui.css', import.meta.url), 'utf8');
+  const uiJs = await readFile(new URL('../runtime/ui.js', import.meta.url), 'utf8');
+  assert.equal(uiCss.includes('#pet.expanded.show #activity-list'), false);
+  assert.ok(uiCss.includes('#pet:not(.activities-open) #activity-list'));
+  assert.match(uiJs, /composeButton\.addEventListener\('click'[\s\S]*?pet\.classList\.remove\('show'\)/);
+  assert.match(uiJs, /activitiesButton\.addEventListener\('click'[\s\S]*?setActivitiesOpen\(!currentlyShowing\)/);
+  assert.match(uiJs, /const key = readyKey\(item\);\s*if \(dismissed\.has\(key\)\)/);
+});
 test('并发真实 hook 进程只保存必要元数据，独立运行时仍读取 WorkBuddy', async t => {
   const dir=await mkdtemp(join(tmpdir(),'agent-pet-events-')); t.after(()=>rm(dir,{recursive:true,force:true}));
   const execute = payload => new Promise((resolve,reject)=>{
