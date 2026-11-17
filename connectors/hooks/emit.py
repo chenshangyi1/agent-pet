@@ -193,6 +193,9 @@ def normalize_payload(payload: dict, provider: str, fmt: str, fallback_event: st
         workspace = clean(os.path.basename(cwd), 64)
         if workspace:
             out['workspace'] = workspace
+        clean_path = re.sub(r'[\r\n\t]+', ' ', cwd).strip()[:512]
+        if clean_path:
+            out['workspacePath'] = clean_path
 
     tool_call = payload.get('toolCall')
     if isinstance(tool_call, dict):

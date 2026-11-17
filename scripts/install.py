@@ -375,7 +375,7 @@ def main():
         print('Installed Agent Pet.app (standalone mode — DSH not detected, running independently)')
     print('Electron runtime:', str(electron) if electron else 'not found at install time (launcher will search at runtime; set AGENT_PET_ELECTRON or install Electron)')
     print('Enabled connectors: dsh' + (f", {', '.join(extra)}" if extra else ''))
-    print('Open Manager (+ in NotchPanel or tray -> 管理 AI Agent... / Bot 派活与通知...) or run `npm run bot` for headless gateway.')
+    print('Open Manager (+ in NotchPanel or tray -> 管理 AI Agent...) to manage connected AI Agents.')
     print('Backup:', backup)
 
 

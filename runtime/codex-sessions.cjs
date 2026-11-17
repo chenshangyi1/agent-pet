@@ -98,8 +98,11 @@ class CodexSessionReader {
 
         if (type === 'session_meta') {
           if (typeof payload.id === 'string' && payload.id.trim()) state.sessionId = cleanText(payload.id, 256);
-          const cwd = typeof payload.cwd === 'string' ? payload.cwd.replace(/[/\\]+$/, '') : '';
-          if (cwd) state.workspace = cleanText(path.basename(cwd), 64);
+          const cwd = typeof payload.cwd === 'string' ? payload.cwd.replace(/[\r\n\t]+/g, ' ').trim().replace(/[/\\]+$/, '').slice(0, 512) : '';
+          if (cwd) {
+            state.workspacePath = cwd;
+            state.workspace = cleanText(path.basename(cwd), 64);
+          }
           eventName = 'SessionStart';
         } else if (type === 'event_msg') {
           if (payload.type === 'task_started') eventName = 'UserPromptSubmit';
@@ -128,6 +131,7 @@ class CodexSessionReader {
           event: eventName,
           at,
           ...(state.workspace ? { workspace: state.workspace } : {}),
+          ...(state.workspacePath ? { workspacePath: state.workspacePath } : {}),
           ...(tool ? { tool } : {}),
           ...(toolId ? { toolId } : {}),
           ...(terminationReason ? { terminationReason } : {}),

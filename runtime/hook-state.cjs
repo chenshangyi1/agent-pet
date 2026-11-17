@@ -40,6 +40,9 @@ function applyEvent(store, event, expectedProvider) {
 
   const row = prior ?? { sessionId: event.sessionId, status: 'idle', tools: {}, lastSeq: 0 };
   if (typeof event.workspace === 'string' && event.workspace.trim()) row.workspace = event.workspace.slice(0, 64);
+  if (typeof event.workspacePath === 'string' && event.workspacePath.trim()) {
+    row.workspacePath = event.workspacePath.replace(/[\r\n\t]+/g, ' ').trim().slice(0, 512);
+  }
   if (typeof event.sessionTitle === 'string') {
     const cleanedTitle = event.sessionTitle.replace(/\s+/g, ' ').trim().slice(0, 80);
     if (cleanedTitle) row.sessionTitle = cleanedTitle;
@@ -153,6 +156,7 @@ function sessionRows(store, providerId = 'workbuddy', now = Date.now()) {
         : staleBlocked
           ? `较早之前的失败记录（已超过 30 分钟），请在 ${provider.label} 查看`
           : row.detail || '等待任务',
+      workspacePath: row.workspacePath || '',
       running: status === 'running',
       unread: ['ready', 'blocked', 'waiting'].includes(status),
       lastSeq: row.lastSeq,

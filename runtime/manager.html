@@ -1,327 +1,62 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="utf-8" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'" />
-  <title>小鑫 · AI Agent 与 Bot 管理</title>
-  <link rel="stylesheet" href="./manager.css" />
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:">
+<title>小鑫 · AI Agent 管理</title>
+<link rel="stylesheet" href="manager.css">
 </head>
 <body>
   <div class="shell">
     <header class="topbar">
       <div class="title-group">
-        <h1>小鑫 · 控制中心</h1>
-        <p id="page-subtitle" class="subtitle">自动检测本机 AI Agent，并支持通过 QQ / 企业微信远程派活与推送状态。</p>
+        <h1>小鑫 · AI Agent 管理</h1>
+        <p class="subtitle">自动检测本机 AI Agent 的运行状态、桌面通知提醒与一键回跳原会话。</p>
       </div>
-      <nav class="segmented" role="tablist" aria-label="管理视图切换">
-        <button id="tab-connectors-btn" class="seg-btn active" type="button" role="tab" aria-selected="true" data-tab="connectors">AI Agent 连接器</button>
-        <button id="tab-bot-btn" class="seg-btn" type="button" role="tab" aria-selected="false" data-tab="bot">Bot 派活网关 (QQ / 企微)</button>
-      </nav>
+      <div class="header-actions">
+        <label class="toggle-pill" for="autostart-toggle" title="登录 macOS 时自动启动小鑫">
+          <input id="autostart-toggle" type="checkbox">
+          <span>开机自动启动</span>
+        </label>
+        <button id="enable-all-btn" class="action-btn primary" type="button">一键接入已安装</button>
+        <button id="rescan-btn" class="ghost-btn" type="button">重新扫描</button>
+      </div>
     </header>
+
+    <div class="panel-toolbar">
+      <p class="toolbar-note">对支持原生 Hook 的 CLI 会自动写入监听脚本，其余客户端会自动同步会话状态与项目目录。</p>
+    </div>
 
     <div id="banner" class="banner" hidden></div>
 
-    <section id="panel-connectors" class="tab-panel" role="tabpanel" aria-labelledby="tab-connectors-btn">
-      <div class="panel-toolbar">
-        <p class="toolbar-note">新装默认仅连接 DSH；点击 <kbd>+</kbd> 为本机已安装的 AI Agent 写入只读观察配置（自动备份原配置）。</p>
-        <div class="header-actions">
-          <button id="enable-all-btn" class="action-btn primary" type="button">一键接入已安装</button>
-          <button id="rescan-btn" class="ghost-btn" type="button">重新扫描</button>
-        </div>
-      </div>
-
-      <main class="sections">
-        <section class="group">
-          <div class="group-header">
-            <h2>已启用</h2>
-            <span id="enabled-count" class="count-pill">0</span>
-          </div>
-          <div id="enabled-list" class="card-list"></div>
-        </section>
-
-        <section class="group">
-          <div class="group-header">
-            <h2>本机已检测到（可一键接入）</h2>
-            <span id="detected-count" class="count-pill">0</span>
-          </div>
-          <div id="detected-list" class="card-list"></div>
-          <div id="detected-empty" class="empty-note" hidden>本机暂未发现其他尚未接入的 AI Agent。</div>
-        </section>
-
-        <section class="group">
-          <div class="group-header">
-            <h2>其他支持的工具（未检测到）</h2>
-            <span id="missing-count" class="count-pill">0</span>
-          </div>
-          <div id="missing-list" class="card-list compact"></div>
-        </section>
-      </main>
-
-      <footer class="footnote">
-        仅读取会话与工具生命周期元数据，不读取或保存提示词、工具参数及模型输出。
-      </footer>
-    </section>
-
-    <section id="panel-bot" class="tab-panel" role="tabpanel" aria-labelledby="tab-bot-btn" hidden>
-      <div class="panel-toolbar">
-        <p class="toolbar-note">通过 QQ 或企业微信远程派活给 Claude Code / Codex / DSH，并在任务待确认、异常或完成时自动推送提醒。</p>
-        <div class="header-actions">
-          <button id="bot-refresh-btn" class="ghost-btn" type="button">刷新状态</button>
-          <button id="bot-save-all-btn" class="action-btn primary" type="button">保存全部配置</button>
-        </div>
-      </div>
-
-      <section class="group">
+    <main class="sections">
+      <section>
         <div class="group-header">
-          <h2>执行引擎就绪状态</h2>
+          <h2>已接入</h2>
+          <span id="enabled-count" class="count-pill">0</span>
         </div>
-        <div id="bot-engines-strip" class="engine-strip"></div>
+        <div id="enabled-list" class="card-list"></div>
       </section>
 
-      <section class="bot-card">
-        <div class="bot-card-header">
-          <div>
-            <h3>默认派活配置</h3>
-            <p class="bot-card-desc">控制远程未指定工具时的默认执行引擎、工作目录与权限范围。</p>
-          </div>
-          <button id="bot-save-dispatch-btn" class="action-btn primary" type="button">保存并应用</button>
+      <section>
+        <div class="group-header">
+          <h2>本机已检测到，可一键接入</h2>
+          <span id="detected-count" class="count-pill">0</span>
         </div>
-        <div class="form-grid">
-          <label class="field">
-            <span class="field-label">默认执行引擎</span>
-            <select id="bot-default-engine" class="input">
-              <option value="claude">Claude Code</option>
-              <option value="codex">Codex</option>
-              <option value="antigravity">Antigravity</option>
-              <option value="dsh">DSH</option>
-            </select>
-          </label>
-          <label class="field">
-            <span class="field-label">权限沙盒模式</span>
-            <select id="bot-sandbox-mode" class="input">
-              <option value="workspace-write">workspace-write（工作区可写）</option>
-              <option value="auto">auto（自动接受编辑）</option>
-              <option value="full">full（完全自动，谨慎使用）</option>
-            </select>
-          </label>
-          <div class="field span-2">
-            <span class="field-label">默认工作目录</span>
-            <div class="input-row">
-              <input id="bot-default-cwd" class="input" type="text" placeholder="/Users/..." />
-              <button id="bot-browse-cwd-btn" class="ghost-btn" type="button">选择目录</button>
-            </div>
-          </div>
-          <label class="field span-2">
-            <span class="field-label">允许的工作区根目录（每行一个，支持 ~，留空默认用户主目录）</span>
-            <textarea id="bot-allowed-workspaces" class="input textarea" rows="2" placeholder="~/Projects&#10;~/AI"></textarea>
-          </label>
-          <label class="switch-item span-2">
-            <input id="bot-autostart" type="checkbox" />
-            <span>开机自动启动（登录 macOS 时自动启动小鑫与 Bot 网关）</span>
-          </label>
-        </div>
+        <div id="detected-list" class="card-list"></div>
+        <div id="detected-empty" class="empty-note" hidden>本机检测到的 AI Agent 均已接入。</div>
       </section>
 
-      <section class="bot-card">
-        <div class="bot-card-header">
-          <div>
-            <h3>安全配对与自动状态推送</h3>
-            <p class="bot-card-desc">在 QQ / 企业微信发送 <code>/pair 配对码</code> 完成授权；状态变更时主动推送。</p>
-          </div>
-          <button id="bot-save-security-btn" class="action-btn primary" type="button">保存并应用</button>
+      <section>
+        <div class="group-header">
+          <h2>未检测到或尚未安装</h2>
+          <span id="missing-count" class="count-pill">0</span>
         </div>
-
-        <div class="pair-box">
-          <div class="pair-left">
-            <span class="field-label">当前一次性配对码</span>
-            <div class="pair-code-row">
-              <code id="bot-pairing-code" class="pair-code">------</code>
-              <button id="bot-copy-pair-btn" class="ghost-btn" type="button">复制</button>
-              <button id="bot-regen-pair-btn" class="ghost-btn" type="button">重新生成</button>
-            </div>
-          </div>
-        </div>
-
-        <div class="sub-block">
-          <span class="field-label">已授权用户 / 会话列表</span>
-          <div id="bot-auth-users-list" class="chip-list"></div>
-          <div class="input-row add-auth-row">
-            <select id="bot-auth-channel" class="input compact-select">
-              <option value="qq">QQ</option>
-              <option value="wecom">企业微信</option>
-            </select>
-            <input id="bot-auth-id-input" class="input" type="text" placeholder="输入 senderId / userid" />
-            <button id="bot-auth-add-btn" class="ghost-btn" type="button">+ 添加</button>
-          </div>
-        </div>
-
-        <div class="sub-block">
-          <span class="field-label">自动状态推送开关</span>
-          <div class="switch-grid">
-            <label class="switch-item">
-              <input id="bot-notify-enabled" type="checkbox" />
-              <span>启用状态自动推送</span>
-            </label>
-            <label class="switch-item">
-              <input id="bot-notify-waiting" type="checkbox" />
-              <span>待确认 (waiting)</span>
-            </label>
-            <label class="switch-item">
-              <input id="bot-notify-blocked" type="checkbox" />
-              <span>异常中断 (blocked)</span>
-            </label>
-            <label class="switch-item">
-              <input id="bot-notify-ready" type="checkbox" />
-              <span>本轮结束 (ready)</span>
-            </label>
-          </div>
-        </div>
+        <div id="missing-list" class="card-list"></div>
       </section>
-
-      <section class="bot-card">
-        <div class="bot-card-header">
-          <div class="channel-title-row">
-            <div>
-              <div class="row-top">
-                <h3>QQ (OneBot v11 WebSocket)</h3>
-                <span id="qq-status-pill" class="status-pill"><span class="dot"></span><span class="status-text">未启用</span></span>
-              </div>
-              <p id="qq-status-detail" class="bot-card-desc">兼容 NapCat / Lagrange / go-cqhttp 正向或反向 WebSocket。</p>
-            </div>
-          </div>
-          <label class="toggle-pill">
-            <input id="qq-enabled" type="checkbox" />
-            <span>启用 QQ</span>
-          </label>
-        </div>
-
-        <div class="form-grid">
-          <label class="field">
-            <span class="field-label">连接模式</span>
-            <select id="qq-mode" class="input">
-              <option value="client">正向 WebSocket（主动连接 OneBot）</option>
-              <option value="server">反向 WebSocket（本地监听等待连入）</option>
-            </select>
-          </label>
-          <label class="field">
-            <span class="field-label">Access Token（可选）</span>
-            <input id="qq-access-token" class="input" type="password" autocomplete="off" placeholder="留空表示不鉴权" />
-          </label>
-
-          <label id="qq-client-group" class="field span-2">
-            <span class="field-label">OneBot WS 地址</span>
-            <input id="qq-ws-url" class="input" type="text" placeholder="ws://127.0.0.1:3001" />
-          </label>
-
-          <div id="qq-server-group" class="field span-2" hidden>
-            <div class="form-grid three-col">
-              <label class="field">
-                <span class="field-label">监听地址</span>
-                <input id="qq-listen-host" class="input" type="text" placeholder="127.0.0.1" />
-              </label>
-              <label class="field">
-                <span class="field-label">监听端口</span>
-                <input id="qq-listen-port" class="input" type="number" min="1" max="65535" placeholder="8080" />
-              </label>
-              <label class="field">
-                <span class="field-label">监听路径</span>
-                <input id="qq-listen-path" class="input" type="text" placeholder="/onebot/v11/ws" />
-              </label>
-            </div>
-          </div>
-
-          <label class="field">
-            <span class="field-label">允许 QQ 号白名单（逗号分隔）</span>
-            <input id="qq-allow-users" class="input" type="text" placeholder="123456, 789012" />
-          </label>
-          <label class="field">
-            <span class="field-label">允许群号白名单（逗号分隔）</span>
-            <input id="qq-allow-groups" class="input" type="text" placeholder="654321" />
-          </label>
-          <label class="field span-2">
-            <span class="field-label">默认推送目标（private:QQ号 或 group:群号，逗号分隔）</span>
-            <input id="qq-push-targets" class="input" type="text" placeholder="private:123456, group:654321" />
-          </label>
-          <label class="switch-item span-2">
-            <input id="qq-require-mention" type="checkbox" />
-            <span>群聊仅在 @ 机器人或以 /、@引擎 开头时触发响应</span>
-          </label>
-        </div>
-
-        <div class="bot-card-footer">
-          <button id="qq-test-btn" class="ghost-btn" type="button">测试推送</button>
-          <button id="qq-save-btn" class="action-btn primary" type="button">保存并应用</button>
-        </div>
-      </section>
-
-      <section class="bot-card">
-        <div class="bot-card-header">
-          <div class="channel-title-row">
-            <div>
-              <div class="row-top">
-                <h3>企业微信 (WeCom)</h3>
-                <span id="wecom-status-pill" class="status-pill"><span class="dot"></span><span class="status-text">未启用</span></span>
-              </div>
-              <p id="wecom-status-detail" class="bot-card-desc">默认通过企业微信智能机器人长连接实时收发消息，支持流式输出与群 Webhook 推送。</p>
-            </div>
-          </div>
-          <label class="toggle-pill">
-            <input id="wecom-enabled" type="checkbox" />
-            <span>启用企业微信</span>
-          </label>
-        </div>
-
-        <div class="form-grid">
-          <label class="field span-2">
-            <span class="field-label">长连接 WebSocket 地址</span>
-            <input id="wecom-ws-url" class="input" type="text" placeholder="wss://openws.work.weixin.qq.com" />
-          </label>
-          <label class="field">
-            <span class="field-label">智能机器人 BotID</span>
-            <input id="wecom-bot-id" class="input" type="text" placeholder="输入企微 BotID" />
-          </label>
-          <label class="field">
-            <span class="field-label">Secret</span>
-            <input id="wecom-secret" class="input" type="password" autocomplete="off" placeholder="输入企微 Secret" />
-          </label>
-          <label class="field span-2">
-            <span class="field-label">可选群机器人 Webhook URL（用于额外通知推送）</span>
-            <input id="wecom-webhook-url" class="input" type="text" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..." />
-          </label>
-          <label class="field">
-            <span class="field-label">默认推送目标（userid / chatid，逗号分隔）</span>
-            <input id="wecom-push-targets" class="input" type="text" placeholder="zhangsan, wrxxxxxxxx" />
-          </label>
-          <label class="field">
-            <span class="field-label">允许发送者白名单（userid，逗号分隔）</span>
-            <input id="wecom-allow-users" class="input" type="text" placeholder="zhangsan, lisi" />
-          </label>
-        </div>
-
-        <div class="bot-card-footer">
-          <button id="wecom-test-btn" class="ghost-btn" type="button">测试推送</button>
-          <button id="wecom-save-btn" class="action-btn primary" type="button">保存并应用</button>
-        </div>
-      </section>
-
-      <section class="bot-card">
-        <div class="bot-card-header">
-          <div class="group-header tight">
-            <h3>Bot 派活任务</h3>
-            <span id="bot-jobs-count" class="count-pill">0</span>
-          </div>
-          <button id="bot-jobs-refresh-btn" class="ghost-btn" type="button">刷新</button>
-        </div>
-        <div id="bot-jobs-list" class="card-list"></div>
-        <div id="bot-jobs-empty" class="empty-note">暂无远程派活任务；在 QQ / 企业微信发送 <code>/claude 任务</code> 或 <code>/codex 任务</code> 即可触发，支持 <code>/diff</code>、<code>/log</code>、<code>/commit</code>、<code>/revert</code> 与直接发送截图/图片调试。</div>
-        <p class="toolbar-note">常用远程指令：<code>/claude</code>、<code>/codex</code>、<code>/diff</code>、<code>/log</code>、<code>/commit</code>、<code>/revert</code>，支持直接发送截图/图片给 AI 调试。</p>
-      </section>
-
-      <footer class="footnote">
-        所有配置与配对凭据均以 0600 权限本地保存在 <code>~/.dsh/companion/bot.json</code>；也可执行 <code>npm run bot</code> 无桌面后台运行。
-      </footer>
-    </section>
+    </main>
   </div>
-  <script type="module" src="./manager.js"></script>
+
+  <script src="manager.js"></script>
 </body>
 </html>

@@ -40,7 +40,14 @@ function writeEvent(payload) {
 }
 
 export const AgentPetPlugin = async ({ directory } = {}) => {
-  const workspace = clean(typeof directory === 'string' ? basename(directory) : '', 64);
+  const workspacePath = typeof directory === 'string'
+    ? directory.replace(/[\r\n\t]+/g, ' ').trim().replace(/[/\\]+$/, '').slice(0, 512)
+    : '';
+  const workspace = clean(workspacePath ? basename(workspacePath) : '', 64);
+  const wsFields = {
+    ...(workspace ? { workspace } : {}),
+    ...(workspacePath ? { workspacePath } : {}),
+  };
 
   return {
     event: async ({ event }) => {
@@ -50,17 +57,17 @@ export const AgentPetPlugin = async ({ directory } = {}) => {
       if (!sessionId || BAD_IDS.has(sessionId)) return;
 
       if (event.type === 'session.created') {
-        writeEvent({ sessionId, event: 'SessionStart', ...(workspace ? { workspace } : {}) });
+        writeEvent({ sessionId, event: 'SessionStart', ...wsFields });
       } else if (event.type === 'session.idle') {
-        writeEvent({ sessionId, event: 'Stop', ...(workspace ? { workspace } : {}) });
+        writeEvent({ sessionId, event: 'Stop', ...wsFields });
       } else if (event.type === 'session.error') {
-        writeEvent({ sessionId, event: 'StopFailure', hasError: true, ...(workspace ? { workspace } : {}) });
+        writeEvent({ sessionId, event: 'StopFailure', hasError: true, ...wsFields });
       } else if (event.type === 'session.status') {
         const statusType = clean(props.status?.type || props.status || '', 32).toLowerCase();
         if (statusType === 'busy' || statusType === 'running' || statusType === 'retry') {
-          writeEvent({ sessionId, event: 'UserPromptSubmit', ...(workspace ? { workspace } : {}) });
+          writeEvent({ sessionId, event: 'UserPromptSubmit', ...wsFields });
         } else if (statusType === 'idle') {
-          writeEvent({ sessionId, event: 'Stop', ...(workspace ? { workspace } : {}) });
+          writeEvent({ sessionId, event: 'Stop', ...wsFields });
         }
       }
     },
@@ -70,7 +77,7 @@ export const AgentPetPlugin = async ({ directory } = {}) => {
       const tool = clean(input?.tool || '', 100);
       const toolId = clean(input?.callID || input?.callId || '', 256);
       if (!sessionId || BAD_IDS.has(sessionId)) return;
-      writeEvent({ sessionId, event: 'PreToolUse', ...(tool ? { tool } : {}), ...(toolId ? { toolId } : {}), ...(workspace ? { workspace } : {}) });
+      writeEvent({ sessionId, event: 'PreToolUse', ...(tool ? { tool } : {}), ...(toolId ? { toolId } : {}), ...wsFields });
     },
 
     'tool.execute.after': async (input) => {
@@ -78,13 +85,13 @@ export const AgentPetPlugin = async ({ directory } = {}) => {
       const tool = clean(input?.tool || '', 100);
       const toolId = clean(input?.callID || input?.callId || '', 256);
       if (!sessionId || BAD_IDS.has(sessionId)) return;
-      writeEvent({ sessionId, event: 'PostToolUse', ...(tool ? { tool } : {}), ...(toolId ? { toolId } : {}), ...(workspace ? { workspace } : {}) });
+      writeEvent({ sessionId, event: 'PostToolUse', ...(tool ? { tool } : {}), ...(toolId ? { toolId } : {}), ...wsFields });
     },
 
     'permission.asked': async (perm) => {
       const sessionId = clean(perm?.sessionID || perm?.sessionId || '', 256);
       if (!sessionId || BAD_IDS.has(sessionId)) return;
-      writeEvent({ sessionId, event: 'Notification', notification: 'permission_prompt', ...(workspace ? { workspace } : {}) });
+      writeEvent({ sessionId, event: 'Notification', notification: 'permission_prompt', ...wsFields });
     },
   };
 };

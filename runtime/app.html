@@ -1,23 +1,22 @@
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="zh-CN">
+<head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'">
 <title>小鑫 · Agent Pet</title><link rel="stylesheet" href="./ui.css"></head>
 <body><main id="pet">
-  <button id="character" aria-label="小鑫：拖动移动，点击查看活动，双击打开工具"><video id="animation" muted autoplay loop playsinline aria-label="小鑫"></video><span id="dot" hidden></span></button>
-  <!-- Stable resting state: with the pointer away the whole dock collapses to
-       one short pale pill. Hovering the character or this pill fades the glass
-       capsule back in; a running turn only recolours the pill to green. -->
+  <button id="character" aria-label="小鑫：拖动移动，点击查看活动，双击打开当前会话"><video id="animation" muted autoplay loop playsinline aria-label="小鑫"></video><span id="dot" hidden></span></button>
+  <!-- Compact bar: character on top, then a translucent pill bar [ compose | voice | activities ]. -->
   <div id="mini-pill" aria-hidden="true"></div>
   <section id="panel" aria-label="小鑫控制条">
     <div id="first-awake" class="glass-card" hidden>
       <span class="awake-title">Hi, I'm 小鑫</span>
-      <span class="awake-body">我会跟随你选择的工具，帮你留意任务状态。</span>
+      <span class="awake-body">我会实时汇聚本机各 AI Agent 的任务通知，点击卡片就能一键回到对应会话。</span>
       <button id="awake-dismiss" type="button">知道了</button>
     </div>
     <button id="activity-stack" type="button" hidden aria-expanded="false"></button>
     <div id="activity-list" role="list" aria-label="最近的 Agent 活动"><p id="empty" role="status">正在读取任务状态…</p></div>
-
-    <section id="transcript" aria-label="快速聊天记录" hidden>
+    <!-- DSH live transcript drawer (shown only when DSH host is connected). -->
+    <section id="transcript" aria-label="DSH 对话记录" hidden>
       <header id="transcript-header">
         <span id="transcript-title">快速聊天</span>
         <span class="transcript-spacer"></span>
@@ -28,46 +27,15 @@
       <div id="transcript-quote" hidden><span id="transcript-quote-text"></span><button id="transcript-quote-remove" type="button" aria-label="移除引用">×</button></div>
       <form id="transcript-form" autocomplete="off"><input id="transcript-input" aria-label="继续追问" placeholder="继续追问…"><button id="transcript-send" type="submit" aria-label="发送">↑</button></form>
     </section>
-
+    <!-- Persistent pill bar: DSH quick chat when connected, or one-click jump/manage + notifications. -->
     <div id="toolbar" role="toolbar" aria-label="桌宠操作">
-      <!-- SF-Symbol-like `square.and.pencil`: rounded square open at the top
-           right, with a slender hollow pencil running bottom-left -> top-right. -->
-      <button class="tool-button" id="tool-compose" type="button" aria-label="开始新聊天" title="开始新聊天" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 4.2H8.2a4 4 0 0 0-4 4v7.6a4 4 0 0 0 4 4h7.6a4 4 0 0 0 4-4V12"/><path d="m9.8 14.2 8.2-8.2a1.25 1.25 0 0 1 1.77 1.77l-8.2 8.2-2.6.7.7-2.6Z"/></svg></button>
+      <button class="tool-button" id="tool-compose" type="button" aria-label="打开当前会话或管理" title="打开当前会话或管理" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 4.2H8.2a4 4 0 0 0-4 4v7.6a4 4 0 0 0 4 4h7.6a4 4 0 0 0 4-4V12"/><path d="m9.8 14.2 8.2-8.2a1.25 1.25 0 0 1 1.77 1.77l-8.2 8.2-2.6.7.7-2.6Z"/></svg></button>
       <form id="quick-chat" autocomplete="off">
-        <button id="tool-context" class="tool-mini" type="button" aria-label="添加上下文" aria-expanded="false" title="添加上下文"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button>
-        <button id="quick-model" type="button" title="切换对话的目标 AI Agent" aria-label="切换目标 AI Agent" aria-expanded="false"><img id="quick-model-icon" alt="" aria-hidden="true"><span id="quick-model-label">Claude</span><span class="quick-model-caret" aria-hidden="true">▾</span></button>
-        <input id="quick-input" maxlength="100000" aria-label="新聊天内容" placeholder="询问，或开始一个新任务…">
+        <input id="quick-input" maxlength="100000" aria-label="DSH 快速对话" placeholder="向 DSH 发送指令…">
         <button id="quick-send" type="submit" aria-label="发送">↑</button>
       </form>
-      <!-- Visual parity with Codex's waveform glyph. Voice is deliberately not
-           wired up here; the button stays present even when the host has no STT. -->
       <button class="tool-button" id="tool-voice" type="button" aria-label="语音对话" aria-pressed="false" title="语音对话"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 10v4M10 6.5v11M14 6.5v11M18 10v4"/></svg></button>
-      <!-- Codex Pet has two capsule forms: a bell with an unread count while
-           notices are collapsed, and a chevron while they are expanded. -->
       <button class="tool-button" id="tool-activities" type="button" aria-label="显示活动" aria-pressed="false" title="显示活动"><svg class="icon-bell" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 20a2 2 0 0 0 4 0"/></svg><svg class="icon-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg><span id="activity-badge" hidden>1</span></button>
-    </div>
-
-    <div id="attachment-strip" hidden aria-label="待发送的图片"></div>
-    <div id="context-popover" class="glass-card" hidden>
-      <div class="context-head"><span>添加上下文</span><button id="context-close" type="button" aria-label="关闭">×</button></div>
-      <div class="context-section"><p class="context-label">发送给 AI Agent</p><div id="context-models" class="context-options"></div></div>
-      <div class="context-section">
-        <div class="context-row-head"><p id="context-workspaces-label" class="context-label">项目目录（当前应用）</p><div class="context-row-actions"><button id="context-toggle-extra" class="context-mini-btn" type="button" aria-expanded="false">＋ 本机项目</button><button id="context-browse-cwd" class="context-mini-btn" type="button">📁 选择文件夹…</button></div></div>
-        <div id="context-workspaces" class="context-options"></div>
-      </div>
-      <div id="context-extra-section" class="context-section" hidden>
-        <div class="context-row-head"><p class="context-label">本机更多项目（Mac 全盘发现）</p><button id="context-scan-extra" class="context-mini-btn" type="button">↻ 扫描本机</button></div>
-        <div id="context-extra-workspaces" class="context-options"></div>
-      </div>
-      <div class="context-section">
-        <div class="context-row-head"><p class="context-label">项目会话</p><button id="context-new-session" class="context-mini-btn" type="button">＋ 新建会话</button></div>
-        <div id="context-sessions" class="context-options"></div>
-      </div>
-      <button id="context-image" class="context-row" type="button"><span class="context-glyph">▧</span>选择图片<span class="context-hint">最多 5 张</span></button>
-      <input id="context-file" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden>
-      <div class="context-section"><p class="context-label">技能 <kbd>/</kbd></p><div id="context-skills" class="context-options"></div></div>
-      <div class="context-section"><p class="context-label">文件引用 <kbd>@</kbd></p><input id="context-query" placeholder="输入文件名搜索…" aria-label="搜索文件引用"><div id="context-files" class="context-options"></div></div>
-      <p id="context-note" class="context-note" hidden></p>
     </div>
     <p id="feedback" role="status" aria-live="polite"><span id="feedback-text"></span><button id="feedback-retry" type="button" hidden>重试</button><button id="feedback-close" type="button" aria-label="关闭提示" hidden>×</button></p>
   </section>

@@ -66,13 +66,13 @@ function extractWorkspace(raw) {
     try {
       const url = new URL(trimmed);
       if (url.protocol !== 'file:') continue;
-      const decoded = decodeURIComponent(url.pathname).replace(/[/\\]+$/, '');
+      const decoded = decodeURIComponent(url.pathname).replace(/[\r\n\t]+/g, ' ').trim().replace(/[/\\]+$/, '').slice(0, 512);
       if (!decoded) continue;
       const base = cleanText(path.basename(decoded), 64);
-      if (base) return base;
+      if (base) return { workspace: base, workspacePath: decoded };
     } catch {}
   }
-  return '';
+  return { workspace: '', workspacePath: '' };
 }
 
 async function querySqliteJson(resolved, sql) {
@@ -162,7 +162,9 @@ class AntigravitySessionReader {
       const killed = Number(row.killed) === 1 || row.killed === true;
       const isError = /ERROR|FAIL/.test(rawStatus);
 
-      const workspace = cols.has('workspace_uris') ? extractWorkspace(row.workspace_uris) : '';
+      const { workspace, workspacePath } = cols.has('workspace_uris')
+        ? extractWorkspace(row.workspace_uris)
+        : { workspace: '', workspacePath: '' };
       const sessionTitle = cols.has('title') ? cleanText(row.title, 80) : '';
       const monotonicAt = () => Math.min(now, Math.max(modifiedAt, prior ? Number(prior.updatedAt || 0) + 1 : 0));
 
@@ -176,6 +178,7 @@ class AntigravitySessionReader {
           event: eventName,
           at: eventAt,
           ...(workspace ? { workspace } : {}),
+          ...(workspacePath ? { workspacePath } : {}),
           ...(sessionTitle ? { sessionTitle } : {}),
           ...extra,
         };
@@ -218,6 +221,10 @@ class AntigravitySessionReader {
 
       if (sessionTitle && Object.hasOwn(store, id) && !store[id].sessionTitle) {
         store[id].sessionTitle = sessionTitle;
+        changed = true;
+      }
+      if (workspacePath && Object.hasOwn(store, id) && !store[id].workspacePath) {
+        store[id].workspacePath = workspacePath;
         changed = true;
       }
 
