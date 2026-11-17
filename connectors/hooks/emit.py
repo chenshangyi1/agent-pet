@@ -6,6 +6,8 @@ normalized v1 lifecycle events to $AGENT_PET_DATA/<provider>/inbox/*.json,
 prints '{}' and always exits 0 so host AI agents are never blocked.
 """
 
+from __future__ import annotations
+
 import argparse
 import hashlib
 import json
@@ -15,6 +17,8 @@ import pwd
 import re
 import sys
 import time
+from typing import Optional
+from urllib.parse import unquote, urlparse
 import uuid
 
 STANDARD_EVENTS = {
@@ -96,6 +100,22 @@ def data_root() -> Path:
     return Path(home) / '.dsh/companion'
 
 
+def _uri_to_local_path(value) -> str:
+    if not isinstance(value, str):
+        return ''
+    raw = value.strip()
+    if not raw:
+        return ''
+    parsed = urlparse(raw)
+    if parsed.scheme == 'file':
+        if parsed.netloc not in ('', 'localhost'):
+            return ''
+        return unquote(parsed.path).strip().rstrip('/\\')
+    if not parsed.scheme and os.path.isabs(raw):
+        return raw.rstrip('/\\')
+    return ''
+
+
 def extract_cwd(payload: dict) -> str:
     for key in ('cwd', 'workspace', 'project_root', 'projectRoot'):
         val = payload.get(key)
@@ -105,6 +125,13 @@ def extract_cwd(payload: dict) -> str:
         val = payload.get(key)
         if isinstance(val, list) and val and isinstance(val[0], str) and val[0].strip():
             return val[0].strip().rstrip('/\\')
+    for key in ('workspaceUris', 'workspace_uris'):
+        val = payload.get(key)
+        items = val if isinstance(val, list) else ([val] if isinstance(val, str) else [])
+        for item in items:
+            decoded = _uri_to_local_path(item)
+            if decoded:
+                return decoded
     tool_info = payload.get('tool_info')
     if isinstance(tool_info, dict):
         file_path = tool_info.get('file_path')
@@ -113,7 +140,7 @@ def extract_cwd(payload: dict) -> str:
     return ''
 
 
-def normalize_payload(payload: dict, provider: str, fmt: str, fallback_event: str = '') -> dict | None:
+def normalize_payload(payload: dict, provider: str, fmt: str, fallback_event: str = '') -> Optional[dict]:
     if not re.fullmatch(r'[a-z0-9-]+', provider) or provider in BAD_IDS:
         return None
 

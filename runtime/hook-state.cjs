@@ -38,6 +38,10 @@ function applyEvent(store, event, expectedProvider) {
 
   const row = prior ?? { sessionId: event.sessionId, status: 'idle', tools: {}, lastSeq: 0 };
   if (typeof event.workspace === 'string' && event.workspace.trim()) row.workspace = event.workspace.slice(0, 64);
+  if (typeof event.sessionTitle === 'string') {
+    const cleanedTitle = event.sessionTitle.replace(/\s+/g, ' ').trim().slice(0, 80);
+    if (cleanedTitle) row.sessionTitle = cleanedTitle;
+  }
   const tool = typeof event.tool === 'string' ? event.tool.slice(0, 100) : '';
   const toolId = String(event.toolId || tool || 'tool').slice(0, 256);
   if (['__proto__', 'constructor', 'prototype'].includes(toolId)) return false;
@@ -130,11 +134,14 @@ function sessionRows(store, providerId = 'workbuddy', now = Date.now()) {
     const stale = ['running', 'waiting'].includes(row.status) && now - row.updatedAt > ACTIVE_TTL;
     const status = stale ? 'unknown' : row.status;
     const shortId = row.sessionId.slice(-6);
+    const title = row.sessionTitle
+      ? (row.workspace ? `${row.workspace} · ${row.sessionTitle}` : row.sessionTitle)
+      : (row.workspace ? `${row.workspace} · ${shortId}` : `任务 ${shortId}`);
     return {
       sessionId: `${provider.id}:${row.sessionId}`,
       provider: provider.id,
       providerLabel: provider.label,
-      title: row.workspace ? `${row.workspace} · ${shortId}` : `任务 ${shortId}`,
+      title,
       status,
       statusText: LABELS[status] ?? '空闲',
       detail: stale ? `一段时间未收到新事件，请在 ${provider.label} 查看` : row.detail || '等待任务',

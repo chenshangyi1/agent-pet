@@ -219,15 +219,19 @@ class ConnectorRegistry {
     this.dataDir = options.dataDir || path.join(this.homeDir, '.dsh', 'companion');
     this.appsDirs = options.appsDirs || ['/Applications', path.join(this.homeDir, 'Applications')];
     this.pathDirs = options.pathDirs || (process.env.PATH ? process.env.PATH.split(path.delimiter) : []);
-    this.pythonPath = options.pythonPath || process.env.AGENT_PET_PYTHON || '/usr/bin/python3';
+    this._explicitPythonPath = String(options.pythonPath || process.env.AGENT_PET_PYTHON || '').trim();
+    this.pythonPath = this._explicitPythonPath || this.resolvePython();
     this.stateFile = path.join(this.dataDir, 'connectors.json');
   }
 
   resolvePython() {
-    if (fs.existsSync(this.pythonPath)) return this.pythonPath;
+    if (this._explicitPythonPath) return this._explicitPythonPath;
     for (const dir of ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin']) {
       const candidate = path.join(dir, 'python3');
-      if (fs.existsSync(candidate)) return candidate;
+      try {
+        fs.accessSync(candidate, fs.constants.X_OK);
+        return candidate;
+      } catch {}
     }
     return 'python3';
   }
@@ -452,9 +456,11 @@ class ConnectorRegistry {
       'agent-pet-observer': {
         SessionStart: [{ type: 'command', command: cmd, timeout: 3 }],
         PreInvocation: [{ type: 'command', command: cmd, timeout: 3 }],
+        PreToolUse: [{ matcher: '.*', hooks: [{ type: 'command', command: cmd, timeout: 3 }] }],
         PostToolUse: [{ matcher: '.*', hooks: [{ type: 'command', command: cmd, timeout: 3 }] }],
         PostInvocation: [{ type: 'command', command: cmd, timeout: 3 }],
         Stop: [{ type: 'command', command: cmd, timeout: 3 }],
+        StopFailure: [{ type: 'command', command: cmd, timeout: 3 }],
       },
     });
   }

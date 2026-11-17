@@ -4,6 +4,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { applyEvent, sessionRows, HISTORY_TTL, PROVIDERS } = require('./hook-state.cjs');
 const { CodexSessionReader } = require('./codex-sessions.cjs');
+const { AntigravitySessionReader } = require('./antigravity-sessions.cjs');
 const { CONNECTOR_CATALOG } = require('../connectors/catalog.cjs');
 
 const rank = { waiting: 0, blocked: 1, running: 2, ready: 3, unknown: 4, idle: 5, history: 6, cancelled: 7 };
@@ -34,6 +35,12 @@ class Providers {
           ? path.join(os.homedir(), '.codex', 'sessions')
           : null;
     this.codexReader = codexSessionsDir ? new CodexSessionReader(codexSessionsDir) : null;
+    const antigravityDbPath = options.antigravityDbPath !== undefined
+      ? options.antigravityDbPath
+      : path.resolve(dataDir) === path.resolve(defaultCompanionDir)
+        ? path.join(os.homedir(), '.gemini', 'antigravity', 'conversation_summaries.db')
+        : null;
+    this.antigravityReader = antigravityDbPath ? new AntigravitySessionReader(antigravityDbPath) : null;
     this.flight = null;
     this.snapshot = { items: [], sources: [] };
   }
@@ -92,14 +99,16 @@ class Providers {
     }
     events.sort((a, b) => a.data.at - b.data.at);
     for (const event of events) applyEvent(state.sessions, event.data, providerId);
-    let rolloutChanged = false;
+    let readerChanged = false;
     if (providerId === 'codex' && this.codexReader) {
-      rolloutChanged = await this.codexReader.poll(state.sessions);
+      readerChanged = await this.codexReader.poll(state.sessions);
+    } else if (providerId === 'antigravity' && this.antigravityReader) {
+      readerChanged = await this.antigravityReader.poll(state.sessions);
     }
     for (const [key, row] of Object.entries(state.sessions)) {
       if (Date.now() - row.updatedAt > HISTORY_TTL) delete state.sessions[key];
     }
-    if (names.length || rolloutChanged) {
+    if (names.length || readerChanged) {
       await fs.mkdir(root, { recursive: true, mode: 0o700 });
       await fs.writeFile(path.join(root, 'state.json.tmp'), JSON.stringify({ sessions: state.sessions }), { mode: 0o600 });
       await fs.rename(path.join(root, 'state.json.tmp'), path.join(root, 'state.json'));

@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
 import { mkdtemp, readFile, writeFile, rm, mkdir, readdir, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -704,4 +705,217 @@ test('统一 hooks/emit.py 兼容 Windsurf/Gemini CLI/Copilot/Cline 事件格式
     if (tc.expectedWorkspace) assert.equal(written.workspace, tc.expectedWorkspace);
     if (tc.expectedReason) assert.equal(written.terminationReason, tc.expectedReason);
   }
+});
+
+test('系统 /usr/bin/python3 (3.9) 兼容 emit.py / workspaceUris 解码及 Antigravity hooks.json', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-pet-py39-agy-'));
+  const home = join(root, 'home');
+  const data = join(root, 'data');
+  await mkdir(home, { recursive: true });
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  const reg = new ConnectorRegistry({
+    rootDir: process.cwd(),
+    homeDir: home,
+    dataDir: data,
+    appsDirs: [],
+    pathDirs: [],
+  });
+  assert.ok(reg.resolvePython());
+  reg.enable('antigravity');
+  assert.equal(reg.isHookConfigured('antigravity'), true);
+
+  const hooksJson = JSON.parse(await readFile(join(home, '.gemini/config/plugins/agent-pet/hooks.json'), 'utf8'));
+  const observer = hooksJson['agent-pet-observer'];
+  assert.ok(Array.isArray(observer?.PreToolUse) && observer.PreToolUse[0].matcher === '.*');
+  assert.match(observer.PreToolUse[0].hooks[0].command, /connectors\/hooks\/emit\.py/);
+  assert.ok(Array.isArray(observer?.PostToolUse) && observer.PostToolUse[0].matcher === '.*');
+  assert.ok(Array.isArray(observer?.StopFailure) && observer.StopFailure[0].type === 'command');
+  assert.match(observer.StopFailure[0].command, /--provider antigravity --format antigravity/);
+
+  reg.disable('antigravity');
+  assert.equal(reg.isHookConfigured('antigravity'), false);
+
+  if (!existsSync('/usr/bin/python3')) return;
+
+  const hooksEmit = join(process.cwd(), 'connectors/hooks/emit.py');
+  const agyEmit = join(process.cwd(), 'connectors/antigravity/emit.py');
+
+  const cases = [
+    {
+      script: hooksEmit,
+      args: ['--provider', 'antigravity', '--format', 'antigravity'],
+      payload: {
+        hookEventName: 'PreInvocation',
+        conversationId: 'py39-conv-1',
+        workspaceUris: ['file:///tmp/agy%20proj'],
+        prompt: 'SECRET_PROMPT_NEVER_STORE',
+      },
+      expectedEvent: 'PreInvocation',
+    },
+    {
+      script: agyEmit,
+      args: [],
+      payload: {
+        hookEventName: 'PreToolUse',
+        conversationId: 'py39-conv-2',
+        workspaceUris: ['file:///tmp/agy%20proj'],
+        toolCall: { id: 'tc-1', name: 'Bash', args: { command: 'SECRET_CMD' } },
+      },
+      expectedEvent: 'PreToolUse',
+      expectedTool: 'Bash',
+    },
+  ];
+
+  for (const tc of cases) {
+    const res = spawnSync('/usr/bin/python3', [tc.script, ...tc.args], {
+      input: JSON.stringify(tc.payload),
+      env: { ...process.env, AGENT_PET_DATA: data },
+      encoding: 'utf8',
+    });
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(res.stdout.trim(), '{}');
+  }
+
+  const badRes = spawnSync('/usr/bin/python3', [agyEmit], {
+    input: '{invalid-json',
+    env: { ...process.env, AGENT_PET_DATA: data },
+    encoding: 'utf8',
+  });
+  assert.equal(badRes.status, 0);
+  assert.equal(badRes.stdout.trim(), '{}');
+
+  const inboxDir = join(data, 'antigravity/inbox');
+  const inboxFiles = await readdir(inboxDir);
+  assert.equal(inboxFiles.length, 2);
+  const parsed = await Promise.all(inboxFiles.map(async name => {
+    const text = await readFile(join(inboxDir, name), 'utf8');
+    assert.ok(!text.includes('SECRET'));
+    return JSON.parse(text);
+  }));
+  assert.ok(parsed.every(ev => ev.v === 1 && ev.provider === 'antigravity' && ev.workspace === 'agy proj'));
+  const preTool = parsed.find(ev => ev.sessionId === 'py39-conv-2');
+  assert.equal(preTool.event, 'PreToolUse');
+  assert.equal(preTool.tool, 'Bash');
+  assert.equal(preTool.toolId, 'tc-1');
+});
+
+test('AntigravitySessionReader 与 Providers 集成：冷启动过滤、hook 工具详情保护与状态收敛', async t => {
+  if (!existsSync('/usr/bin/sqlite3')) t.skip('sqlite3 binary unavailable');
+
+  const root = await mkdtemp(join(tmpdir(), 'agent-pet-agy-db-'));
+  const dataDir = join(root, 'data');
+  const dbPath = join(root, 'conversation_summaries.db');
+  await mkdir(dataDir, { recursive: true });
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  const execSql = sql => {
+    const res = spawnSync('/usr/bin/sqlite3', [dbPath, sql], { encoding: 'utf8' });
+    assert.equal(res.status, 0, res.stderr || `sqlite3 exited ${res.status}`);
+  };
+  const fmtTs = ms => new Date(ms).toISOString().replace('T', ' ').replace('Z', '+00:00');
+  const t0 = Date.now() - 20_000;
+
+  execSql(`
+    PRAGMA journal_mode=WAL;
+    CREATE TABLE conversation_summaries (
+      conversation_id TEXT PRIMARY KEY,
+      title TEXT NOT NULL DEFAULT '',
+      workspace_uris TEXT NOT NULL DEFAULT '',
+      last_modified_time TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT '',
+      parent_conversation_id TEXT NOT NULL DEFAULT '',
+      not_fully_idle INTEGER NOT NULL DEFAULT 0,
+      killed INTEGER NOT NULL DEFAULT 0
+    );
+    INSERT INTO conversation_summaries VALUES
+      ('conv-run', 'Fix Parser Bug', '["file:///tmp/agy%20app"]', '${fmtTs(t0)}', 'CASCADE_RUN_STATUS_RUNNING', '', 0, 0),
+      ('conv-idle', 'Old Finished Task', '["file:///tmp/old-proj"]', '${fmtTs(t0 - 1000)}', 'CASCADE_RUN_STATUS_IDLE', '', 0, 0),
+      ('conv-child', 'Child Subagent', '["file:///tmp/agy%20app"]', '${fmtTs(t0)}', 'CASCADE_RUN_STATUS_RUNNING', 'conv-run', 1, 0);
+  `);
+
+  const providers = new Providers(dataDir, {}, { antigravityDbPath: dbPath, enabledProviders: ['dsh', 'antigravity'] });
+  await providers.refresh();
+
+  let agyItems = providers.list('antigravity').items;
+  assert.equal(agyItems.length, 1);
+  assert.equal(agyItems[0].sessionId, 'antigravity:conv-run');
+  assert.equal(agyItems[0].status, 'running');
+  assert.equal(agyItems[0].title, 'agy app · Fix Parser Bug');
+  assert.equal(agyItems[0].unread, false);
+
+  // Inject real hook PreToolUse detail, then verify steady-state DB poll preserves it.
+  const agyInbox = join(dataDir, 'antigravity/inbox');
+  await mkdir(agyInbox, { recursive: true });
+  await writeFile(join(agyInbox, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json'), JSON.stringify({
+    v: 1,
+    id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    provider: 'antigravity',
+    sessionId: 'conv-run',
+    event: 'PreToolUse',
+    tool: 'Bash',
+    toolId: 't-bash-1',
+    at: t0 + 1000,
+    workspace: 'agy app',
+  }));
+  await providers.refresh();
+  let runRow = providers.list('antigravity').items.find(r => r.sessionId === 'antigravity:conv-run');
+  assert.equal(runRow.status, 'running');
+  assert.equal(runRow.detail, '正在使用 Bash');
+
+  execSql(`UPDATE conversation_summaries SET last_modified_time='${fmtTs(t0 + 2000)}' WHERE conversation_id='conv-run';`);
+  await providers.refresh();
+  runRow = providers.list('antigravity').items.find(r => r.sessionId === 'antigravity:conv-run');
+  assert.equal(runRow.status, 'running');
+  assert.equal(runRow.detail, '正在使用 Bash');
+  assert.equal(runRow.title, 'agy app · Fix Parser Bug');
+
+  // Transition IDLE -> RUNNING (via not_fully_idle = 1), RUNNING -> IDLE (killed=0 => ready), RUNNING -> IDLE (killed=1 => cancelled).
+  execSql(`UPDATE conversation_summaries SET not_fully_idle=1, last_modified_time='${fmtTs(t0 + 3000)}' WHERE conversation_id='conv-idle';`);
+  await providers.refresh();
+  let idleRow = providers.list('antigravity').items.find(r => r.sessionId === 'antigravity:conv-idle');
+  assert.equal(idleRow.status, 'running');
+  assert.equal(idleRow.title, 'old-proj · Old Finished Task');
+
+  execSql(`UPDATE conversation_summaries SET status='CASCADE_RUN_STATUS_IDLE', not_fully_idle=0, killed=0, last_modified_time='${fmtTs(t0 + 4000)}' WHERE conversation_id='conv-run';`);
+  await providers.refresh();
+  runRow = providers.list('antigravity').items.find(r => r.sessionId === 'antigravity:conv-run');
+  assert.equal(runRow.status, 'ready');
+  assert.equal(runRow.unread, true);
+
+  execSql(`UPDATE conversation_summaries SET status='CASCADE_RUN_STATUS_IDLE', not_fully_idle=0, killed=1, last_modified_time='${fmtTs(t0 + 5000)}' WHERE conversation_id='conv-idle';`);
+  await providers.refresh();
+  idleRow = providers.list('antigravity').items.find(r => r.sessionId === 'antigravity:conv-idle');
+  assert.equal(idleRow.status, 'cancelled');
+  assert.equal(idleRow.unread, false);
+
+  // Persisted stale running session converges to ready when DB is already IDLE, and isolated Providers omits reader by default.
+  const dataDir2 = join(root, 'data2');
+  await mkdir(join(dataDir2, 'antigravity'), { recursive: true });
+  await writeFile(join(dataDir2, 'antigravity/state.json'), JSON.stringify({
+    sessions: {
+      'conv-stale': {
+        sessionId: 'conv-stale',
+        status: 'running',
+        tools: {},
+        lastSeq: 1,
+        updatedAt: t0,
+        eventId: 'agydb:conv-stale:1',
+        detail: '正在思考',
+      },
+    },
+  }));
+  execSql(`INSERT INTO conversation_summaries VALUES ('conv-stale', 'Stale Task', '["file:///tmp/stale-ws"]', '${fmtTs(t0 + 6000)}', 'CASCADE_RUN_STATUS_IDLE', '', 0, 0);`);
+
+  const isolated = new Providers(dataDir2, {}, { enabledProviders: ['dsh', 'antigravity'] });
+  assert.equal(isolated.antigravityReader, null);
+
+  const providers2 = new Providers(dataDir2, {}, { antigravityDbPath: dbPath, enabledProviders: ['dsh', 'antigravity'] });
+  await providers2.refresh();
+  const staleRow = providers2.list('antigravity').items.find(r => r.sessionId === 'antigravity:conv-stale');
+  assert.equal(staleRow.status, 'ready');
+  assert.equal(staleRow.title, 'stale-ws · Stale Task');
+
+  const persisted = JSON.parse(await readFile(join(dataDir2, 'antigravity/state.json'), 'utf8'));
+  assert.equal(persisted.sessions['conv-stale'].status, 'ready');
 });
