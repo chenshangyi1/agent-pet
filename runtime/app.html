@@ -4,39 +4,18 @@
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'">
 <title>小鑫 · Agent Pet</title><link rel="stylesheet" href="./ui.css"></head>
 <body><main id="pet">
-  <button id="character" aria-label="小鑫：拖动移动，点击查看活动，双击打开当前会话"><video id="animation" muted autoplay loop playsinline aria-label="小鑫"></video><span id="dot" hidden></span></button>
-  <!-- Compact bar: character on top, then a translucent pill bar [ compose | voice | activities ]. -->
-  <div id="mini-pill" aria-hidden="true"></div>
-  <section id="panel" aria-label="小鑫控制条">
+  <button id="character" type="button" aria-label="小鑫：点击展开或收起通知，拖动移动，右键打开菜单">
+    <video id="animation" muted autoplay loop playsinline aria-label="小鑫"></video>
+    <span id="activity-badge" hidden>1</span>
+  </button>
+  <section id="panel" aria-label="小鑫消息通知">
     <div id="first-awake" class="glass-card" hidden>
       <span class="awake-title">Hi, I'm 小鑫</span>
-      <span class="awake-body">我会实时汇聚本机各 AI Agent 的任务通知，点击卡片就能一键回到对应会话。</span>
+      <span class="awake-body">我会实时汇聚本机各 AI Agent 的任务通知，点击蓝色小女仆即可展开或收起，点击卡片直接回到原会话。</span>
       <button id="awake-dismiss" type="button">知道了</button>
     </div>
     <button id="activity-stack" type="button" hidden aria-expanded="false"></button>
-    <div id="activity-list" role="list" aria-label="最近的 Agent 活动"><p id="empty" role="status">正在读取任务状态…</p></div>
-    <!-- DSH live transcript drawer (shown only when DSH host is connected). -->
-    <section id="transcript" aria-label="DSH 对话记录" hidden>
-      <header id="transcript-header">
-        <span id="transcript-title">快速聊天</span>
-        <span class="transcript-spacer"></span>
-        <button id="transcript-new" type="button" title="开始新聊天">新聊天</button>
-        <button id="transcript-close" type="button" title="返回紧凑条">收起</button>
-      </header>
-      <div id="transcript-list" role="log" aria-live="polite"></div>
-      <div id="transcript-quote" hidden><span id="transcript-quote-text"></span><button id="transcript-quote-remove" type="button" aria-label="移除引用">×</button></div>
-      <form id="transcript-form" autocomplete="off"><input id="transcript-input" aria-label="继续追问" placeholder="继续追问…"><button id="transcript-send" type="submit" aria-label="发送">↑</button></form>
-    </section>
-    <!-- Persistent pill bar: DSH quick chat when connected, or one-click jump/manage + notifications. -->
-    <div id="toolbar" role="toolbar" aria-label="桌宠操作">
-      <button class="tool-button" id="tool-compose" type="button" aria-label="打开当前会话或管理" title="打开当前会话或管理" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 4.2H8.2a4 4 0 0 0-4 4v7.6a4 4 0 0 0 4 4h7.6a4 4 0 0 0 4-4V12"/><path d="m9.8 14.2 8.2-8.2a1.25 1.25 0 0 1 1.77 1.77l-8.2 8.2-2.6.7.7-2.6Z"/></svg></button>
-      <form id="quick-chat" autocomplete="off">
-        <input id="quick-input" maxlength="100000" aria-label="DSH 快速对话" placeholder="向 DSH 发送指令…">
-        <button id="quick-send" type="submit" aria-label="发送">↑</button>
-      </form>
-      <button class="tool-button" id="tool-voice" type="button" aria-label="语音对话" aria-pressed="false" title="语音对话"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 10v4M10 6.5v11M14 6.5v11M18 10v4"/></svg></button>
-      <button class="tool-button" id="tool-activities" type="button" aria-label="显示活动" aria-pressed="false" title="显示活动"><svg class="icon-bell" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 20a2 2 0 0 0 4 0"/></svg><svg class="icon-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg><span id="activity-badge" hidden>1</span></button>
-    </div>
+    <div id="activity-list" role="list" aria-label="最近的 Agent 活动"><p id="empty" role="status">暂无需要关注的活动</p></div>
     <p id="feedback" role="status" aria-live="polite"><span id="feedback-text"></span><button id="feedback-retry" type="button" hidden>重试</button><button id="feedback-close" type="button" aria-label="关闭提示" hidden>×</button></p>
   </section>
 </main><script type="module" src="./ui.js"></script></body></html>

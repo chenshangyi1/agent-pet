@@ -48,7 +48,7 @@ test('独立运行 WebM 动画资产、Manager & Pet UI DOM/CSP 契约及无 ~/.
 
   for (const [htmlRel, jsRel, minIds] of [
     ['runtime/manager.html', 'runtime/manager.js', 8],
-    ['runtime/app.html', 'runtime/ui.js', 18],
+    ['runtime/app.html', 'runtime/ui.js', 6],
   ]) {
     const html = await readFile(join(ROOT_DIR, htmlRel), 'utf8');
     const js = await readFile(join(ROOT_DIR, jsRel), 'utf8');
@@ -62,6 +62,11 @@ test('独立运行 WebM 动画资产、Manager & Pet UI DOM/CSP 契约及无 ~/.
     assert.ok(referencedIds.length >= minIds, `expected >= ${minIds} DOM refs in ${jsRel}, got ${referencedIds.length}`);
     for (const id of referencedIds) {
       assert.ok(htmlIds.has(id), `${jsRel} references missing DOM id in ${htmlRel}: ${id}`);
+    }
+    if (htmlRel === 'runtime/app.html') {
+      for (const removedId of ['toolbar', 'tool-compose', 'tool-voice', 'quick-chat', 'transcript']) {
+        assert.equal(htmlIds.has(removedId), false, `expected ${removedId} to be removed from app.html`);
+      }
     }
   }
 

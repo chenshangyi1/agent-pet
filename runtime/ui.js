@@ -1,5 +1,4 @@
-/** Floating Agent Pet controls: activity notices, one-click session jump, and DSH companion mode. */
-import { recordingToWave } from './audio.js';
+/** Floating Agent Pet UI: click character to toggle notices, click notice to jump to session. */
 import { createActivityNoticeTracker } from './activity-notices.js';
 
 const native = window.companion;
@@ -11,11 +10,7 @@ const list = $('activity-list');
 const empty = $('empty');
 const video = $('animation');
 const feedback = $('feedback');
-const quickInput = $('quick-input');
-const voiceButton = $('tool-voice');
-const composeButton = $('tool-compose');
-const activitiesButton = $('tool-activities');
-const miniPill = $('mini-pill');
+const badge = $('activity-badge');
 const labels = { running: '正在工作', waiting: '需要你确认', blocked: '遇到问题', ready: '已完成', cancelled: '已取消', idle: '空闲' };
 
 const svgEl = (tag, attrs = {}) => {
@@ -75,10 +70,10 @@ function makeProviderIcon(provider = 'dsh', className = 'activity-provider-icon'
   return img;
 }
 
-let source = 'auto', dshConnected = false, knownSources = [];
+let source = 'auto';
 let items = [], current, animationKey, polling = false, noticeTimer, drag, suppressClick = false;
 const PREFS_KEY = 'dsh-companion:prefs:v1';
-const defaultPrefs = { firstAwakeSeen: false, muted: [], dismissed: [], activeSessionId: null, stackCollapsed: true };
+const defaultPrefs = { firstAwakeSeen: false, muted: [], dismissed: [], stackCollapsed: true };
 let prefs;
 try { prefs = { ...defaultPrefs, ...JSON.parse(localStorage.getItem(PREFS_KEY) || '{}') }; }
 catch { prefs = { ...defaultPrefs }; }
@@ -112,9 +107,7 @@ const dismissExpired = rows => {
   return live;
 };
 const trackActivityNotices = createActivityNoticeTracker();
-let sending = false, recorder, mediaStream, recordingTimer, voiceConversation = false, voiceEpoch = 0, voiceSessionId;
 const reduced = matchMedia('(prefers-reduced-motion: reduce)');
-let quoted = null, transcriptSessionId = null;
 
 async function action(name, body = {}) {
   if (native) return native.action({ ...body, action: name });
@@ -140,56 +133,32 @@ function cleanErrorMessage(message) {
 function report(error, retry) { showFeedback(cleanErrorMessage(error?.message), true, retry); notice(); }
 function run(fn) { Promise.resolve().then(fn).catch(report); }
 
-function isDshChatAvailable() {
-  return dshConnected && (source === 'auto' || source === 'dsh');
-}
-
 function syncView() {
-  const open = ['compose-open', 'activities-open', 'transcript-open']
-    .some(name => pet.classList.contains(name));
+  const open = pet.classList.contains('activities-open');
   if (pet.classList.contains('expanded') !== open) pet.classList.toggle('expanded', open);
   const revealed = open || pet.classList.contains('hovering') || pet.classList.contains('pinned');
   if (pet.classList.contains('revealed') !== revealed) pet.classList.toggle('revealed', revealed);
 }
 new MutationObserver(syncView).observe(pet, { attributes: true, attributeFilter: ['class'] });
-pet.classList.remove('show', 'compose-open', 'activities-open', 'transcript-open', 'hovering', 'pinned', 'revealed', 'expanded');
+pet.classList.remove('show', 'activities-open', 'hovering', 'pinned', 'revealed', 'expanded');
 syncView();
 
 function pingBadge() {
-  const badge = $('activity-badge');
   badge.classList.remove('ping');
   void badge.offsetWidth;
   badge.classList.add('ping');
-}
-function syncActivitiesButton() {
-  const open = pet.classList.contains('activities-open');
-  activitiesButton.setAttribute('aria-pressed', String(open));
-  activitiesButton.setAttribute('aria-label', open ? '收起活动' : '显示活动');
-  activitiesButton.title = open ? '收起活动' : '显示活动';
 }
 function setActivitiesOpen(nextOpen) {
   const open = Boolean(nextOpen);
   pet.classList.toggle('activities-open', open);
   pet.classList.remove('show');
-  if (open) {
-    closeTranscript();
-  } else {
+  character.setAttribute('aria-expanded', String(open));
+  if (!open) {
     prefs.stackCollapsed = true;
     savePrefs();
   }
-  syncActivitiesButton();
   syncView();
   renderActivities();
-}
-function showQuickChat() {
-  if (!isDshChatAvailable()) return false;
-  pet.classList.add('compose-open');
-  pet.classList.remove('show');
-  closeTranscript();
-  composeButton.setAttribute('aria-expanded', 'true');
-  syncView();
-  setTimeout(() => quickInput.focus(), 30);
-  return true;
 }
 
 async function animation(status) {
@@ -216,28 +185,6 @@ function dismissItem(item) {
 function toggleMute(item) {
   if (muted.has(item.sessionId)) muted.delete(item.sessionId); else muted.add(item.sessionId);
   persistSets(); renderActivities();
-}
-async function stopSession(item) {
-  await action('cancel', { sessionId: item.sessionId });
-  showFeedback('已发送停止请求');
-  await poll();
-}
-function bindFollowUp(card, item) {
-  const form = card.querySelector('.activity-followup');
-  const input = form.querySelector('input');
-  form.onsubmit = event => {
-    event.preventDefault();
-    const text = input.value.trim();
-    if (!text) return;
-    input.value = ''; form.hidden = true;
-    run(() => sendPrompt(text, { sessionId: item.sessionId }));
-  };
-  return form;
-}
-function openFollowUp(card, item) {
-  const form = bindFollowUp(card, item);
-  form.hidden = false;
-  form.querySelector('input').focus();
 }
 function shortDetail(text) {
   const raw = String(text ?? '').replace(/\s+/g, ' ').trim();
@@ -313,7 +260,7 @@ function makeCard(item, { stacked = false, stackLayer = 0, stackTotal = 1 } = {}
       renderActivities();
       return;
     }
-    run(() => openDsh(item));
+    run(() => jumpSession(item));
   });
   card.append(main);
 
@@ -325,7 +272,7 @@ function makeCard(item, { stacked = false, stackLayer = 0, stackTotal = 1 } = {}
     }
     const handle = el('button', 'approval-open', item.provider === 'dsh' ? '在 DSH 中处理' : '立即查看');
     handle.type = 'button';
-    handle.addEventListener('click', event => { event.stopPropagation(); run(() => openDsh(item)); });
+    handle.addEventListener('click', event => { event.stopPropagation(); run(() => jumpSession(item)); });
     approval.append(handle);
     card.append(approval);
   }
@@ -338,50 +285,31 @@ function makeCard(item, { stacked = false, stackLayer = 0, stackTotal = 1 } = {}
     actions.append(button);
     return button;
   };
-  addAction('open', '打开', () => openDsh(item));
+  addAction('open', '打开', () => jumpSession(item));
   addAction('expand', expanded.has(id) ? '收起' : '展开', () => {
     if (expanded.has(id)) expanded.delete(id); else expanded.add(id);
     renderActivities();
   });
-  if (dshConnected && item.provider === 'dsh' && item.capabilities?.reply !== false) {
-    addAction('reply', '回复', () => openFollowUp(card, item));
-  }
-  if (dshConnected && item.provider === 'dsh' && item.capabilities?.cancel !== false && ['running', 'waiting'].includes(item.status)) {
-    addAction('stop', '停止', () => stopSession(item));
-  }
   addAction('mute', muted.has(id) ? '取消静音' : '静音', () => toggleMute(item));
   addAction('dismiss', '关闭', () => dismissItem(item));
   card.append(actions);
 
-  const followup = el('form', 'activity-followup');
-  followup.hidden = true;
-  const input = el('input');
-  input.placeholder = '继续追问…'; input.setAttribute('aria-label', '继续追问');
-  const send = el('button', null, '↑');
-  send.type = 'submit'; send.setAttribute('aria-label', '发送');
-  followup.append(input, send);
-  card.append(followup);
-  bindFollowUp(card, item);
   return card;
 }
 let renderKey = '';
 function renderActivities() {
   const signature = JSON.stringify([
     items.map(item => [item.sessionId, item.lastSeq, item.status, item.detail, item.unread, item.pending?.length ?? 0]),
-    [...muted], [...expanded], [...dismissed], prefs.stackCollapsed, prefs.activeSessionId, prefs.firstAwakeSeen,
-    $('transcript').hidden, pet.dataset.bubble, pet.classList.contains('activities-open'),
+    [...muted], [...expanded], [...dismissed], prefs.stackCollapsed, prefs.firstAwakeSeen,
+    pet.dataset.bubble, pet.classList.contains('activities-open'),
   ]);
   if (signature === renderKey) return;
   renderKey = signature;
-  const drafts = new Map();
-  list.querySelectorAll('.activity-card').forEach(card => {
-    const input = card.querySelector('.activity-followup input');
-    if (input?.value) drafts.set(card.dataset.sessionId, { text: input.value, open: !card.querySelector('.activity-followup').hidden });
-    card.remove();
-  });
-  empty.style.display = items.length ? 'none' : (pet.classList.contains('activities-open') ? 'block' : 'none');
+  list.querySelectorAll('.activity-card').forEach(card => card.remove());
+  const showOnboarding = !prefs.firstAwakeSeen && items.length === 0;
+  $('first-awake').hidden = !showOnboarding;
+  empty.style.display = !items.length && !showOnboarding && pet.classList.contains('activities-open') ? 'block' : 'none';
   empty.textContent = '暂无需要关注的活动';
-  $('first-awake').hidden = Boolean(prefs.firstAwakeSeen) || items.length > 0;
 
   const collapsed = prefs.stackCollapsed && items.length > 1;
   list.classList.toggle('is-stacked', collapsed);
@@ -393,26 +321,18 @@ function renderActivities() {
   }
   const shown = collapsed ? items.slice(0, 3) : items;
   shown.forEach((item, index) => {
-    const card = makeCard(item, { stacked: collapsed, stackLayer: index, stackTotal: items.length });
-    const draft = drafts.get(item.sessionId);
-    if (draft && !collapsed) {
-      const form = card.querySelector('.activity-followup');
-      form.hidden = !draft.open;
-      form.querySelector('input').value = draft.text;
-    }
-    list.append(card);
+    list.append(makeCard(item, { stacked: collapsed, stackLayer: index, stackTotal: items.length }));
   });
 
-  const badge = $('activity-badge');
   badge.hidden = items.length === 0;
   badge.textContent = items.length > 99 ? '99+' : String(items.length);
   badge.setAttribute('aria-label', `${items.length} 项待处理活动`);
   const placement = pet.dataset.bubble;
   if (placement === 'above') {
-    pet.dataset.panelOrder = 'controls-last';
+    pet.dataset.panelOrder = 'above';
   } else {
-    pet.dataset.panelOrder = 'controls-first';
-    pet.style.setProperty('--panel-top', 'calc(var(--pet-top,0px) + 138px)');
+    pet.dataset.panelOrder = 'below';
+    pet.style.setProperty('--panel-top', 'calc(var(--pet-top,0px) + 140px)');
   }
 }
 async function poll() {
@@ -420,39 +340,22 @@ async function poll() {
   polling = true;
   try {
     const response = await action('list');
-    knownSources = Array.isArray(response.sources) ? response.sources : knownSources;
-    dshConnected = response.sources ? Boolean(response.sources.find(row => row.id === 'dsh')?.connected) : false;
-    const canChat = isDshChatAvailable();
-    if (!canChat && pet.classList.contains('compose-open')) {
-      pet.classList.remove('compose-open');
-      composeButton.setAttribute('aria-expanded', 'false');
-    }
     const next = visibleActivities(response.items ?? []);
     const now = Date.now();
     for (const item of next) if (item.status === 'ready' && !readyShownAt.has(item.sessionId)) readyShownAt.set(item.sessionId, now);
     items = dismissExpired(next);
     current = items[0];
-    const sourceLabel = source !== 'auto' ? (knownSources.find(row => row.id === source)?.label || source) : '';
-    composeButton.disabled = false;
-    composeButton.title = canChat
-      ? '新建 DSH 聊天'
-      : (current
-        ? `回到 ${current.title || current.providerLabel || '当前会话'}`
-        : (sourceLabel ? `打开 ${sourceLabel}` : '打开 AI Agent 管理'));
-    composeButton.setAttribute('aria-label', composeButton.title);
-    voiceButton.disabled = !canChat;
     renderActivities();
     const status = current?.status ?? 'idle';
     document.body.dataset.status = status;
     syncView();
-    $('dot').hidden = !current;
-    character.setAttribute('aria-label', current ? `小鑫：${items.length} 项活动，${current.title}，双击跳转会话` : '小鑫：拖动移动，双击打开当前会话或管理');
+    character.setAttribute('aria-label', current ? `小鑫：${items.length} 项活动，点击查看或收起` : '小鑫：点击查看活动，拖动移动，右键菜单');
     await animation(status);
     if (trackActivityNotices(items.filter(item => !muted.has(item.sessionId))).length) pingBadge();
   } finally { polling = false; }
 }
 
-async function openDsh(item = current) {
+async function jumpSession(item = current) {
   const res = await action(item ? 'focus' : 'home', item ? { sessionId: item.sessionId } : {});
   setActivitiesOpen(false);
   character.blur();
@@ -466,303 +369,9 @@ async function openDsh(item = current) {
   await poll();
 }
 
-async function sendPrompt(text, { sessionId: existingSessionId, trackReply = false, quoted: quotedText, reuseActive = false } = {}) {
-  const request = text.trim();
-  if (!request || sending) return;
-  if (!isDshChatAvailable()) {
-    showFeedback('DSH 未连接，请直接在对应 AI 应用中对话');
-    notice();
-    return;
-  }
-  sending = true;
-  $('quick-send').disabled = true;
-  showFeedback('正在发送…');
-  const options = { sessionId: existingSessionId, trackReply, quoted: quotedText, reuseActive };
-  try {
-    let sessionId = existingSessionId ?? (reuseActive ? prefs.activeSessionId : null);
-    if (!sessionId) {
-      const requestedId = `session-${crypto.randomUUID()}`;
-      const created = await action('create', { sessionId: requestedId });
-      sessionId = created?.sessionId || requestedId;
-    }
-    const baselineSeq = trackReply ? (await action('conversation', { sessionId })).lastSeq ?? -1 : undefined;
-    const parts = [];
-    if (quotedText) parts.push({ type: 'text', text: `[引用] ${quotedText.slice(0, 400)}` });
-    parts.push({ type: 'text', text: request });
-    await action('prompt', {
-      sessionId,
-      requestId: crypto.randomUUID(),
-      content: parts,
-      clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-    });
-    quickInput.value = '';
-    quoted = null;
-    renderQuote();
-    pet.classList.remove('compose-open');
-    composeButton.setAttribute('aria-expanded', 'false');
-    if (reuseActive) {
-      prefs.activeSessionId = sessionId;
-      savePrefs();
-    }
-    showFeedback(existingSessionId ? '已回复该会话' : '已发送给 DSH');
-    setActivitiesOpen(true);
-    await poll();
-    return { sessionId, baselineSeq };
-  } catch (error) { report(error, () => sendPrompt(request, options)); }
-  finally { sending = false; $('quick-send').disabled = false; }
-}
-
-function renderQuote() {
-  $('transcript-quote').hidden = !quoted;
-  $('transcript-quote-text').textContent = quoted && quoted.length > 90 ? quoted.slice(0, 90) + '…' : quoted || '';
-}
-
-let transcriptRenderKey = '';
-let transcriptFetching = false;
-function renderTranscriptMessages(container, view, targetSessionId, { forceScroll = false } = {}) {
-  const msgs = Array.isArray(view?.messages) ? view.messages : [];
-  const nextKey = JSON.stringify([targetSessionId, msgs.map(m => [m.id, m.seq, m.text, Boolean(m.streaming)])]);
-  if (nextKey === transcriptRenderKey) return;
-  transcriptRenderKey = nextKey;
-  const nearBottom = forceScroll || (container.scrollHeight - container.scrollTop - container.clientHeight < 36);
-  container.textContent = '';
-  if (!msgs.length) { container.append(el('p', 'transcript-state', '还没有消息，先说点什么吧')); return; }
-  for (const message of msgs) {
-    const row = el('div', 'transcript-message');
-    row.dataset.role = message.role;
-    if (message.streaming) row.dataset.streaming = 'true';
-    row.append(el('span', 'transcript-role', message.role === 'user' ? '你' : (message.streaming ? 'DSH · 输出中' : 'DSH')));
-    row.append(el('span', 'transcript-body', message.text || (message.attachments ? `[${message.attachments} 个附件]` : '')));
-    if (!message.streaming) {
-      const reply = el('button', 'transcript-reply', '回复');
-      reply.type = 'button';
-      reply.addEventListener('click', () => { quoted = message.text || ''; renderQuote(); $('transcript-input').focus(); });
-      row.append(reply);
-    }
-    container.append(row);
-  }
-  if (nearBottom) container.scrollTop = container.scrollHeight;
-}
-async function loadTranscript({ quiet = false } = {}) {
-  const container = $('transcript-list');
-  const requestedId = transcriptSessionId;
-  if (!requestedId) return;
-  if (quiet && transcriptFetching) return;
-  transcriptFetching = true;
-  if (!quiet) {
-    transcriptRenderKey = '';
-    container.textContent = '';
-    container.append(el('p', 'transcript-state', '正在读取会话…'));
-  }
-  try {
-    const view = await action('conversation', { sessionId: requestedId });
-    if (requestedId !== transcriptSessionId || $('transcript').hidden) return;
-    renderTranscriptMessages(container, view, requestedId, { forceScroll: !quiet });
-  } catch (error) {
-    if (!quiet) {
-      container.textContent = '';
-      container.append(el('p', 'transcript-state', '会话暂时不可用'));
-      report(error);
-    }
-  } finally {
-    transcriptFetching = false;
-  }
-}
-function closeTranscript() {
-  $('transcript').hidden = true;
-  pet.classList.remove('transcript-open');
-  quoted = null; renderQuote();
-}
-function startNewChat() {
-  prefs.activeSessionId = null;
-  savePrefs();
-  quoted = null; transcriptSessionId = null;
-  renderQuote();
-  closeTranscript();
-  quickInput.value = '';
-  if (showQuickChat()) showFeedback('已开始新聊天');
-}
-
-function setVoiceButton(active, processing = false) {
-  voiceButton.classList.toggle('voice-active', active);
-  voiceButton.classList.toggle('voice-processing', active && processing);
-  voiceButton.setAttribute('aria-pressed', String(active));
-  voiceButton.setAttribute('aria-label', active ? (processing ? '停止语音对话' : '结束本轮语音') : '开始语音对话');
-  voiceButton.title = active ? (processing ? '停止语音对话' : '结束本轮语音') : '开始语音对话';
-}
-
-async function speakReply(text, epoch) {
-  if (native) {
-    const res = await action('speak', { text });
-    if (!res?.stopped && voiceConversation && epoch === voiceEpoch) {
-      recordVoiceChunk(epoch).catch(report);
-    }
-    return;
-  }
-  if (!window.speechSynthesis || !window.SpeechSynthesisUtterance) throw new Error('当前桌面环境不支持语音播报');
-  const utterance = new SpeechSynthesisUtterance(text);
-  utterance.lang = 'zh-CN';
-  utterance.rate = 1;
-  utterance.onend = () => { if (voiceConversation && epoch === voiceEpoch) recordVoiceChunk(epoch).catch(report); };
-  utterance.onerror = () => {
-    if (voiceConversation && epoch === voiceEpoch) {
-      showFeedback('语音播报失败，点麦克风结束语音对话');
-      recordVoiceChunk(epoch).catch(report);
-    }
-  };
-  window.speechSynthesis.speak(utterance);
-}
-
-async function waitForVoiceReply(sessionId, baselineSeq, epoch) {
-  const deadline = Date.now() + 5 * 60_000;
-  while (voiceConversation && epoch === voiceEpoch && Date.now() < deadline) {
-    const view = await action('conversation', { sessionId });
-    if (view.status === 'ready') {
-      const messages = (view.messages ?? []).filter(message => message.seq > baselineSeq);
-      const heardPrompt = messages.some(message => message.role === 'user');
-      const reply = heardPrompt && [...messages].reverse().find(message => message.role === 'assistant' && message.text?.trim());
-      if (reply) { showFeedback('DSH 正在语音回复…'); await speakReply(reply.text, epoch); return true; }
-    }
-    if (['waiting', 'blocked'].includes(view.status)) {
-      voiceConversation = false; setVoiceButton(false);
-      showFeedback(view.detail || '任务需要你在 DSH 中处理');
-      return false;
-    }
-    await new Promise(resolve => setTimeout(resolve, 900));
-  }
-  if (voiceConversation && epoch === voiceEpoch) {
-    throw new Error('等待 DSH 回复超时，请在 DSH 中查看任务');
-  }
-}
-
-async function recordVoiceChunk(epoch) {
-  if (!voiceConversation || epoch !== voiceEpoch) return;
-  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) throw new Error('当前桌面环境不支持录音');
-  mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
-  if (!voiceConversation || epoch !== voiceEpoch) { mediaStream.getTracks().forEach(track => track.stop()); mediaStream = undefined; return; }
-  const chunks = [];
-  let vadTimer, vadContext, heardSpeech = false, lastSpeechAt = performance.now();
-  const startedAt = performance.now();
-  try {
-    vadContext = new AudioContext();
-    const analyser = vadContext.createAnalyser();
-    analyser.fftSize = 512;
-    vadContext.createMediaStreamSource(mediaStream).connect(analyser);
-    const samples = new Float32Array(analyser.fftSize);
-    vadTimer = setInterval(() => {
-      if (!recorder || recorder.state !== 'recording') return;
-      analyser.getFloatTimeDomainData(samples);
-      let sum = 0;
-      for (let i = 0; i < samples.length; i++) sum += samples[i] * samples[i];
-      const rms = Math.sqrt(sum / samples.length);
-      voiceButton.style.setProperty('--voice-level', String(Math.min(1, rms * 10)));
-      const now = performance.now();
-      if (now - startedAt > 250 && rms > 0.016) {
-        heardSpeech = true;
-        lastSpeechAt = now;
-      } else if (heardSpeech && now - startedAt > 900 && now - lastSpeechAt >= 1350) {
-        recorder.stop();
-      }
-    }, 80);
-  } catch { /* fallback cleanly to manual stop or 24s cap */ }
-  const stopVad = () => {
-    clearInterval(vadTimer);
-    voiceButton.style.removeProperty('--voice-level');
-    vadContext?.close().catch(() => {});
-    vadContext = undefined;
-  };
-
-  recorder = new MediaRecorder(mediaStream);
-  recorder.addEventListener('dataavailable', event => { if (event.data.size) chunks.push(event.data); });
-  recorder.addEventListener('stop', async () => {
-    const activeRecorder = recorder;
-    recorder = undefined; clearTimeout(recordingTimer); stopVad();
-    mediaStream?.getTracks().forEach(track => track.stop()); mediaStream = undefined;
-    voiceButton.classList.remove('recording'); setVoiceButton(voiceConversation, true);
-    if (!voiceConversation || epoch !== voiceEpoch) return;
-    try {
-      showFeedback('正在识别语音…');
-      const audio = await recordingToWave(new Blob(chunks, { type: activeRecorder.mimeType }));
-      const result = await action('hear', { audio });
-      if (!result.text?.trim()) throw new Error('没有识别到语音，请重试');
-      showFeedback('正在发送语音内容…');
-      const sent = await sendPrompt(result.text, { sessionId: voiceSessionId, trackReply: true });
-      if (sent?.sessionId) voiceSessionId = sent.sessionId;
-      const speaking = sent?.sessionId ? await waitForVoiceReply(sent.sessionId, sent.baselineSeq, epoch) : false;
-      if (!speaking && voiceConversation && epoch === voiceEpoch) recordVoiceChunk(epoch).catch(report);
-    } catch (error) {
-      if (voiceConversation && epoch === voiceEpoch) { voiceConversation = false; setVoiceButton(false); report(error); }
-    }
-  }, { once: true });
-  recorder.start();
-  voiceButton.classList.add('recording'); setVoiceButton(true);
-  showFeedback('正在聆听… 说完停顿即自动发送（也可点麦克风结束）');
-  recordingTimer = setTimeout(() => { if (recorder?.state === 'recording') recorder.stop(); }, 24_000);
-}
-
-async function startVoice() {
-  if (voiceConversation) {
-    if (recorder?.state === 'recording') { recorder.stop(); return; }
-    voiceConversation = false; voiceEpoch++;
-    voiceSessionId = undefined;
-    if (native) action('speak-stop').catch(() => {});
-    window.speechSynthesis?.cancel();
-    recorder?.state === 'recording' && recorder.stop();
-    mediaStream?.getTracks().forEach(track => track.stop()); mediaStream = undefined;
-    setVoiceButton(false); showFeedback('语音对话已结束');
-    return;
-  }
-  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) throw new Error('当前桌面环境不支持录音');
-  if (!native && (!window.speechSynthesis || !window.SpeechSynthesisUtterance)) throw new Error('当前桌面环境不支持语音播报');
-  voiceConversation = true;
-  const epoch = ++voiceEpoch;
-  setVoiceButton(true);
-  try { await recordVoiceChunk(epoch); }
-  catch (error) { voiceConversation = false; setVoiceButton(false); throw error; }
-}
-
-character.addEventListener('click', event => { if (suppressClick) { suppressClick = false; return; } if (event.detail === 1) notice(); });
-character.addEventListener('dblclick', () => { if (!suppressClick) run(() => openDsh()); });
-composeButton.addEventListener('click', event => {
-  if (!isDshChatAvailable()) {
-    run(() => openDsh(current));
-    return;
-  }
-  const open = pet.classList.toggle('compose-open');
-  pet.classList.remove('show');
-  event.currentTarget.setAttribute('aria-expanded', String(open));
-  if (open) {
-    closeTranscript();
-    syncView();
-    setTimeout(() => quickInput.focus(), 30);
-  } else {
-    syncView();
-    quickInput.blur();
-  }
-});
-$('quick-chat').addEventListener('submit', event => {
-  event.preventDefault();
-  run(() => sendPrompt(quickInput.value, { reuseActive: true }));
-});
-voiceButton.addEventListener('click', () => {
-  if (!isDshChatAvailable()) { showFeedback('当前处于状态监控模式，点击通知卡片即可回到对应 AI 会话'); notice(); return; }
-  if (voiceButton.dataset.available === 'false') { showFeedback('当前桌面环境未找到语音识别组件'); notice(); return; }
-  run(startVoice);
-});
-activitiesButton.addEventListener('click', () => {
-  const currentlyShowing = pet.classList.contains('activities-open') && !pet.classList.contains('transcript-open');
-  setActivitiesOpen(!currentlyShowing);
-});
-$('transcript-close').addEventListener('click', closeTranscript);
-$('transcript-new').addEventListener('click', startNewChat);
-$('transcript-quote-remove').addEventListener('click', () => { quoted = null; renderQuote(); });
-$('transcript-form').addEventListener('submit', event => {
-  event.preventDefault();
-  const input = $('transcript-input');
-  const text = input.value.trim();
-  if (!text) return;
-  input.value = '';
-  run(async () => { await sendPrompt(text, { sessionId: transcriptSessionId, quoted }); await loadTranscript(); });
+character.addEventListener('click', () => {
+  if (suppressClick) { suppressClick = false; return; }
+  setActivitiesOpen(!pet.classList.contains('activities-open'));
 });
 $('activity-stack').addEventListener('click', () => { prefs.stackCollapsed = !prefs.stackCollapsed; savePrefs(); renderActivities(); });
 $('awake-dismiss').addEventListener('click', () => { prefs.firstAwakeSeen = true; savePrefs(); renderActivities(); });
@@ -784,18 +393,15 @@ function endDrag() { if (drag) { suppressClick = drag.moved; drag = null; run(()
 character.addEventListener('pointerup', endDrag);
 character.addEventListener('pointercancel', endDrag);
 character.addEventListener('lostpointercapture', endDrag);
-character.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); run(() => openDsh()); } });
+character.addEventListener('keydown', event => {
+  if (event.key === 'Enter' || event.key === ' ') {
+    event.preventDefault();
+    setActivitiesOpen(!pet.classList.contains('activities-open'));
+  }
+});
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape') {
-    voiceConversation = false; voiceEpoch++; voiceSessionId = undefined;
-    if (native) action('speak-stop').catch(() => {});
-    window.speechSynthesis?.cancel();
-    if (recorder?.state === 'recording') recorder.stop();
-    mediaStream?.getTracks().forEach(track => track.stop()); mediaStream = undefined;
-    setVoiceButton(false);
-    closeTranscript();
-    pet.classList.remove('show', 'compose-open');
-    composeButton.setAttribute('aria-expanded', 'false');
+    pet.classList.remove('show');
     setActivitiesOpen(false);
     character.blur();
   }
@@ -813,58 +419,46 @@ if (native) {
   const applySource = mode => {
     if (mode.source && source !== mode.source) {
       source = mode.source;
-      voiceConversation = false; voiceEpoch++; voiceSessionId = undefined;
-      if (recorder?.state === 'recording') recorder.stop();
-      mediaStream?.getTracks().forEach(track => track.stop()); window.speechSynthesis?.cancel(); setVoiceButton(false);
-      pet.classList.remove('show', 'compose-open', 'transcript-open');
-      composeButton.setAttribute('aria-expanded', 'false');
-      syncActivitiesButton(); syncView();
-      $('transcript').hidden = true;
+      setActivitiesOpen(false);
       run(poll);
     }
   };
   native.onMode(mode => {
     applySource(mode);
     applyPlacement(mode.placement);
-    document.body.classList.toggle('control-only', mode.controlOnly);
     if (mode.notice) notice();
-    if (mode.focusQuickChat && !showQuickChat()) {
-      run(() => (current ? openDsh(current) : action('home')));
-    }
+    if (mode.openNotices) setActivitiesOpen(true);
   });
-  native.onUpdated?.(() => {
-    run(poll);
-    if (!$('transcript').hidden && transcriptSessionId) run(() => loadTranscript({ quiet: true }));
-  });
+  native.onUpdated?.(() => run(poll));
   run(async () => {
     const mode = await native.window('placement');
-    applySource(mode); applyPlacement(mode.placement);
-    document.body.classList.toggle('control-only', mode.controlOnly);
+    applySource(mode);
+    applyPlacement(mode.placement);
   });
-  run(async () => {
-    const info = await action('info');
-    voiceButton.dataset.available = String(Boolean(info.speechAvailable));
-    dshConnected = Boolean(info.dshConnected);
-  });
-  let passthrough, hovering = false, releaseTimer;
+  let passthrough, releaseTimer;
   const inside = (rect, x, y) => rect.width > 0 && rect.height > 0
     && x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
-  const toolbar = $('toolbar');
-  const anchor = () => ([character.getBoundingClientRect(), miniPill.getBoundingClientRect(), toolbar.getBoundingClientRect(),
+  const anchor = () => ([
+    character.getBoundingClientRect(),
     ...(feedback.classList.contains('visible') ? [feedback.getBoundingClientRect()] : []),
-    ...(hovering && pet.classList.contains('expanded') ? [panel.getBoundingClientRect()] : [])]);
+    ...(pet.classList.contains('expanded') ? [
+      list.getBoundingClientRect(),
+      $('activity-stack').getBoundingClientRect(),
+      $('first-awake').getBoundingClientRect(),
+    ] : []),
+  ]);
   const release = () => {
     clearTimeout(releaseTimer);
-    hovering = false; pet.classList.remove('hovering');
+    pet.classList.remove('hovering');
     if (passthrough !== true) { passthrough = true; run(() => native.window('passthrough', true)); }
   };
   document.addEventListener('mousemove', event => {
     if (drag) return;
     const overContent = anchor().some(rect => inside(rect, event.clientX, event.clientY));
-    const overControl = Boolean(event.target.closest?.('button,input,textarea,#panel'));
+    const overControl = Boolean(event.target.closest?.('button,#activity-list,#first-awake,#activity-stack,#feedback'));
     if (overContent || overControl) {
       clearTimeout(releaseTimer);
-      if (!hovering) { hovering = true; pet.classList.add('hovering'); }
+      pet.classList.add('hovering');
       if (passthrough !== false) { passthrough = false; run(() => native.window('passthrough', false)); }
       return;
     }
@@ -875,16 +469,12 @@ if (native) {
   passthrough = true; run(() => native.window('passthrough', true));
 } else {
   document.body.classList.add('preview');
-  pet.dataset.panelOrder = 'controls-first';
-  pet.classList.add('activities-open');
-  activitiesButton.setAttribute('aria-pressed', 'true');
-  activitiesButton.setAttribute('aria-label', '收起活动');
+  pet.dataset.panelOrder = 'below';
+  setActivitiesOpen(true);
 }
-renderQuote();
 run(poll);
 const timer = setInterval(() => run(poll), 3500);
 window.addEventListener('beforeunload', () => {
-  voiceConversation = false; voiceEpoch++; voiceSessionId = undefined; window.speechSynthesis?.cancel();
-  clearInterval(timer); clearTimeout(noticeTimer); clearTimeout(recordingTimer);
-  mediaStream?.getTracks().forEach(track => track.stop());
+  clearInterval(timer);
+  clearTimeout(noticeTimer);
 });

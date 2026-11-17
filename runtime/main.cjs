@@ -12,7 +12,6 @@ const { createNotch } = require('./notch.cjs');
 const { layoutPet } = require('./placement.cjs');
 const { ConnectorRegistry } = require('../connectors/registry.cjs');
 const { CATALOG_BY_ID } = require('../connectors/catalog.cjs');
-const { LocalSpeech } = require('./local-speech.cjs');
 const { AutoStartManager } = require('./autostart.cjs');
 const { jumpToSession } = require('./session-jump.cjs');
 
@@ -37,7 +36,6 @@ mkdirSync(dataDir, { recursive: true, mode: 0o700 });
 app.setPath('userData', path.join(dataDir, 'electron'));
 
 const registry = new ConnectorRegistry({ rootDir: path.dirname(__dirname), dataDir });
-const localSpeech = new LocalSpeech({ rootDir: path.dirname(__dirname) });
 const autoStart = new AutoStartManager({ rootDir: path.dirname(__dirname) });
 const providers = new Providers(dataDir, { endpoint, token }, { enabledProviders: registry.enabledIds() });
 
@@ -90,10 +88,10 @@ function positionPet(position) {
 
 function currentPosition() { return placement.position; }
 
-function showPet(focusQuickChat = false) {
+function showPet({ openNotices = false } = {}) {
   settings.hidden = false;
-  if (focusQuickChat) { win.show(); win.focus(); } else win.showInactive();
-  win.webContents.send('companion:mode', { ...mode(), notice: true, focusQuickChat });
+  win.showInactive();
+  win.webContents.send('companion:mode', { ...mode(), notice: true, openNotices });
   save(); notch?.send();
 }
 
@@ -155,7 +153,6 @@ function menuTemplate() {
       label: `${Math.round(value * 100)}%`, type: 'radio', checked: Math.abs(petScale() - value) < .01,
       click: () => setPetScale(value),
     })) },
-    { label: '仅显示控制条', type: 'checkbox', checked: Boolean(settings.controlOnly), click: () => setControlOnly(!settings.controlOnly) },
     { label: '重置位置', click: resetPosition },
     { label: '隐藏小鑫', click: hidePet },
     {
@@ -211,10 +208,6 @@ function isDshOnline() {
   return Boolean(providers.snapshot?.sources?.find(row => row.id === 'dsh')?.connected);
 }
 
-const DSH_INTERACTIVE_ACTIONS = new Set([
-  'create', 'prompt', 'conversation', 'cancel', 'models', 'selectModel', 'skills', 'files',
-]);
-
 async function jumpForAction(body) {
   const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
   const items = providers.snapshot?.items || [];
@@ -251,48 +244,22 @@ async function agentAction(body) {
   }
   if (body.action === 'info') {
     let dshConnected = isDshOnline();
-    let dshSpeech = false;
     if (['dsh', 'auto'].includes(settings.source) || dshConnected) {
       try {
-        const info = await rpc(body);
+        await rpc(body);
         dshConnected = true;
-        dshSpeech = Boolean(info?.speechAvailable);
       } catch {}
     }
     return {
       connected: dshConnected,
       dshConnected,
-      speechAvailable: Boolean(dshSpeech || (dshConnected && localSpeech.hasRecognizer())),
       source: settings.source,
     };
-  }
-  if (body.action === 'speak') return localSpeech.speak(body.text);
-  if (body.action === 'speak-stop') { localSpeech.stopSpeaking(); return { stopped: true }; }
-  if (body.action === 'hear') {
-    try {
-      const info = await rpc({ action: 'info' });
-      if (info?.speechAvailable) return await rpc(body);
-    } catch {}
-    return localSpeech.transcribeWave(body.audio, typeof body.locale === 'string' ? body.locale : 'zh-CN');
   }
   if (['focus', 'home'].includes(body.action)) {
     return jumpForAction(body);
   }
-
-  const sessionId = String(body.sessionId || '');
-  const prefixIdx = sessionId.indexOf(':');
-  const sessionProvider = prefixIdx > 0 ? sessionId.slice(0, prefixIdx) : '';
-  if (sessionProvider && isReadOnlyConnector(sessionProvider)) {
-    throw new Error(`请在 ${CATALOG_BY_ID[sessionProvider].label} 中继续此任务`);
-  }
-  if (!sessionId && isReadOnlyConnector(settings.source)) {
-    throw new Error(`请在 ${CATALOG_BY_ID[settings.source].label} 中新建任务`);
-  }
-  if (DSH_INTERACTIVE_ACTIONS.has(body.action)) {
-    const rawId = sessionId.startsWith('dsh:') ? sessionId.slice(4) : sessionId;
-    return rpc(rawId && rawId !== sessionId ? { ...body, sessionId: rawId } : body);
-  }
-  return rpc(body);
+  throw new Error('不支持的操作');
 }
 
 function applyDesktop(command, value) {
@@ -422,7 +389,7 @@ ipcMain.handle('companion:connectors', async (event, body) => {
 
 ipcMain.handle('companion:action', async (event, body) => {
   trusted(event);
-  if (!body || !['list', 'focus', 'home', 'info', 'create', 'prompt', 'cancel', 'models', 'selectModel', 'skills', 'files', 'hear', 'speak', 'speak-stop', 'conversation'].includes(body.action)) {
+  if (!body || !['list', 'focus', 'home', 'info'].includes(body.action)) {
     throw new Error('不支持的操作');
   }
   return agentAction(body);
@@ -471,8 +438,8 @@ app.whenReady().then(async () => {
   win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   win.webContents.on('will-navigate', event => event.preventDefault());
-  win.webContents.session.setPermissionRequestHandler((_contents, permission, callback, details) => {
-    callback(permission === 'media' && details?.mediaTypes?.includes('audio') === true);
+  win.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => {
+    callback(false);
   });
   win.webContents.on('render-process-gone', () => { process.stderr.write('[companion] 桌宠渲染进程已退出\n'); app.quit(); });
   win.on('close', event => { if (!quitting) { event.preventDefault(); hidePet(); } });
@@ -527,7 +494,7 @@ app.whenReady().then(async () => {
   }, 1500);
 
   const shortcut = process.env.DSH_COMPANION_SHORTCUT || 'Alt+Space';
-  const shortcutOk = globalShortcut.register(shortcut, () => showPet(isDshOnline()));
+  const shortcutOk = globalShortcut.register(shortcut, () => showPet({ openNotices: true }));
   writeFileSync(path.join(dataDir, 'desktop-runtime.json'), JSON.stringify({ pid: process.pid, hostPid, shortcut, shortcutRegistered: shortcutOk, ready: true, mode: 'multi-agent', project: path.dirname(__dirname) }), { mode: 0o600 });
   process.stdout.write('[companion] pet ready\n');
 
@@ -555,7 +522,6 @@ process.on('message', message => {
 
 app.on('before-quit', () => {
   quitting = true;
-  localSpeech.stopSpeaking();
   clearInterval(dragTimer);
   clearInterval(refreshTimer);
   commandServer?.close();

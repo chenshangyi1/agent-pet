@@ -60,8 +60,9 @@ test('超过冷却窗口的历史 StopFailure 不再长期作为未读失败告�
   const uiJs = await readFile(new URL('../runtime/ui.js', import.meta.url), 'utf8');
   assert.equal(uiCss.includes('#pet.expanded.show #activity-list'), false);
   assert.ok(uiCss.includes('#pet:not(.activities-open) #activity-list'));
-  assert.match(uiJs, /composeButton\.addEventListener\('click'[\s\S]*?pet\.classList\.remove\('show'\)/);
-  assert.match(uiJs, /activitiesButton\.addEventListener\('click'[\s\S]*?setActivitiesOpen\(!currentlyShowing\)/);
+  assert.match(uiJs, /character\.addEventListener\('click'[\s\S]*?setActivitiesOpen\(!pet\.classList\.contains\('activities-open'\)\)/);
+  assert.equal(uiJs.includes('composeButton'), false);
+  assert.equal(uiJs.includes('voiceButton'), false);
   assert.match(uiJs, /const key = readyKey\(item\);\s*if \(dismissed\.has\(key\)\)/);
 });
 test('并发真实 hook 进程只保存必要元数据，独立运行时仍读取 WorkBuddy', async t => {
