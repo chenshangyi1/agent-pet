@@ -25,6 +25,13 @@ def save_json(target, value):
     os.replace(temporary, target)
 
 
+APP_NAME = 'Agent Pet'
+APP_DISPLAY_NAME = '小鑫'
+APP_EXEC_NAME = 'AgentPet'
+APP_BUNDLE_ID = 'local.chenmingxin.agent-pet'
+APP_VERSION = '0.3.0'
+
+
 def resolve_electron():
     override = os.environ.get('AGENT_PET_ELECTRON', '').strip()
     if override:
@@ -37,15 +44,33 @@ def resolve_electron():
 
     which_electron = shutil.which('electron')
     candidates = [
-        root / 'node_modules/.bin/electron',
         root / 'node_modules/electron/dist/Electron.app/Contents/MacOS/Electron',
         Path('/Applications/Electron.app/Contents/MacOS/Electron'),
+        root / 'node_modules/.bin/electron',
         Path(which_electron) if which_electron else None,
         user / '.dsh/electron/Electron.app/Contents/MacOS/Electron',
     ]
     for candidate in candidates:
         if candidate and candidate.is_file():
             return candidate
+    return None
+
+
+def resolve_electron_bundle(electron):
+    if electron is None:
+        return None
+    probe_paths = [electron]
+    if electron.is_symlink():
+        probe_paths.append(electron.resolve())
+    for candidate in probe_paths:
+        if (
+            candidate.parent.name == 'MacOS'
+            and candidate.parent.parent.name == 'Contents'
+            and candidate.parent.parent.parent.name.endswith('.app')
+        ):
+            bundle_dir = candidate.parent.parent.parent
+            if (bundle_dir / 'Contents/Info.plist').is_file():
+                return bundle_dir, candidate.name
     return None
 
 
@@ -71,14 +96,183 @@ def install_dsh_profile():
     return True
 
 
-def install_app():
-    app = user / 'Applications/Agent Pet.app'
-    if app.exists():
-        shutil.copytree(app, backup / 'Agent Pet.app', symlinks=True)
+def _remove_path(target):
+    if target.is_symlink() or target.is_file():
+        target.unlink()
+    elif target.exists():
+        shutil.rmtree(target)
+
+
+def _load_plist(path):
+    if not path.is_file():
+        return {}
+    with path.open('rb') as stream:
+        data_dict = plistlib.load(stream)
+    return data_dict if isinstance(data_dict, dict) else {}
+
+
+def _write_plist(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('wb') as stream:
+        plistlib.dump(payload, stream)
+
+
+def _is_macho(path):
+    if not path.is_file():
+        return False
+    try:
+        header = path.read_bytes()[:4]
+    except OSError:
+        return False
+    return header in (
+        b'\xfe\xed\xfa\xce',
+        b'\xce\xfa\xed\xfe',
+        b'\xfe\xed\xfa\xcf',
+        b'\xcf\xfa\xed\xfe',
+        b'\xca\xfe\xba\xbe',
+        b'\xbe\xba\xfe\xca',
+    )
+
+
+def _copy_app_icon(app_dir, info_plist):
+    icon_src = root / 'assets/agent-pet.icns'
+    if not icon_src.is_file():
+        return
+    resources = app_dir / 'Contents/Resources'
+    resources.mkdir(parents=True, exist_ok=True)
+    old_icon = resources / 'electron.icns'
+    if old_icon.exists():
+        old_icon.unlink()
+    shutil.copy2(icon_src, resources / 'agent-pet.icns')
+    info_plist['CFBundleIconFile'] = 'agent-pet.icns'
+    info_plist.pop('CFBundleIconName', None)
+
+
+def _rebrand_helpers(stage):
+    frameworks = stage / 'Contents/Frameworks'
+    if not frameworks.is_dir():
+        return
+    for helper_app in sorted(frameworks.glob('*.app')):
+        plist_path = helper_app / 'Contents/Info.plist'
+        helper_plist = _load_plist(plist_path)
+        old_id = str(helper_plist.get('CFBundleIdentifier') or '')
+        is_electron_helper = helper_app.name.startswith('Electron Helper')
+        if not is_electron_helper and not old_id.startswith('com.github.Electron'):
+            continue
+
+        suffix = helper_app.name[len('Electron Helper'):-len('.app')] if is_electron_helper else ''
+        new_base = f'{APP_NAME} Helper{suffix}' if is_electron_helper else helper_app.stem
+        old_exec = str(helper_plist.get('CFBundleExecutable') or helper_app.stem)
+        macos_dir = helper_app / 'Contents/MacOS'
+        src_exec = macos_dir / old_exec
+        dst_exec = macos_dir / new_base
+        if src_exec.exists() and src_exec != dst_exec:
+            if dst_exec.exists():
+                dst_exec.unlink()
+            src_exec.rename(dst_exec)
+        if dst_exec.exists():
+            dst_exec.chmod(0o755)
+
+        helper_plist.update({
+            'CFBundleIdentifier': f'{APP_BUNDLE_ID}.helper',
+            'CFBundleName': new_base,
+            'CFBundleDisplayName': new_base,
+            'CFBundleExecutable': new_base,
+            'CFBundlePackageType': 'APPL',
+            'LSUIElement': True,
+        })
+        _write_plist(plist_path, helper_plist)
+
+        if is_electron_helper:
+            new_helper_app = helper_app.with_name(f'{new_base}.app')
+            if new_helper_app != helper_app:
+                _remove_path(new_helper_app)
+                helper_app.rename(new_helper_app)
+
+
+def _sign_if_native(app_dir, main_exec):
+    codesign = Path('/usr/bin/codesign')
+    if not codesign.is_file() or not _is_macho(main_exec):
+        return
+    subprocess.run([str(codesign), '--force', '--deep', '--sign', '-', str(app_dir)], check=True)
+
+
+def _refresh_launch_services(app_dir):
+    # Skip touching global LaunchServices during isolated tests overriding install targets.
+    if os.environ.get('AGENT_PET_ELECTRON') or os.environ.get('AGENT_PET_DATA'):
+        return
+    lsregister = Path('/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister')
+    if lsregister.is_file():
+        subprocess.run([str(lsregister), '-f', str(app_dir)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _install_branded_app(app, src_bundle, src_exec_name):
+    app.parent.mkdir(parents=True, exist_ok=True)
+    stage = app.parent / f'.{app.name}.agent-pet-staging-{os.getpid()}'
+    _remove_path(stage)
+    try:
+        shutil.copytree(src_bundle, stage, symlinks=True)
+
+        src_exec = stage / 'Contents/MacOS' / src_exec_name
+        dst_exec = stage / 'Contents/MacOS' / APP_EXEC_NAME
+        if src_exec.exists() and src_exec != dst_exec:
+            if dst_exec.exists():
+                dst_exec.unlink()
+            src_exec.rename(dst_exec)
+        dst_exec.chmod(0o755)
+
+        plist_path = stage / 'Contents/Info.plist'
+        info = _load_plist(plist_path)
+        info.pop('ElectronAsarIntegrity', None)
+        info.update({
+            'CFBundleName': APP_NAME,
+            'CFBundleDisplayName': APP_DISPLAY_NAME,
+            'CFBundleExecutable': APP_EXEC_NAME,
+            'CFBundleIdentifier': APP_BUNDLE_ID,
+            'CFBundleShortVersionString': APP_VERSION,
+            'CFBundleVersion': APP_VERSION,
+            'CFBundlePackageType': 'APPL',
+            'LSUIElement': True,
+            'NSMicrophoneUsageDescription': '用于桌宠小鑫的语音输入',
+            'NSSpeechRecognitionUsageDescription': '用于桌宠小鑫识别你的语音并与 AI 对话',
+        })
+        _copy_app_icon(stage, info)
+        _write_plist(plist_path, info)
+
+        _rebrand_helpers(stage)
+
+        resources = stage / 'Contents/Resources'
+        resources.mkdir(parents=True, exist_ok=True)
+        for stale in ('default_app.asar', 'app.asar', 'app'):
+            _remove_path(resources / stale)
+
+        app_code = resources / 'app'
+        app_code.mkdir(parents=True, exist_ok=True)
+        (app_code / 'package.json').write_text(
+            json.dumps({'name': 'agent-pet', 'version': APP_VERSION, 'main': 'main.js'}, indent=2) + '\n'
+        )
+        runtime_main = str(root / 'runtime/main.cjs')
+        (app_code / 'main.js').write_text(
+            "'use strict';\n"
+            'delete process.env.ELECTRON_RUN_AS_NODE;\n'
+            f'process.env.AGENT_PET_ROOT = {json.dumps(str(root))};\n'
+            f'require({json.dumps(runtime_main)});\n'
+        )
+
+        _sign_if_native(stage, dst_exec)
+
+        _remove_path(app)
+        stage.rename(app)
+    finally:
+        _remove_path(stage)
+
+
+def _install_shell_launcher(app, electron):
+    if (app / 'Contents/Frameworks').exists():
+        _remove_path(app)
     macos = app / 'Contents/MacOS'
     macos.mkdir(parents=True, exist_ok=True)
-    electron = resolve_electron()
-    launcher = macos / 'AgentPet'
+    launcher = macos / APP_EXEC_NAME
     main_script = shlex.quote(str(root / 'runtime/main.cjs'))
     if electron is not None:
         launcher.write_text(
@@ -92,9 +286,9 @@ def install_app():
             'unset ELECTRON_RUN_AS_NODE',
             'for bin in \\',
             '  "$AGENT_PET_ELECTRON" \\',
-            f'  {shlex.quote(str(root / "node_modules/.bin/electron"))} \\',
             f'  {shlex.quote(str(root / "node_modules/electron/dist/Electron.app/Contents/MacOS/Electron"))} \\',
             '  "/Applications/Electron.app/Contents/MacOS/Electron" \\',
+            f'  {shlex.quote(str(root / "node_modules/.bin/electron"))} \\',
             '  "$(command -v electron 2>/dev/null)" \\',
             '  "$HOME/.dsh/electron/Electron.app/Contents/MacOS/Electron"; do',
             '  if [ -n "$bin" ] && [ -x "$bin" ]; then',
@@ -107,18 +301,34 @@ def install_app():
         ]
         launcher.write_text('\n'.join(fallback_lines))
     launcher.chmod(0o755)
-    with (app / 'Contents/Info.plist').open('wb') as stream:
-        plistlib.dump({
-            'CFBundleName': 'Agent Pet',
-            'CFBundleDisplayName': 'Agent Pet',
-            'CFBundleExecutable': 'AgentPet',
-            'CFBundleIdentifier': 'local.chenmingxin.agent-pet',
-            'CFBundleVersion': '0.3.0',
-            'CFBundlePackageType': 'APPL',
-            'LSUIElement': True,
-            'NSMicrophoneUsageDescription': '用于桌宠小鑫的语音输入',
-            'NSSpeechRecognitionUsageDescription': '用于桌宠小鑫识别你的语音并与 AI 对话',
-        }, stream)
+    info = {
+        'CFBundleName': APP_NAME,
+        'CFBundleDisplayName': APP_DISPLAY_NAME,
+        'CFBundleExecutable': APP_EXEC_NAME,
+        'CFBundleIdentifier': APP_BUNDLE_ID,
+        'CFBundleShortVersionString': APP_VERSION,
+        'CFBundleVersion': APP_VERSION,
+        'CFBundlePackageType': 'APPL',
+        'LSUIElement': True,
+        'NSMicrophoneUsageDescription': '用于桌宠小鑫的语音输入',
+        'NSSpeechRecognitionUsageDescription': '用于桌宠小鑫识别你的语音并与 AI 对话',
+    }
+    _copy_app_icon(app, info)
+    _write_plist(app / 'Contents/Info.plist', info)
+
+
+def install_app():
+    app = user / 'Applications/Agent Pet.app'
+    if app.exists():
+        shutil.copytree(app, backup / 'Agent Pet.app', symlinks=True)
+    electron = resolve_electron()
+    bundle = resolve_electron_bundle(electron)
+    if bundle is not None:
+        src_bundle, src_exec_name = bundle
+        _install_branded_app(app, src_bundle, src_exec_name)
+    else:
+        _install_shell_launcher(app, electron)
+    _refresh_launch_services(app)
     return electron
 
 

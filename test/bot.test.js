@@ -1473,6 +1473,115 @@ test('独立运行 WebM 动画资产、Manager UI DOM/CSP 契约及无 ~/.dsh �
   assert.match(startRes.stderr, /无法找到 Electron 运行时/);
 });
 
+test('scripts/install.py builds self-contained branded .app when Electron.app bundle is provided', async (t) => {
+  const { lstat, readlink } = await import('node:fs/promises');
+  const tempRoot = await mkdtemp(join(tmpdir(), 'agent-pet-branded-app-'));
+  t.after(() => rm(tempRoot, { recursive: true, force: true }));
+
+  const fakeHome = join(tempRoot, 'home');
+  const fakeData = join(tempRoot, 'pet-data');
+  const srcBundle = join(tempRoot, 'FakeElectron.app');
+  await mkdir(join(srcBundle, 'Contents/MacOS'), { recursive: true });
+  await mkdir(join(srcBundle, 'Contents/Resources'), { recursive: true });
+  await mkdir(join(srcBundle, 'Contents/Frameworks/Electron Helper.app/Contents/MacOS'), { recursive: true });
+  await mkdir(join(srcBundle, 'Contents/Frameworks/Electron Framework.framework/Versions/A'), { recursive: true });
+  await mkdir(fakeHome, { recursive: true });
+
+  const srcExec = join(srcBundle, 'Contents/MacOS/Electron');
+  await writeFile(srcExec, '#!/bin/sh\nexit 0\n', 'utf8');
+  await chmod(srcExec, 0o755);
+  await writeFile(join(srcBundle, 'Contents/Resources/default_app.asar'), 'dummy', 'utf8');
+  await writeFile(join(srcBundle, 'Contents/Resources/electron.icns'), 'dummy', 'utf8');
+  const srcHelperExec = join(srcBundle, 'Contents/Frameworks/Electron Helper.app/Contents/MacOS/Electron Helper');
+  await writeFile(srcHelperExec, '#!/bin/sh\nexit 0\n', 'utf8');
+  await chmod(srcHelperExec, 0o755);
+  await writeFile(join(srcBundle, 'Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework'), 'dummy', 'utf8');
+  await symlink('A', join(srcBundle, 'Contents/Frameworks/Electron Framework.framework/Versions/Current'));
+
+  const seedRes = spawnSync('python3', [
+    '-c',
+    `import plistlib, pathlib
+b = pathlib.Path(${JSON.stringify(srcBundle)})
+with (b / 'Contents/Info.plist').open('wb') as f:
+    plistlib.dump({
+        'CFBundleIdentifier': 'com.github.Electron',
+        'CFBundleName': 'Electron',
+        'CFBundleExecutable': 'Electron',
+        'CFBundleIconFile': 'electron.icns',
+        'ElectronAsarIntegrity': {'Resources/default_app.asar': {'algorithm': 'SHA256', 'hash': 'abc'}},
+    }, f)
+with (b / 'Contents/Frameworks/Electron Helper.app/Contents/Info.plist').open('wb') as f:
+    plistlib.dump({
+        'CFBundleIdentifier': 'com.github.Electron.helper',
+        'CFBundleName': 'Electron Helper',
+        'CFBundlePackageType': 'APPL',
+        'LSUIElement': True,
+    }, f)
+`,
+  ], { encoding: 'utf8' });
+  assert.equal(seedRes.status, 0, seedRes.stderr);
+
+  const installRes = spawnSync('python3', [join(ROOT_DIR, 'scripts/install.py')], {
+    cwd: ROOT_DIR,
+    env: {
+      ...process.env,
+      HOME: fakeHome,
+      AGENT_PET_DATA: fakeData,
+      AGENT_PET_ELECTRON: srcExec,
+    },
+    encoding: 'utf8',
+  });
+  assert.equal(installRes.status, 0, installRes.stderr);
+
+  const installedApp = join(fakeHome, 'Applications/Agent Pet.app');
+  const brandedExec = join(installedApp, 'Contents/MacOS/AgentPet');
+  assert.equal(existsSync(brandedExec), true);
+  assert.equal((await stat(brandedExec)).mode & 0o111, 0o111);
+  assert.equal(existsSync(join(installedApp, 'Contents/MacOS/Electron')), false);
+  assert.equal(existsSync(join(installedApp, 'Contents/Resources/default_app.asar')), false);
+  assert.equal(existsSync(join(installedApp, 'Contents/Resources/electron.icns')), false);
+  assert.equal(existsSync(join(installedApp, 'Contents/Resources/agent-pet.icns')), true);
+
+  const appPkg = JSON.parse(await readFile(join(installedApp, 'Contents/Resources/app/package.json'), 'utf8'));
+  assert.equal(appPkg.main, 'main.js');
+  const appMain = await readFile(join(installedApp, 'Contents/Resources/app/main.js'), 'utf8');
+  assert.match(appMain, /delete process\.env\.ELECTRON_RUN_AS_NODE;/);
+  assert.ok(appMain.includes(join(ROOT_DIR, 'runtime/main.cjs')));
+
+  // Helper bundle & symlink preservation
+  assert.equal(existsSync(join(installedApp, 'Contents/Frameworks/Electron Helper.app')), false);
+  assert.equal(existsSync(join(installedApp, 'Contents/Frameworks/Agent Pet Helper.app/Contents/MacOS/Agent Pet Helper')), true);
+  const fwCurrent = join(installedApp, 'Contents/Frameworks/Electron Framework.framework/Versions/Current');
+  assert.equal((await lstat(fwCurrent)).isSymbolicLink(), true);
+  assert.equal(await readlink(fwCurrent), 'A');
+
+  const inspectRes = spawnSync('python3', [
+    '-c',
+    `import json, plistlib, pathlib
+app = pathlib.Path(${JSON.stringify(installedApp)})
+src = pathlib.Path(${JSON.stringify(srcBundle)})
+with (app / 'Contents/Info.plist').open('rb') as f: main_p = plistlib.load(f)
+with (app / 'Contents/Frameworks/Agent Pet Helper.app/Contents/Info.plist').open('rb') as f: helper_p = plistlib.load(f)
+with (src / 'Contents/Info.plist').open('rb') as f: src_p = plistlib.load(f)
+print(json.dumps({'main': main_p, 'helper': helper_p, 'src': src_p}, default=str))
+`,
+  ], { encoding: 'utf8' });
+  assert.equal(inspectRes.status, 0, inspectRes.stderr);
+  const parsed = JSON.parse(inspectRes.stdout);
+  assert.equal(parsed.main.CFBundleIdentifier, 'local.chenmingxin.agent-pet');
+  assert.equal(parsed.main.CFBundleName, 'Agent Pet');
+  assert.equal(parsed.main.CFBundleDisplayName, '小鑫');
+  assert.equal(parsed.main.CFBundleExecutable, 'AgentPet');
+  assert.equal(parsed.main.CFBundleIconFile, 'agent-pet.icns');
+  assert.equal(parsed.main.LSUIElement, true);
+  assert.equal('ElectronAsarIntegrity' in parsed.main, false);
+  assert.equal(parsed.helper.CFBundleIdentifier, 'local.chenmingxin.agent-pet.helper');
+  assert.equal(parsed.helper.CFBundleExecutable, 'Agent Pet Helper');
+  // Original Electron.app must remain untouched
+  assert.equal(parsed.src.CFBundleIdentifier, 'com.github.Electron');
+  assert.equal(existsSync(srcExec), true);
+});
+
 test('LocalChatBridge 会话创建、图片 base64 落盘与清理、多轮 --resume、列表/详情与取消', async t => {
   const rawDir = await mkdtemp(join(tmpdir(), 'agent-pet-local-chat-'));
   const dir = await realpath(rawDir);
