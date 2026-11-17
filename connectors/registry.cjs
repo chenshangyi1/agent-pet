@@ -456,7 +456,6 @@ class ConnectorRegistry {
       'agent-pet-observer': {
         SessionStart: [{ type: 'command', command: cmd, timeout: 3 }],
         PreInvocation: [{ type: 'command', command: cmd, timeout: 3 }],
-        PreToolUse: [{ matcher: '.*', hooks: [{ type: 'command', command: cmd, timeout: 3 }] }],
         PostToolUse: [{ matcher: '.*', hooks: [{ type: 'command', command: cmd, timeout: 3 }] }],
         PostInvocation: [{ type: 'command', command: cmd, timeout: 3 }],
         Stop: [{ type: 'command', command: cmd, timeout: 3 }],

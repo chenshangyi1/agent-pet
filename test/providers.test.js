@@ -727,9 +727,10 @@ test('系统 /usr/bin/python3 (3.9) 兼容 emit.py / workspaceUris 解码及 Ant
 
   const hooksJson = JSON.parse(await readFile(join(home, '.gemini/config/plugins/agent-pet/hooks.json'), 'utf8'));
   const observer = hooksJson['agent-pet-observer'];
-  assert.ok(Array.isArray(observer?.PreToolUse) && observer.PreToolUse[0].matcher === '.*');
-  assert.match(observer.PreToolUse[0].hooks[0].command, /connectors\/hooks\/emit\.py/);
+  assert.equal(observer?.PreToolUse, undefined);
+  assert.ok(Array.isArray(observer?.PreInvocation) && observer.PreInvocation[0].type === 'command');
   assert.ok(Array.isArray(observer?.PostToolUse) && observer.PostToolUse[0].matcher === '.*');
+  assert.match(observer.PostToolUse[0].hooks[0].command, /connectors\/hooks\/emit\.py/);
   assert.ok(Array.isArray(observer?.StopFailure) && observer.StopFailure[0].type === 'command');
   assert.match(observer.StopFailure[0].command, /--provider antigravity --format antigravity/);
 
