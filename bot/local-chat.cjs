@@ -26,11 +26,12 @@ const PROVIDER_LABELS = {
   claude: 'Claude Code',
   codex: 'Codex',
   opencode: 'OpenCode',
+  'workbuddy-ai': 'WorkBuddy AI',
   dsh: 'DSH',
 };
 
-const DIRECT_ENGINES = new Set(['claude', 'codex', 'opencode']);
-const VALID_ENGINES = new Set(['claude', 'codex', 'opencode', 'dsh']);
+const DIRECT_ENGINES = new Set(['claude', 'codex', 'opencode', 'workbuddy-ai']);
+const VALID_ENGINES = new Set(['claude', 'codex', 'opencode', 'workbuddy-ai', 'dsh']);
 const MAX_DISCOVER_FILES = 15;
 const MAX_DISCOVER_WORKSPACES = 12;
 const MAX_DISCOVER_SESSIONS = 10;
@@ -441,7 +442,7 @@ function getProviderLabel(id) {
 function stripInlineAgentPrefix(rawText) {
   const text = typeof rawText === 'string' ? rawText.trim() : '';
   if (!text) return { text: '', inlineEngine: null };
-  const match = text.match(/^@(claude|codex|opencode|dsh)(?:\s+([\s\S]*))?$/i);
+  const match = text.match(/^@(claude|codex|opencode|workbuddy-ai|dsh)(?:\s+([\s\S]*))?$/i);
   if (!match) return { text, inlineEngine: null };
   return {
     text: String(match[2] || '').trim(),
@@ -1613,6 +1614,7 @@ class LocalChatBridge {
     if (probes.claude?.available) return 'claude';
     if (probes.codex?.available) return 'codex';
     if (probes.opencode?.available) return 'opencode';
+    if (probes['workbuddy-ai']?.available) return 'workbuddy-ai';
     return 'claude';
   }
 
@@ -1650,6 +1652,7 @@ class LocalChatBridge {
       updatedAt: Date.now(),
       lastSeq: 0,
       activeJobId: null,
+      streamingText: '',
       messages: [],
     };
     this.sessions.set(canonicalId, session);
@@ -1846,6 +1849,7 @@ class LocalChatBridge {
       if (filter !== 'auto' && s.provider !== filter) continue;
       out.push({
         sessionId: s.sessionId,
+        cliSessionId: s.cliSessionId || null,
         provider: s.provider,
         providerLabel: s.providerLabel,
         title: s.title,
@@ -2051,13 +2055,24 @@ class LocalChatBridge {
         throw new Error('未找到对应的本地会话');
       }
       session.unread = false;
+      const messages = session.messages.map(m => ({ ...m }));
+      if (session.status === 'running' && session.streamingText) {
+        messages.push({
+          id: `streaming:${session.sessionId}`,
+          seq: session.lastSeq,
+          role: 'assistant',
+          text: session.streamingText,
+          createdAt: session.updatedAt,
+          streaming: true,
+        });
+      }
       return {
         sessionId: session.sessionId,
         title: session.title,
         status: session.status,
         detail: session.detail,
         lastSeq: session.lastSeq,
-        messages: session.messages.map(m => ({ ...m })),
+        messages,
       };
     }
 
@@ -2076,6 +2091,7 @@ class LocalChatBridge {
         await this.dispatcher.stopJob(session.activeJobId).catch(() => {});
       }
       session.activeJobId = null;
+      session.streamingText = '';
       session.status = 'cancelled';
       session.statusText = '已取消';
       session.detail = '任务已取消';
@@ -2130,6 +2146,7 @@ class LocalChatBridge {
       session.status = 'running';
       session.statusText = '正在思考';
       session.detail = '正在思考';
+      session.streamingText = '';
       session.unread = false;
       session.updatedAt = Date.now();
       this.onUpdate?.({ type: 'chat', sessionId: session.sessionId, status: session.status });
@@ -2144,8 +2161,16 @@ class LocalChatBridge {
         images,
         onProgress: ev => {
           if (session.status !== 'running') return;
+          const liveDelta = typeof ev?.deltaText === 'string' ? ev.deltaText.trim() : '';
           if (ev?.tool) {
             session.detail = `正在使用 ${ev.tool}`;
+            session.lastSeq += 1;
+            session.updatedAt = Date.now();
+            this.onUpdate?.({ type: 'chat', sessionId: session.sessionId, status: session.status });
+          } else if (liveDelta) {
+            session.streamingText = liveDelta;
+            const singleLine = liveDelta.replace(/\s+/g, ' ').trim();
+            session.detail = `💬 ${singleLine.length > 76 ? `…${singleLine.slice(-76)}` : singleLine}`;
             session.lastSeq += 1;
             session.updatedAt = Date.now();
             this.onUpdate?.({ type: 'chat', sessionId: session.sessionId, status: session.status });
@@ -2168,6 +2193,7 @@ class LocalChatBridge {
       runPromise
         .then(res => {
           session.activeJobId = null;
+          session.streamingText = '';
           if (res?.sessionId) {
             session.cliSessionId = res.sessionId;
             this.sessionAliases.set(res.sessionId, session.sessionId);
@@ -2218,6 +2244,7 @@ class LocalChatBridge {
         })
         .catch(err => {
           session.activeJobId = null;
+          session.streamingText = '';
           if (session.status === 'cancelled') return;
           const errMsg = err?.message || String(err);
           session.lastSeq += 1;

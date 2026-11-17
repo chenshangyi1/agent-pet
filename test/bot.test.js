@@ -29,6 +29,7 @@ const {
   TaskDispatcher,
   parseClaudeStreamLine,
   parseCodexJsonLine,
+  parseOpencodeJsonLine,
   sanitizeWorkspace,
   mirrorInboxEvent,
 } = require('../bot/dispatcher.cjs');
@@ -2967,4 +2968,150 @@ test('LocalChatBridge 跨 Agent 工作区隔离、workspaces 返回 homeDir/sugg
 
   const filesDefault = await bridge.handleAction({ action: 'files', query: 'marker' }, 'auto');
   assert.deepEqual(filesDefault.candidates.map(f => f.path), ['claude-marker.ts']);
+});
+
+test('WorkBuddy AI 与 OpenCode 直连后台流式派活、token 增量传输与会话续接', async t => {
+  const rawDir = await mkdtemp(join(tmpdir(), 'agent-pet-direct-stream-'));
+  const dir = await realpath(rawDir);
+  t.after(() => rm(rawDir, { recursive: true, force: true }));
+
+  const dataDir = join(dir, 'data');
+  const workDir = join(dir, 'work');
+  await mkdir(dataDir, { recursive: true });
+  await mkdir(workDir, { recursive: true });
+
+  const mockWai = await makeMockExecutable(
+    join(dir, 'mock-wai'),
+    `
+const fs = require('node:fs');
+const path = require('node:path');
+const args = process.argv.slice(2);
+const rIdx = args.indexOf('--resume');
+const sid = rIdx >= 0 ? args[rIdx + 1] : 'wai-ses-1';
+console.log(JSON.stringify({ type: 'system', subtype: 'init', session_id: sid }));
+console.log(JSON.stringify({ type: 'stream_event', session_id: sid, event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '正在' } } }));
+console.log(JSON.stringify({ type: 'stream_event', session_id: sid, event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '分析中' } } }));
+const finish = () => {
+  console.log(JSON.stringify({ type: 'assistant', session_id: sid, message: { content: [{ type: 'tool_use', id: 'tu-1', name: 'Read' }] } }));
+  console.log(JSON.stringify({ type: 'result', subtype: 'success', session_id: sid, result: rIdx >= 0 ? '续聊完成' : '分析完成' }));
+  process.exit(0);
+};
+const gateFile = ${JSON.stringify(join(dir, 'wai-finish.flag'))};
+const poll = setInterval(() => {
+  if (fs.existsSync(gateFile)) {
+    clearInterval(poll);
+    finish();
+  }
+}, 20);
+`,
+  );
+
+  const mockOpencode = await makeMockExecutable(
+    join(dir, 'mock-opencode'),
+    `
+const args = process.argv.slice(2);
+const sIdx = args.indexOf('-s');
+const sid = sIdx >= 0 ? args[sIdx + 1] : 'ses_oc_1';
+console.log(JSON.stringify({ type: 'step_start', sessionID: sid }));
+console.log(JSON.stringify({ type: 'tool_use', sessionID: sid, part: { type: 'tool', callID: 'c1', tool: 'bash', state: { status: 'running' } } }));
+console.log(JSON.stringify({ type: 'text', sessionID: sid, part: { type: 'text', text: 'OpenCode ' } }));
+console.log(JSON.stringify({ type: 'text', sessionID: sid, part: { type: 'text', text: '就绪' } }));
+console.log(JSON.stringify({ type: 'step_finish', sessionID: sid, part: { reason: 'stop' } }));
+`,
+  );
+
+  const prevWai = process.env.WORKBUDDY_AI_BIN;
+  const prevOc = process.env.OPENCODE_BIN;
+  process.env.WORKBUDDY_AI_BIN = mockWai;
+  process.env.OPENCODE_BIN = mockOpencode;
+  t.after(() => {
+    if (prevWai === undefined) delete process.env.WORKBUDDY_AI_BIN;
+    else process.env.WORKBUDDY_AI_BIN = prevWai;
+    if (prevOc === undefined) delete process.env.OPENCODE_BIN;
+    else process.env.OPENCODE_BIN = prevOc;
+  });
+
+  // 1. Line parser coverage for stream_event deltaText and OpenCode JSON lines
+  const parsedDelta = parseClaudeStreamLine(JSON.stringify({
+    type: 'stream_event',
+    session_id: 's1',
+    event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'chunk' } },
+  }));
+  assert.equal(parsedDelta.deltaText, 'chunk');
+  const parsedOc = parseOpencodeJsonLine(JSON.stringify({
+    type: 'tool_use',
+    sessionID: 'ses_1',
+    part: { type: 'tool', callID: 'c1', tool: 'read', state: { status: 'running' } },
+  }));
+  assert.equal(parsedOc.sessionId, 'ses_1');
+  assert.equal(parsedOc.tool, 'read');
+
+  // 2. LocalChatBridge real-time streaming conversation + detail updates
+  const providers = new Providers(dataDir, {}, { enabledProviders: ['dsh', 'workbuddy-ai', 'opencode'] });
+  const dispatcher = new TaskDispatcher({
+    dataDir,
+    providers,
+    allowedWorkspaces: [dir],
+    defaultCwd: workDir,
+  });
+  const probes = dispatcher.probeEngines();
+  assert.equal(probes['workbuddy-ai'].available, true);
+  assert.equal(probes.opencode.available, true);
+
+  const updates = [];
+  const bridge = new LocalChatBridge({
+    dispatcher,
+    getConfig: () => ({ defaultEngine: 'workbuddy-ai', defaultCwd: workDir }),
+    onUpdate: ev => updates.push(ev),
+  });
+
+  const created = await bridge.handleAction({ action: 'create', targetAgent: 'workbuddy-ai', cwd: workDir }, 'auto');
+  const started = await bridge.handleAction({
+    action: 'prompt',
+    sessionId: created.sessionId,
+    targetAgent: 'workbuddy-ai',
+    text: '你好',
+  }, 'auto');
+  assert.equal(started.status, 'running');
+
+  let streamObserved = false;
+  for (let i = 0; i < 60; i += 1) {
+    const midConv = await bridge.handleAction({ action: 'conversation', sessionId: created.sessionId }, 'auto');
+    if (midConv.status === 'running' && midConv.messages.some(m => m.streaming && m.text.includes('正在分析中'))) {
+      streamObserved = true;
+      break;
+    }
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  assert.equal(streamObserved, true, 'running session should expose live streamingText before completion');
+  await writeFile(join(dir, 'wai-finish.flag'), 'ok', 'utf8');
+
+  // Wait for completion
+  for (let i = 0; i < 30; i += 1) {
+    const conv = await bridge.handleAction({ action: 'conversation', sessionId: created.sessionId }, 'auto');
+    if (conv.status === 'ready') break;
+    await new Promise(resolve => setTimeout(resolve, 30));
+  }
+  const doneConv = await bridge.handleAction({ action: 'conversation', sessionId: created.sessionId }, 'auto');
+  assert.equal(doneConv.status, 'ready');
+  assert.equal(doneConv.messages.some(m => m.role === 'assistant' && m.text.includes('分析完成')), true);
+  assert.equal(doneConv.messages.some(m => m.streaming), false);
+  const listed = bridge.listSessions('auto').find(s => s.sessionId === created.sessionId);
+  assert.equal(listed.cliSessionId, 'wai-ses-1');
+  assert.ok(updates.length >= 2);
+
+  // 3. OpenCode --format json dispatch & sessionID capture
+  const ocRes = await dispatcher.dispatch({ engine: 'opencode', prompt: 'test oc', cwd: workDir });
+  assert.equal(ocRes.status, 'completed');
+  assert.equal(ocRes.sessionId, 'ses_oc_1');
+  assert.match(ocRes.text, /OpenCode[\s\S]*就绪/);
+  assert.deepEqual(ocRes.toolsUsed, ['bash']);
+
+  // 4. UI & preload streaming/launch-notice contract checks
+  const preloadSrc = await readFile(join(ROOT_DIR, 'runtime/preload.cjs'), 'utf8');
+  const uiJsSrc = await readFile(join(ROOT_DIR, 'runtime/ui.js'), 'utf8');
+  assert.match(preloadSrc, /companion:updated/);
+  assert.match(uiJsSrc, /native\.onUpdated/);
+  assert.match(uiJsSrc, /\[仅复制切窗\]/);
+  assert.match(uiJsSrc, /workbuddy-ai/);
 });

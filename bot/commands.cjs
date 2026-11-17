@@ -3,7 +3,7 @@
 const os = require('node:os');
 const { timingSafeEqual } = require('node:crypto');
 
-const VALID_ENGINES = new Set(['claude', 'codex', 'antigravity', 'dsh']);
+const VALID_ENGINES = new Set(['claude', 'codex', 'opencode', 'workbuddy-ai', 'antigravity', 'dsh']);
 const VALID_PET_COMMANDS = new Set(['show', 'hide', 'reset']);
 const MAX_REPLY_CHARS = 3200;
 
@@ -201,7 +201,7 @@ class CommandRouter {
     const probes = this.dispatcher?.probeEngines ? this.dispatcher.probeEngines() : {};
     const current = this._effectiveEngine(ctx);
     const lines = [`⚙️ 本机执行引擎检测（当前默认：${current}）：`];
-    for (const id of ['claude', 'codex', 'antigravity', 'dsh']) {
+    for (const id of ['claude', 'codex', 'opencode', 'workbuddy-ai', 'antigravity', 'dsh']) {
       const info = probes[id];
       if (!info) continue;
       if (info.available) {
@@ -378,7 +378,7 @@ class CommandRouter {
       if (!arg) {
         return this._sendReply(
           reply,
-          `⚙️ 当前默认引擎：${this._effectiveEngine(ctx)}（可选：claude、codex、antigravity、dsh）`,
+          `⚙️ 当前默认引擎：${this._effectiveEngine(ctx)}（可选：claude、codex、opencode、workbuddy-ai、antigravity、dsh）`,
           { handled: true }
         );
       }
@@ -386,7 +386,7 @@ class CommandRouter {
       if (!VALID_ENGINES.has(nextEngine)) {
         return this._sendReply(
           reply,
-          `❌ 不支持的引擎 "${arg}"，可选：claude、codex、antigravity、dsh`,
+          `❌ 不支持的引擎 "${arg}"，可选：claude、codex、opencode、workbuddy-ai、antigravity、dsh`,
           { handled: true }
         );
       }
@@ -501,8 +501,8 @@ class CommandRouter {
       }
     }
 
-    // 4. Direct engine dispatch commands: /claude, @claude, /codex, @codex, /antigravity, /agy, @antigravity, @agy, /dsh, @dsh, /run
-    const engineCmdMatch = raw.match(/^(?:\/|@)(claude|codex|antigravity|agy|dsh|run)(?:(?:\s+|[:：]\s*)([\s\S]*))?$/i);
+    // 4. Direct engine dispatch commands: /claude, @claude, /codex, @codex, /opencode, @opencode, /workbuddy-ai, @workbuddy-ai, /antigravity, /agy, @antigravity, @agy, /dsh, @dsh, /run
+    const engineCmdMatch = raw.match(/^(?:\/|@)(claude|codex|opencode|workbuddy-ai|antigravity|agy|dsh|run)(?:(?:\s+|[:：]\s*)([\s\S]*))?$/i);
     if (engineCmdMatch) {
       const rawCmd = engineCmdMatch[1].toLowerCase();
       const prompt = (engineCmdMatch[2] || '').trim()

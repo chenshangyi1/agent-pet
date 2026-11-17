@@ -147,7 +147,7 @@ function setSource(source) {
   settings.source = source;
   if (source !== 'auto' && CATALOG_BY_ID[source]) {
     settings.chatTarget = source;
-    if (botService?.localChat && ['claude', 'codex', 'opencode', 'dsh'].includes(source)) {
+    if (botService?.localChat && LOCAL_CHAT_ENGINES.has(source)) {
       botService.localChat.selectedEngine = source;
     }
   }
@@ -173,7 +173,8 @@ const INTERACTIVE_ACTIONS = new Set([
   'create', 'prompt', 'conversation', 'cancel', 'models', 'selectModel', 'skills', 'files',
   'workspaces', 'selectWorkspace', 'sessions', 'selectSession',
 ]);
-const DIRECT_CHAT_SOURCES = new Set(['auto', 'dsh', 'claude', 'codex', 'opencode']);
+const DIRECT_CHAT_SOURCES = new Set(['auto', 'dsh', 'claude', 'codex', 'opencode', 'workbuddy-ai']);
+const LOCAL_CHAT_ENGINES = new Set(['claude', 'codex', 'opencode', 'workbuddy-ai', 'dsh']);
 
 function isDshOnline() {
   return Boolean(providers.snapshot?.sources?.find(row => row.id === 'dsh')?.connected);
@@ -186,6 +187,7 @@ function currentTargetAgent() {
   if (probes.claude?.available) return 'claude';
   if (probes.codex?.available) return 'codex';
   if (probes.opencode?.available) return 'opencode';
+  if (probes['workbuddy-ai']?.available) return 'workbuddy-ai';
   return 'dsh';
 }
 
@@ -200,6 +202,7 @@ function getChatTargets() {
     if (id === 'claude') isDirect = Boolean(probes.claude?.available);
     else if (id === 'codex') isDirect = Boolean(probes.codex?.available);
     else if (id === 'opencode') isDirect = Boolean(probes.opencode?.available);
+    else if (id === 'workbuddy-ai') isDirect = Boolean(probes['workbuddy-ai']?.available);
     else if (id === 'dsh') isDirect = dshOnline;
     else if (id === 'antigravity') isDirect = Boolean(probes.antigravity?.available);
     out.push({
@@ -268,9 +271,16 @@ async function agentAction(body) {
     const base = providers.list(settings.source);
     const localItems = botService?.localChat ? botService.localChat.listSessions(settings.source) : [];
     if (!localItems.length) return base;
+    const claimedCliKeys = new Set();
+    for (const item of localItems) {
+      if (item?.provider && item?.cliSessionId) {
+        claimedCliKeys.add(`${item.provider}:${item.cliSessionId}`);
+      }
+    }
     const mergedMap = new Map();
     for (const item of base.items || []) {
-      if (item?.sessionId) mergedMap.set(item.sessionId, item);
+      if (!item?.sessionId || claimedCliKeys.has(item.sessionId)) continue;
+      mergedMap.set(item.sessionId, item);
     }
     for (const item of localItems) {
       if (!item?.sessionId) continue;
@@ -346,7 +356,7 @@ async function agentAction(body) {
     if (!id) throw new Error('未知的目标 AI Agent');
     settings.chatTarget = id;
     save();
-    if (botService?.localChat && ['claude', 'codex', 'opencode', 'dsh'].includes(id)) {
+    if (botService?.localChat && LOCAL_CHAT_ENGINES.has(id)) {
       botService.localChat.selectedEngine = id;
     }
     return {
@@ -384,6 +394,7 @@ async function agentAction(body) {
       || (sessionId.startsWith('local:claude:') ? 'claude'
         : sessionId.startsWith('local:codex:') ? 'codex'
         : sessionId.startsWith('local:opencode:') ? 'opencode'
+        : sessionId.startsWith('local:workbuddy-ai:') ? 'workbuddy-ai'
         : sessionId.startsWith('launch:') && CATALOG_BY_ID[sessionId.slice(7)] ? sessionId.slice(7)
         : currentTargetAgent());
     const dshOnline = isDshOnline();
@@ -398,12 +409,13 @@ async function agentAction(body) {
     const isDirectLocal = target === 'claude'
       || target === 'codex'
       || target === 'opencode'
+      || target === 'workbuddy-ai'
       || target === 'dsh'
       || (target === 'antigravity' && Boolean(probes.antigravity?.available));
     if (isDirectLocal) {
       if (!botService?.localChat) throw new Error('本地对话服务尚未就绪');
       const localTarget = target === 'dsh'
-        ? (probes.claude?.available ? 'claude' : probes.codex?.available ? 'codex' : probes.opencode?.available ? 'opencode' : 'claude')
+        ? (probes.claude?.available ? 'claude' : probes.codex?.available ? 'codex' : probes.opencode?.available ? 'opencode' : probes['workbuddy-ai']?.available ? 'workbuddy-ai' : 'claude')
         : target;
       return botService.localChat.handleAction({ ...body, targetAgent: localTarget }, localTarget);
     }
@@ -417,7 +429,16 @@ async function agentAction(body) {
     if (promptText) {
       await copyToClipboard(promptText);
     }
-    if (CATALOG_BY_ID[target]?.bundleId) {
+    const boundLocal = sessionId && botService?.localChat?._resolveSession(sessionId);
+    const launchChatId = boundLocal?.cliSessionId
+      || (sessionId.startsWith('workbuddy:') ? sessionId.slice('workbuddy:'.length) : '');
+    if (target === 'workbuddy' && launchChatId && /^[a-zA-Z0-9_-]+$/.test(launchChatId)) {
+      try {
+        await shell.openExternal(`workbuddy://chat/${encodeURIComponent(launchChatId)}`);
+      } catch {
+        if (CATALOG_BY_ID[target]?.bundleId) await openBundle(target);
+      }
+    } else if (CATALOG_BY_ID[target]?.bundleId) {
       await openBundle(target);
     }
     return {
@@ -465,7 +486,7 @@ async function agentAction(body) {
     throw new Error(`请在 ${CATALOG_BY_ID[targetProvider].label} 中继续此任务`);
   }
   if (INTERACTIVE_ACTIONS.has(body.action)) {
-    if (['claude', 'codex', 'opencode'].includes(settings.source)) {
+    if (['claude', 'codex', 'opencode', 'workbuddy-ai'].includes(settings.source)) {
       if (!botService?.localChat) throw new Error('本地对话服务尚未就绪');
       return botService.localChat.handleAction(body, settings.source);
     }
@@ -686,12 +707,31 @@ app.whenReady().then(async () => {
     },
     openApp: id => (id === 'dsh' ? openDsh() : openBundle(id)),
   });
+  let petUpdateTimer = null;
+  let lastPetPushAt = 0;
+  const pushPetUpdate = () => {
+    if (!win || win.isDestroyed()) return;
+    const elapsed = Date.now() - lastPetPushAt;
+    if (elapsed >= 150) {
+      lastPetPushAt = Date.now();
+      win.webContents.send('companion:updated');
+      return;
+    }
+    if (!petUpdateTimer) {
+      petUpdateTimer = setTimeout(() => {
+        petUpdateTimer = null;
+        lastPetPushAt = Date.now();
+        if (win && !win.isDestroyed()) win.webContents.send('companion:updated');
+      }, 150 - elapsed);
+    }
+  };
   botService.on('updated', state => {
+    pushPetUpdate();
     if (managerWin && !managerWin.isDestroyed()) managerWin.webContents.send('companion:bot-updated', { ...state, autoStart: autoStart.isEnabled() });
   });
   {
     const initialTarget = currentTargetAgent();
-    if (botService.localChat && ['claude', 'codex', 'opencode', 'dsh'].includes(initialTarget)) {
+    if (botService.localChat && LOCAL_CHAT_ENGINES.has(initialTarget)) {
       botService.localChat.selectedEngine = initialTarget;
     }
   }

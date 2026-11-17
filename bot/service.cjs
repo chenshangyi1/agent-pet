@@ -101,7 +101,7 @@ function normalizeBotConfig(raw = {}, existing = null) {
     : normalizeStringList(base.allowedWorkspaces, [home]);
   const allowedWorkspaces = allowedRaw.length > 0 ? allowedRaw : [home];
 
-  const validEngines = new Set(['claude', 'codex', 'antigravity', 'dsh']);
+  const validEngines = new Set(['claude', 'codex', 'opencode', 'workbuddy-ai', 'antigravity', 'dsh']);
   const engineCandidate = String(raw.defaultEngine ?? base.defaultEngine ?? 'claude').trim().toLowerCase();
   const defaultEngine = validEngines.has(engineCandidate) ? engineCandidate : 'claude';
 

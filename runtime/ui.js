@@ -73,7 +73,7 @@ function makeProviderIcon(provider = 'dsh', className = 'activity-provider-icon'
   img.src = iconUrl(provider);
   return img;
 }
-const DIRECT_CHAT_SOURCES = new Set(['auto', 'dsh', 'claude', 'codex', 'opencode']);
+const DIRECT_CHAT_SOURCES = new Set(['auto', 'dsh', 'claude', 'codex', 'opencode', 'workbuddy-ai']);
 const TARGET_LABELS = {
   claude: 'Claude Code',
   codex: 'Codex',
@@ -598,7 +598,7 @@ async function sendPrompt(text, { sessionId: existingSessionId, trackReply = fal
       sessionId = created?.sessionId || requestedId;
     }
     const isLaunchSession = sessionId.startsWith('launch:')
-      || (!existingSessionId && getTargetInfo(promptTarget).mode === 'launch' && !/^@(?:claude|codex|opencode|dsh)\b/i.test(request));
+      || (!existingSessionId && getTargetInfo(promptTarget).mode === 'launch' && !/^@(?:claude|codex|opencode|workbuddy-ai|dsh)\b/i.test(request));
     const baselineSeq = trackReply && !isLaunchSession ? (await action('conversation', { sessionId })).lastSeq ?? -1 : undefined;
     const parts = [];
     if (quotedText) parts.push({ type: 'text', text: `[引用] ${quotedText.slice(0, 400)}` });
@@ -677,7 +677,7 @@ function getTargetInfo(id = targetAgent) {
   const found = chatTargets.find(t => t.id === id);
   if (found) return found;
   const label = TARGET_LABELS[id] || id || 'Claude Code';
-  const mode = ['claude', 'codex', 'opencode', 'dsh'].includes(id) ? 'direct' : 'launch';
+  const mode = ['claude', 'codex', 'opencode', 'workbuddy-ai', 'dsh'].includes(id) ? 'direct' : 'launch';
   return { id, label, mode };
 }
 function cwdBasename(dir = currentCwd) {
@@ -767,8 +767,8 @@ function renderModel() {
   if (labelEl) labelEl.textContent = label;
   if (info?.mode === 'launch') {
     quickInput.placeholder = dirName
-      ? `在 ${dirName} 中发指令给 ${label}（复制并打开）…`
-      : `发指令给 ${label}（自动复制并打开应用）…`;
+      ? `[仅复制切窗] ${dirName} · ${label}（⌘V粘贴）`
+      : `[仅复制切窗] 给 ${label} 发指令（⌘V粘贴）`;
   } else if (sessionLabel) {
     quickInput.placeholder = `继续「${sessionLabel}」…`;
   } else if (dirName) {
@@ -824,7 +824,7 @@ function renderTargetOptions(targets) {
   }
   for (const row of targets) {
     const label = row.label || TARGET_LABELS[row.id] || row.id;
-    const mode = row.mode || (['claude', 'codex', 'opencode', 'dsh'].includes(row.id) ? 'direct' : 'launch');
+    const mode = row.mode || (['claude', 'codex', 'opencode', 'workbuddy-ai', 'dsh'].includes(row.id) ? 'direct' : 'launch');
     const button = el('button', 'context-target');
     button.type = 'button';
     if (row.id === targetAgent) button.classList.add('is-active');
@@ -924,7 +924,7 @@ function renderTargetOptions(targets) {
       renderSessionOptions(sessionOptions);
       refreshFilesForWorkspace();
       showFeedback(mode === 'launch'
-        ? `已切换至 ${label}（发送时将复制指令并打开应用）`
+        ? `已切换至 ${label}（仅复制并打开应用，后台流式执行请选「直连」Agent）`
         : `已切换对话目标：${label}`);
     }));
     container.append(button);
@@ -1097,7 +1097,10 @@ function renderSessionOptions(sessions = sessionOptions) {
       if (contextExtraOpen) renderExtraWorkspaceOptions(extraWorkspaceOptions);
       renderSessionOptions(sessionOptions);
       refreshFilesForWorkspace();
-      showFeedback(`已绑定会话：${activeSessionTitle || '历史会话'}（发消息将直接续聊）`);
+      const modeLabel = getTargetInfo(targetAgent).label;
+      showFeedback(getTargetInfo(targetAgent).mode === 'launch'
+        ? `已绑定 ${modeLabel} 会话：${activeSessionTitle || '历史会话'}（发送将复制并跳转应用）`
+        : `已绑定会话：${activeSessionTitle || '历史会话'}（发消息将直接续聊）`);
     }));
     container.append(button);
   }
@@ -1261,33 +1264,58 @@ function closeContext() {
   $('tool-context').setAttribute('aria-expanded', 'false');
   $('quick-model')?.setAttribute('aria-expanded', 'false');
 }
-async function loadTranscript() {
-  const container = $('transcript-list');
+let transcriptRenderKey = '';
+let transcriptFetching = false;
+function renderTranscriptMessages(container, view, targetSessionId, { forceScroll = false } = {}) {
+  const msgs = Array.isArray(view?.messages) ? view.messages : [];
+  const nextKey = JSON.stringify([targetSessionId, msgs.map(m => [m.id, m.seq, m.text, Boolean(m.streaming)])]);
+  if (nextKey === transcriptRenderKey) return;
+  transcriptRenderKey = nextKey;
+  const nearBottom = forceScroll || (container.scrollHeight - container.scrollTop - container.clientHeight < 36);
   container.textContent = '';
-  container.append(el('p', 'transcript-state', '正在读取会话…'));
-  try {
-    const view = await action('conversation', { sessionId: transcriptSessionId });
-    container.textContent = '';
-    if (!view.messages?.length) { container.append(el('p', 'transcript-state', '还没有消息，先说点什么吧')); return; }
-    for (const message of view.messages) {
-      const row = el('div', 'transcript-message');
-      row.dataset.role = message.role;
-      const assistantRole = transcriptSessionId?.startsWith('local:')
-        ? (getTargetInfo(transcriptSessionId.split(':')[1])?.label || '小鑫')
-        : 'DSH';
-      row.append(el('span', 'transcript-role', message.role === 'user' ? '你' : assistantRole));
-      row.append(el('span', 'transcript-body', message.text || (message.attachments ? `[${message.attachments} 个附件]` : '')));
+  if (!msgs.length) { container.append(el('p', 'transcript-state', '还没有消息，先说点什么吧')); return; }
+  for (const message of msgs) {
+    const row = el('div', 'transcript-message');
+    row.dataset.role = message.role;
+    if (message.streaming) row.dataset.streaming = 'true';
+    const assistantRole = targetSessionId?.startsWith('local:')
+      ? (getTargetInfo(targetSessionId.split(':')[1])?.label || '小鑫')
+      : 'DSH';
+    row.append(el('span', 'transcript-role', message.role === 'user' ? '你' : (message.streaming ? `${assistantRole} · 输出中` : assistantRole)));
+    row.append(el('span', 'transcript-body', message.text || (message.attachments ? `[${message.attachments} 个附件]` : '')));
+    if (!message.streaming) {
       const reply = el('button', 'transcript-reply', '回复');
       reply.type = 'button';
       reply.addEventListener('click', () => { quoted = message.text || ''; renderQuote(); $('transcript-input').focus(); });
       row.append(reply);
-      container.append(row);
     }
-    container.scrollTop = container.scrollHeight;
-  } catch (error) {
+    container.append(row);
+  }
+  if (nearBottom) container.scrollTop = container.scrollHeight;
+}
+async function loadTranscript({ quiet = false } = {}) {
+  const container = $('transcript-list');
+  const requestedId = transcriptSessionId;
+  if (!requestedId) return;
+  if (quiet && transcriptFetching) return;
+  transcriptFetching = true;
+  if (!quiet) {
+    transcriptRenderKey = '';
     container.textContent = '';
-    container.append(el('p', 'transcript-state', '会话暂时不可用'));
-    report(error);
+    container.append(el('p', 'transcript-state', '正在读取会话…'));
+  }
+  try {
+    const view = await action('conversation', { sessionId: requestedId });
+    if (requestedId !== transcriptSessionId || $('transcript').hidden) return;
+    renderTranscriptMessages(container, view, requestedId, { forceScroll: !quiet });
+  } catch (error) {
+    if (!quiet) {
+      container.textContent = '';
+      container.append(el('p', 'transcript-state', '会话暂时不可用'));
+      report(error);
+    }
+  } finally {
+    transcriptFetching = false;
   }
 }
 async function openTranscript(sessionId = prefs.activeSessionId) {
@@ -1670,6 +1698,10 @@ if (native) {
     sourceInitialized = true;
   };
   native.onMode(mode => { applySource(mode); applyPlacement(mode.placement); document.body.classList.toggle('control-only', mode.controlOnly); if (mode.notice) notice(); if (mode.focusQuickChat) showQuickChat(); });
+  native.onUpdated?.(() => {
+    run(poll);
+    if (!$('transcript').hidden && transcriptSessionId) run(() => loadTranscript({ quiet: true }));
+  });
   run(async () => { const mode = await native.window('placement'); applySource(mode); applyPlacement(mode.placement); document.body.classList.toggle('control-only', mode.controlOnly); });
   run(async () => {
     const info = await action('info');

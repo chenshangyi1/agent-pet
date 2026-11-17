@@ -277,6 +277,19 @@ function parseClaudeStreamLine(line) {
     }
   }
 
+  let deltaText = '';
+  let thinkingDelta = '';
+  if (obj.type === 'stream_event' && obj.event && typeof obj.event === 'object') {
+    const ev = obj.event;
+    if (ev.type === 'content_block_delta' && ev.delta && typeof ev.delta === 'object') {
+      if (ev.delta.type === 'text_delta' && typeof ev.delta.text === 'string') {
+        deltaText = ev.delta.text;
+      } else if (ev.delta.type === 'thinking_delta' && typeof ev.delta.thinking === 'string') {
+        thinkingDelta = ev.delta.thinking;
+      }
+    }
+  }
+
   const isError = Boolean(
     obj.is_error ||
     (obj.type === 'result' && typeof obj.subtype === 'string' && obj.subtype && obj.subtype !== 'success')
@@ -290,8 +303,57 @@ function parseClaudeStreamLine(line) {
     tools,
     toolResults,
     text: obj.type === 'result' ? resultText : textParts.join('\n'),
+    deltaText,
+    thinkingDelta,
     isResult: obj.type === 'result',
     isError,
+  };
+}
+
+function parseOpencodeJsonLine(line) {
+  if (typeof line !== 'string') return null;
+  const trimmed = line.trim();
+  if (!trimmed || !trimmed.startsWith('{')) return null;
+
+  let obj;
+  try {
+    obj = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  if (!obj || typeof obj !== 'object' || typeof obj.type !== 'string') return null;
+
+  const sessionId = typeof obj.sessionID === 'string' && obj.sessionID.trim()
+    ? obj.sessionID.trim()
+    : (typeof obj.sessionId === 'string' && obj.sessionId.trim() ? obj.sessionId.trim() : null);
+  const part = obj.part && typeof obj.part === 'object' ? obj.part : null;
+  const text = obj.type === 'text' && typeof part?.text === 'string'
+    ? part.text
+    : (typeof obj.text === 'string' ? obj.text : '');
+
+  let tool = '';
+  let toolId = '';
+  let toolStatus = '';
+  if ((obj.type === 'tool_use' || part?.type === 'tool' || part?.type === 'tool_use') && part) {
+    tool = String(part.tool || part.name || '').trim();
+    toolId = typeof part.callID === 'string' ? part.callID : (typeof part.id === 'string' ? part.id : '');
+    toolStatus = typeof part.state?.status === 'string' ? part.state.status : '';
+  }
+
+  let errorMessage = '';
+  if (obj.type === 'error') {
+    errorMessage = obj.error?.data?.message || obj.error?.message || obj.message || 'OpenCode 发生错误';
+  }
+
+  return {
+    raw: obj,
+    type: obj.type,
+    sessionId,
+    text,
+    tool,
+    toolId,
+    toolStatus,
+    errorMessage: typeof errorMessage === 'string' ? errorMessage : '',
   };
 }
 
@@ -456,6 +518,18 @@ class TaskDispatcher {
       process.env.OPENCODE_BIN,
       '/Applications/OpenCode.app/Contents/Resources/opencode-cli',
     ]) || findBinary('opencode-cli', [process.env.OPENCODE_BIN]);
+    const workbuddyAiCandidates = [
+      process.env.WORKBUDDY_AI_BIN,
+      '/Applications/WorkBuddy AI.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy',
+    ].filter(Boolean);
+    let workbuddyAiPath = null;
+    for (const candidate of workbuddyAiCandidates) {
+      const resolved = path.resolve(expandHome(candidate));
+      if (isExecutableFile(resolved)) {
+        workbuddyAiPath = resolved;
+        break;
+      }
+    }
     const agyPath = findBinary('agy', [process.env.AGY_BIN]);
 
     let antigravity;
@@ -497,6 +571,11 @@ class TaskDispatcher {
         available: Boolean(opencodePath),
         path: opencodePath,
         label: 'OpenCode',
+      },
+      'workbuddy-ai': {
+        available: Boolean(workbuddyAiPath),
+        path: workbuddyAiPath,
+        label: 'WorkBuddy AI',
       },
       antigravity,
       dsh: {
@@ -547,7 +626,7 @@ class TaskDispatcher {
       PATH: mergedPath,
       AGENT_PET_DATA: this.dataDir,
     };
-    if (engine === 'claude') {
+    if (engine === 'claude' || engine === 'workbuddy-ai') {
       delete env.CLAUDECODE;
       delete env.CLAUDE_CODE_ENTRYPOINT;
     }
@@ -617,10 +696,11 @@ class TaskDispatcher {
     const cleanPrompt = typeof prompt === 'string' ? prompt.trim() : '';
     if (!cleanPrompt) throw new Error('任务内容不能为空');
 
-    const normalizedEngine = String(engine || 'claude').trim().toLowerCase() === 'agy'
+    const rawEngine = String(engine || 'claude').trim().toLowerCase();
+    const normalizedEngine = rawEngine === 'agy'
       ? 'antigravity'
-      : String(engine || 'claude').trim().toLowerCase();
-    if (!['claude', 'codex', 'opencode', 'antigravity', 'dsh'].includes(normalizedEngine)) {
+      : (rawEngine === 'workbuddyai' ? 'workbuddy-ai' : rawEngine);
+    if (!['claude', 'codex', 'opencode', 'workbuddy-ai', 'antigravity', 'dsh'].includes(normalizedEngine)) {
       throw new Error(`不支持的执行引擎: ${engine}`);
     }
 
@@ -655,6 +735,8 @@ class TaskDispatcher {
           return await this._dispatchCodex(job, cleanPrompt, onProgress);
         case 'opencode':
           return await this._dispatchOpencode(job, cleanPrompt, onProgress);
+        case 'workbuddy-ai':
+          return await this._dispatchWorkbuddyAi(job, cleanPrompt, onProgress);
         case 'antigravity':
           return await this._dispatchAntigravity(job, cleanPrompt, onProgress);
         case 'dsh':
@@ -672,16 +754,36 @@ class TaskDispatcher {
 
   _dispatchClaude(job, prompt, onProgress) {
     const probes = this.probeEngines();
-    const bin = probes.claude.path;
+    const bin = probes.claude?.path;
     if (!bin) {
       throw new Error('未检测到 claude CLI，请先安装 Claude Code 或设置 CLAUDE_BIN');
     }
+    return this._dispatchStreamJsonCli(job, prompt, onProgress, {
+      engine: 'claude',
+      label: 'Claude Code',
+      bin,
+    });
+  }
 
+  _dispatchWorkbuddyAi(job, prompt, onProgress) {
+    const probes = this.probeEngines();
+    const bin = probes['workbuddy-ai']?.path;
+    if (!bin) {
+      throw new Error('未检测到 WorkBuddy AI CLI，请确认已安装 WorkBuddy AI.app 或设置 WORKBUDDY_AI_BIN');
+    }
+    return this._dispatchStreamJsonCli(job, prompt, onProgress, {
+      engine: 'workbuddy-ai',
+      label: 'WorkBuddy AI',
+      bin,
+    });
+  }
+
+  _dispatchStreamJsonCli(job, prompt, onProgress, { engine, label, bin }) {
     const images = Array.isArray(job.images) ? job.images : [];
     const effectivePrompt = images.length > 0
       ? `[附加图片路径: ${images.join(', ')} — 请先读取查看图片内容]\n${prompt}`
       : prompt;
-    const args = ['-p', effectivePrompt, '--output-format', 'stream-json', '--verbose'];
+    const args = ['-p', effectivePrompt, '--output-format', 'stream-json', '--verbose', '--include-partial-messages'];
     if (job.sessionId) args.push('--resume', job.sessionId);
     const addedDirs = new Set();
     for (const imgPath of images) {
@@ -694,13 +796,14 @@ class TaskDispatcher {
     if (this.sandboxMode === 'auto') args.push('--permission-mode', 'acceptEdits');
     else if (this.sandboxMode === 'full') args.push('--dangerously-skip-permissions');
 
-    const mirror = this._createMirrorSession('claude', job.cwd, job.sessionId);
+    const mirror = this._createMirrorSession(engine, job.cwd, job.sessionId);
     mirror.start(job.jobId);
 
     return new Promise((resolve, reject) => {
       let settled = false;
       let stdoutBuf = '';
       let stderrBuf = '';
+      let partialText = '';
       let lastAssistantText = '';
       let finalResultText = '';
       let resultIsError = false;
@@ -708,7 +811,7 @@ class TaskDispatcher {
 
       const child = spawn(bin, args, {
         cwd: job.cwd,
-        env: this._buildChildEnv('claude'),
+        env: this._buildChildEnv(engine),
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       job.child = child;
@@ -720,8 +823,15 @@ class TaskDispatcher {
 
         if (parsed.sessionId && parsed.sessionId !== job.sessionId) {
           job.sessionId = parsed.sessionId;
-          this._markDispatched('claude', parsed.sessionId);
+          this._markDispatched(engine, parsed.sessionId);
           mirror.adoptSessionId(parsed.sessionId);
+        }
+
+        if (parsed.deltaText) {
+          partialText += parsed.deltaText;
+          try {
+            onProgress?.({ type: 'delta', deltaText: partialText });
+          } catch {}
         }
 
         for (const t of parsed.tools) {
@@ -743,14 +853,16 @@ class TaskDispatcher {
         }
 
         if (parsed.isResult) {
-          finalResultText = parsed.text || lastAssistantText;
+          finalResultText = parsed.text || lastAssistantText || partialText;
           resultIsError = parsed.isError;
+          partialText = '';
         } else if (parsed.text) {
           lastAssistantText = parsed.text;
+          partialText = '';
           const preview = cleanMeta(parsed.text, 120);
           if (preview) {
             try {
-              onProgress?.({ type: 'text', text: `💬 ${preview}` });
+              onProgress?.({ type: 'text', text: `💬 ${preview}`, deltaText: parsed.text });
             } catch {}
           }
         }
@@ -777,10 +889,10 @@ class TaskDispatcher {
           mirror.emit('Stop', { terminationReason: 'USER_CANCELED' });
           resolve({
             jobId: job.jobId,
-            engine: 'claude',
+            engine,
             status: 'cancelled',
             sessionId: job.sessionId,
-            text: lastAssistantText || '任务已取消',
+            text: lastAssistantText || partialText || '任务已取消',
             toolsUsed: [...job.toolsUsed],
           });
           return;
@@ -799,13 +911,13 @@ class TaskDispatcher {
         job.child = null;
         job.endedAt = Date.now();
 
-        const outputText = (finalResultText || lastAssistantText).trim();
+        const outputText = (finalResultText || lastAssistantText || partialText).trim();
         if (job.cancelled) {
           job.status = 'cancelled';
           mirror.emit('Stop', { terminationReason: 'USER_CANCELED' });
           resolve({
             jobId: job.jobId,
-            engine: 'claude',
+            engine,
             status: 'cancelled',
             sessionId: job.sessionId,
             text: outputText || '任务已取消',
@@ -819,7 +931,7 @@ class TaskDispatcher {
           mirror.emit('Stop');
           resolve({
             jobId: job.jobId,
-            engine: 'claude',
+            engine,
             status: 'completed',
             sessionId: job.sessionId,
             text: outputText,
@@ -828,13 +940,13 @@ class TaskDispatcher {
           return;
         }
 
-        const errMsg = (resultIsError ? outputText : '') || stderrBuf.trim() || `Claude Code 退出码 ${code}`;
+        const errMsg = (resultIsError ? outputText : '') || stderrBuf.trim() || `${label} 退出码 ${code}`;
         job.status = 'failed';
         job.error = errMsg;
         mirror.emit('StopFailure', { hasError: true });
         resolve({
           jobId: job.jobId,
-          engine: 'claude',
+          engine,
           status: 'failed',
           sessionId: job.sessionId,
           text: outputText,
@@ -922,6 +1034,14 @@ class TaskDispatcher {
           return;
         }
 
+        if (parsed.type === 'item.updated' && (parsed.itemType === 'agent_message' || parsed.itemType === 'message') && parsed.text) {
+          lastAgentMessage = parsed.text;
+          try {
+            onProgress?.({ type: 'delta', deltaText: parsed.text });
+          } catch {}
+          return;
+        }
+
         if (parsed.type === 'item.completed') {
           if (parsed.itemType === 'agent_message' || parsed.itemType === 'message') {
             if (parsed.text) {
@@ -929,7 +1049,7 @@ class TaskDispatcher {
               const preview = cleanMeta(parsed.text, 120);
               if (preview) {
                 try {
-                  onProgress?.({ type: 'text', text: `💬 ${preview}` });
+                  onProgress?.({ type: 'text', text: `💬 ${preview}`, deltaText: parsed.text });
                 } catch {}
               }
             }
@@ -1048,7 +1168,7 @@ class TaskDispatcher {
       throw new Error('未检测到 opencode CLI，请先安装 OpenCode 或设置 OPENCODE_BIN');
     }
 
-    const args = ['run', '--auto'];
+    const args = ['run', '--auto', '--format', 'json'];
     if (job.sessionId) args.push('-s', job.sessionId);
     const images = Array.isArray(job.images) ? job.images : [];
     for (const imgPath of images) {
@@ -1061,8 +1181,12 @@ class TaskDispatcher {
 
     return new Promise((resolve, reject) => {
       let settled = false;
-      let stdoutText = '';
+      let stdoutBuf = '';
+      let jsonText = '';
+      let plainStdout = '';
       let stderrText = '';
+      let turnError = '';
+      const toolsSet = new Set();
 
       const child = spawn(bin, args, {
         cwd: job.cwd,
@@ -1072,15 +1196,65 @@ class TaskDispatcher {
       job.child = child;
       child.stdin?.end();
 
-      child.stdout.on('data', chunk => {
-        const piece = chunk.toString('utf8');
-        stdoutText += piece;
-        const preview = cleanMeta(stripAnsi(piece), 120);
-        if (preview) {
+      const handleLine = rawLine => {
+        const parsed = parseOpencodeJsonLine(rawLine);
+        if (!parsed) {
+          const cleanLine = stripAnsi(rawLine);
+          if (cleanLine.trim()) {
+            plainStdout += (plainStdout ? '\n' : '') + cleanLine;
+            const preview = cleanMeta(cleanLine, 120);
+            if (preview) {
+              try {
+                onProgress?.({ type: 'text', text: `💬 ${preview}`, deltaText: plainStdout });
+              } catch {}
+            }
+          }
+          return;
+        }
+
+        if (parsed.sessionId && parsed.sessionId !== job.sessionId) {
+          job.sessionId = parsed.sessionId;
+          this._markDispatched('opencode', parsed.sessionId);
+          mirror.adoptSessionId(parsed.sessionId);
+        }
+
+        if (parsed.tool) {
+          if (!toolsSet.has(parsed.tool)) {
+            toolsSet.add(parsed.tool);
+            job.toolsUsed.push(parsed.tool);
+          }
+          if (parsed.toolStatus === 'completed' || parsed.toolStatus === 'error') {
+            mirror.emit(parsed.toolStatus === 'error' ? 'PostToolUseFailure' : 'PostToolUse', {
+              tool: parsed.tool,
+              toolId: parsed.toolId || parsed.tool,
+              hasError: parsed.toolStatus === 'error',
+            });
+          } else {
+            mirror.emit('PreToolUse', { tool: parsed.tool, toolId: parsed.toolId || parsed.tool });
+            try {
+              onProgress?.({ type: 'tool', tool: parsed.tool, text: `🔧 正在使用 ${parsed.tool}` });
+            } catch {}
+          }
+        }
+
+        if (parsed.text) {
+          jsonText = jsonText ? `${jsonText}\n${parsed.text}` : parsed.text;
+          const preview = cleanMeta(parsed.text, 120);
           try {
-            onProgress?.({ type: 'text', text: `💬 ${preview}` });
+            onProgress?.({ type: 'text', text: `💬 ${preview}`, deltaText: jsonText });
           } catch {}
         }
+
+        if (parsed.errorMessage) {
+          turnError = parsed.errorMessage;
+        }
+      };
+
+      child.stdout.on('data', chunk => {
+        stdoutBuf += chunk.toString('utf8');
+        const lines = stdoutBuf.split('\n');
+        stdoutBuf = lines.pop() ?? '';
+        for (const line of lines) handleLine(line);
       });
 
       child.stderr.on('data', chunk => {
@@ -1092,6 +1266,7 @@ class TaskDispatcher {
         settled = true;
         job.child = null;
         job.endedAt = Date.now();
+        const fallbackText = (jsonText || plainStdout).trim();
         if (job.cancelled) {
           job.status = 'cancelled';
           mirror.emit('Stop', { terminationReason: 'USER_CANCELED' });
@@ -1100,8 +1275,8 @@ class TaskDispatcher {
             engine: 'opencode',
             status: 'cancelled',
             sessionId: job.sessionId || (`opencode-${job.jobId}`),
-            text: stripAnsi(stdoutText).trim() || '任务已取消',
-            toolsUsed: [],
+            text: fallbackText || '任务已取消',
+            toolsUsed: [...job.toolsUsed],
           });
           return;
         }
@@ -1112,12 +1287,14 @@ class TaskDispatcher {
       });
 
       child.on('close', code => {
+        if (stdoutBuf.trim()) handleLine(stdoutBuf);
+        stdoutBuf = '';
         if (settled) return;
         settled = true;
         job.child = null;
         job.endedAt = Date.now();
 
-        const output = stripAnsi(stdoutText).trim();
+        const output = (jsonText || plainStdout).trim();
         const finalSessionId = job.sessionId || (`opencode-${job.jobId}`);
         if (job.cancelled) {
           job.status = 'cancelled';
@@ -1128,12 +1305,12 @@ class TaskDispatcher {
             status: 'cancelled',
             sessionId: finalSessionId,
             text: output || '任务已取消',
-            toolsUsed: [],
+            toolsUsed: [...job.toolsUsed],
           });
           return;
         }
 
-        if (code === 0) {
+        if (code === 0 && !turnError) {
           job.sessionId = finalSessionId;
           this._markDispatched('opencode', finalSessionId);
           job.status = 'completed';
@@ -1144,12 +1321,12 @@ class TaskDispatcher {
             status: 'completed',
             sessionId: finalSessionId,
             text: output || '已完成任务',
-            toolsUsed: [],
+            toolsUsed: [...job.toolsUsed],
           });
           return;
         }
 
-        const errMsg = stripAnsi(stderrText).trim() || output || `OpenCode 退出码 ${code}`;
+        const errMsg = turnError || stripAnsi(stderrText).trim() || output || `OpenCode 退出码 ${code}`;
         job.status = 'failed';
         job.error = errMsg;
         mirror.emit('StopFailure', { hasError: true });
@@ -1160,7 +1337,7 @@ class TaskDispatcher {
           sessionId: finalSessionId,
           text: output,
           error: errMsg,
-          toolsUsed: [],
+          toolsUsed: [...job.toolsUsed],
         });
       });
     });
@@ -1706,6 +1883,7 @@ module.exports = {
   TaskDispatcher,
   parseClaudeStreamLine,
   parseCodexJsonLine,
+  parseOpencodeJsonLine,
   sanitizeWorkspace,
   mirrorInboxEvent,
 };
