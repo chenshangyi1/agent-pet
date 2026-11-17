@@ -6,7 +6,9 @@
 
 ```text
 ios/AgentPetIOS/
-├── Package.swift
+├── AgentPetIOS.xcodeproj             # Xcode iOS 应用工程（直接双击或在 Xcode 打开它）
+├── Info.plist                        # 本地 HTTP/WS 与局域网权限声明
+├── project.yml                       # XcodeGen 工程描述文件
 ├── README.md
 └── Sources/AgentPetIOS/
     ├── AgentPetIOSApp.swift          # @main SwiftUI 应用入口
@@ -35,15 +37,13 @@ ios/AgentPetIOS/
 
 ## 在 Xcode 中运行到 iPhone / 模拟器
 
-1. 使用 Xcode 15+ 打开 `ios/AgentPetIOS/Package.swift`（或新建一个 iOS App 工程并将 `Sources/AgentPetIOS` 作为依赖 / 源码加入）。
-2. 由于局域网 `MobileBridgeServer` 默认使用明文 `http://` 与 `ws://`，如通过 Xcode iOS App Target 运行到真机，请在 Target 的 `Info.plist` 中添加：
-   - `NSAppTransportSecurity` -> `NSAllowsLocalNetworking = YES`（或 `NSAllowsArbitraryLoads = YES`）
-   - `NSLocalNetworkUsageDescription`：说明用于连接同一局域网内 Mac 上的小鑫桌面端。
-3. 在「连接设置」页输入 Mac 局域网 IP（如 `192.168.1.88:18472`）及 `~/.dsh/companion/bot-config.json` 中的 6 位 `pairingCode` 即可配对。
+1. 双击或在 Xcode 打开 **`AgentPetIOS.xcodeproj`**（不要按 Swift Package 方式运行，否则模拟器启动会因缺少 `Info.plist` / Bundle ID 报错）。
+2. 在 Xcode 顶部选择任意 iPhone 模拟器（如 `iPhone 17 Pro Max`），按 `⌘R` 即可编译并运行。
+3. 如部署到真机 iPhone：在 `AgentPetIOS` Target 的 **Signing & Capabilities** 选择你的 Apple 开发者 Team，运行后在 **「连接设置」** 页输入 Mac 局域网 IP（如 `192.168.1.88:18472`）及 `~/.dsh/companion/bot.json` 中的 6 位 `pairingCode` 即可配对。
 
-## 本地编译验证
+## 本地命令行构建（iOS 模拟器）
 
 ```bash
 cd ios/AgentPetIOS
-swift build
+xcodebuild -project AgentPetIOS.xcodeproj -scheme AgentPetIOS -destination 'platform=iOS Simulator,name=iPhone 17 Pro Max' build
 ```
